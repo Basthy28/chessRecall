@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(node -e \"const d=require\\('fs'\\).readFileSync\\(0,'utf8'\\); const p=JSON.parse\\(d\\); console.log\\('main:', p.main\\); console.log\\('types:', p.types\\); console.log\\('exports:', JSON.stringify\\(p.exports, null, 2\\)\\)\")",
+      "Bash(node -e \"const Chess = require\\('chess.js'\\); console.log\\(typeof Chess\\)\")",
+      "Bash(node -e \"const { Chess } = require\\('chess.js'\\); const c = new Chess\\(\\); c.loadPgn\\('1. e4 e5 2. Nf3 Nc6'\\); console.log\\('fen:', c.fen\\(\\)\\); const moves = c.history\\({verbose: true}\\); console.log\\('sample move:', JSON.stringify\\(moves[0]\\)\\)\")",
+      "Bash(timeout 10 node -e ':*)",
+      "Bash(timeout 15 node -e ':*)",
+      "Bash(npm run:*)",
+      "Bash(npx tsc:*)",
+      "Bash(node -e ':*)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('main:', d.get\\('main'\\)\\); print\\('exports:', json.dumps\\(d.get\\('exports', {}\\), indent=2\\)[:1000]\\)\")",
+      "Bash(node:*)",
+      "Bash(kill %1)",
+      "Bash(wait)",
+      "Bash(npx tsx:*)"
+    ]
+  }
+}

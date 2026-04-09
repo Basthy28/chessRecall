@@ -1,26 +1,169 @@
+/* ================================================================
+   All @import rules must come first (CSS spec).
+   Chessground CSS MUST be global — do not move these to a component.
+   ================================================================ */
+@import "chessground/assets/chessground.base.css";
+@import "chessground/assets/chessground.brown.css";
+@import "chessground/assets/chessground.cburnett.css";
 @import "tailwindcss";
 
+/* ================================================================
+   App-wide design tokens — dark theme by default
+   ================================================================ */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* ── Color palette ── */
+  --bg-base: #161512;
+  --bg-surface: #1e1c1a;
+  --bg-elevated: #272421;
+  --bg-hover: #2e2b28;
+  --border: #3a3836;
+  --border-subtle: #2d2b29;
+  --text-primary: #bababa;
+  --text-secondary: #999790;
+  --text-muted: #7f7f7f;
+  --accent: #c0a060;
+  --accent-hover: #d4b573;
+  --accent-dim: rgba(192,160,96,0.12);
+  --green: #86a666;
+  --green-dim: rgba(134,166,102,0.15);
+  --red: #b94040;
+  --red-dim: rgba(185,64,64,0.15);
+  --orange: #c87832;
+  --orange-dim: rgba(200,120,50,0.15);
+  --teal: #4a9e8e;
+  --teal-dim: rgba(74,158,142,0.15);
+  --blue: #7b9ebd;
+
+  /* ── Typography scale ── */
+  --font-xs: 11px;
+  --font-sm: 12px;
+  --font-base: 13px;
+  --font-md: 14px;
+  --font-lg: 16px;
+  --font-xl: 20px;
+  --font-2xl: 24px;
+
+  /* ── Shadows ── */
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.5), 0 2px 4px rgba(0,0,0,0.3);
+  --shadow-lg: 0 8px 28px rgba(0,0,0,0.65), 0 4px 8px rgba(0,0,0,0.4);
+  --shadow-board: 0 12px 40px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-card: 0 2px 8px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.03);
+
+  /* ── Radius ── */
+  --radius-sm: 4px;
+  --radius-md: 7px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+
+  /* ── Transitions ── */
+  --transition-fast: 120ms ease;
+  --transition-base: 180ms ease;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  box-sizing: border-box;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: "Noto Sans", system-ui, Arial, sans-serif;
+  font-size: var(--font-base);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
+
+/* ── Subtle grain texture overlay ── */
+body::before {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  opacity: 0.028;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)' opacity='1'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+}
+
+/* ── Scrollbar styling ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-surface);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4e4c4a;
+}
+
+/* ── Selection color ── */
+::selection {
+  background: rgba(192, 160, 96, 0.28);
+  color: var(--text-primary);
+}
+
+/* ================================================================
+   Chessground container overrides — force proper sizing
+   ================================================================ */
+cg-container {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Chessground brown theme uses an SVG background on `cg-board`.
+   Override it directly to ensure tile colors actually change. */
+.chess-recall-board cg-board {
+  background-color: #f2d4a8;
+  background-image: repeating-conic-gradient(
+    #ad7a4f 0deg 90deg,
+    #f2d4a8 90deg 180deg,
+    #ad7a4f 180deg 270deg,
+    #f2d4a8 270deg 360deg
+  );
+  background-size: 25% 25%;
+}
+
+.chess-recall-board coords {
+  color: rgba(33, 21, 12, 0.88);
+  font-weight: 800;
+  font-size: 18px;
+  text-shadow:
+    0 0 1px rgba(255, 255, 255, 0.28),
+    0 1px 0 rgba(0, 0, 0, 0.2);
+}
+
+.games-layout {
+  display: grid;
+  grid-template-columns: minmax(360px, 1.2fr) minmax(280px, 0.8fr);
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+}
+
+.games-review-board {
+  max-width: 560px;
+}
+
+@media (max-width: 900px) {
+  .games-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .games-review-board {
+    max-width: 480px;
+  }
+}
+
+@media (max-width: 700px) {
+  .games-table-source {
+    display: none;
+  }
+}
+

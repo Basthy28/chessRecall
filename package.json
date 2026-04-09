@@ -6,12 +6,23 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "worker": "npx tsx src/workers/analyzeGame.worker.ts",
+    "redis:up": "docker compose -f docker-compose.redis.yml up -d",
+    "redis:down": "docker compose -f docker-compose.redis.yml down",
+    "redis:logs": "docker compose -f docker-compose.redis.yml logs -f redis"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.102.1",
+    "@types/ioredis": "^4.28.10",
+    "bullmq": "^5.73.0",
+    "chess.js": "^1.4.0",
+    "chessground": "^9.2.1",
+    "ioredis": "^5.10.1",
     "next": "16.2.2",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "stockfish": "^18.0.7"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

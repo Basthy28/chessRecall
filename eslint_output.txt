@@ -1,0 +1,9 @@
+
+C:\Users\sebas\Documents\chessRecall\chess-recall-app\src\components\training\GamesPanel.tsx
+   82:10  warning  'createEmptyBranchState' is defined but never used  @typescript-eslint/no-unused-vars
+  180:10  warning  'playUciMove' is defined but never used             @typescript-eslint/no-unused-vars
+  827:16  error    'np' is never reassigned. Use 'const' instead       prefer-const
+
+✖ 3 problems (1 error, 2 warnings)
+  1 error and 0 warnings potentially fixable with the `--fix` option.
+

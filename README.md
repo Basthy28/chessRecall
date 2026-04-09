@@ -1,36 +1,59 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# chessRecall (app)
 
-## Getting Started
+App Next.js para importar/analisar jogos e fazer review (com Stockfish + árvore de variações).
 
-First, run the development server:
+## Requisitos
+
+- Node.js 20+
+- Docker Desktop (para Redis, necessário para o queue/worker de análise)
+
+## Instalação
+
+```bash
+cd chess-recall-app
+npm install
+```
+
+## Dev (apenas UI)
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Abrir http://localhost:3000
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Dev (com análise em background: Redis + worker + UI)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Em 3 terminais separados:
 
-## Learn More
+```bash
+npm run redis:up
+```
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npm run worker
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+npm run dev
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Scripts úteis
 
-## Deploy on Vercel
+- `npm run dev`: Next dev server
+- `npm run build`: build de produção
+- `npm run start`: serve build de produção
+- `npm run lint`: ESLint
+- `npm run worker`: processa a fila de análises (BullMQ) e escreve resultados
+- `npm run redis:up`: sobe Redis via Docker
+- `npm run redis:down`: desce Redis
+- `npm run redis:logs`: logs do Redis
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Troubleshooting
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Mensagem “Redis queue offline. Start Redis + worker and try again.”
+  - Corre `npm run redis:up` e depois `npm run worker`.
+- Worker não inicia no Windows
+  - Garante Node 20+ e reinstala deps: `rm -r node_modules && npm i` (ou apaga a pasta manualmente no Explorer).
+- Import/Analyze não encontra jogos
+  - Confirma que tens as contas vinculadas dentro da app (Lichess/Chess.com) e que o username está correto.
