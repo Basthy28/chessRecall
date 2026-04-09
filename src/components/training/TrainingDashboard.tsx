@@ -1,10 +1,19 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import ChessBoard from "@/components/board/ChessBoard";
 import TrainingQueue from "@/components/training/TrainingQueue";
 import GamesPanel from "@/components/training/GamesPanel";
+import PuzzleTrainer from "@/components/training/PuzzleTrainer";
 import Button from "@/components/ui/Button";
+import AuthModal from "@/components/auth/AuthModal";
+import { useAuth } from "@/hooks/useAuth";
+import { createBrowserClient } from "@/lib/supabase";
+import {
+  readLinkedAccounts,
+  saveLinkedAccounts,
+  restoreLinkedAccountsFromSupabase,
+} from "@/lib/linkedAccounts";
 import type { Puzzle } from "@/types";
 
 // Placeholder puzzles — will be replaced by real Supabase data in Phase 2
@@ -168,13 +177,34 @@ const SRS_BUTTONS = [
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function TrainingDashboard() {
+  const { userId, userEmail, loading: authLoading } = useAuth();
+  const [showAuthModal, setShowAuthModal] = useState(false);
   const [activePuzzle, setActivePuzzle] = useState<Puzzle | null>(
     MOCK_PUZZLES[0] ?? null
   );
   const [showSolution, setShowSolution] = useState(false);
-  const [activeNav, setActiveNav] = useState<"train" | "games" | "stats" | "settings">("train");
+  const [activeNav, setActiveNav] = useState<"train" | "puzzles" | "games" | "stats" | "settings">("train");
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+
+  const handleAuthSuccess = useCallback(async (newUserId: string) => {
+    setShowAuthModal(false);
+    // After login: restore linked accounts from Supabase if localStorage is empty
+    const local = readLinkedAccounts();
+    if (!local.lichess && !local.chessCom) {
+      const restored = await restoreLinkedAccountsFromSupabase();
+      if (restored) {
+        saveLinkedAccounts(restored);
+      }
+    }
+    // Suppress unused variable warning — userId comes from useAuth hook reactively
+    void newUserId;
+  }, []);
+
+  const handleSignOut = useCallback(async () => {
+    const supabase = createBrowserClient();
+    await supabase.auth.signOut();
+  }, []);
 
   return (
     <div
@@ -186,6 +216,12 @@ export default function TrainingDashboard() {
         color: "var(--text-primary)",
       }}
     >
+      {showAuthModal && (
+        <AuthModal
+          onAuthSuccess={handleAuthSuccess}
+          onDismiss={() => setShowAuthModal(false)}
+        />
+      )}
       {/* ════════════════════════════════════════
           Header
       ════════════════════════════════════════ */}
@@ -243,7 +279,7 @@ export default function TrainingDashboard() {
 
         {/* Center: Nav */}
         <nav style={{ display: "flex", gap: "2px" }}>
-          {(["train", "games", "stats", "settings"] as const).map((item) => {
+          {(["train", "puzzles", "games", "stats", "settings"] as const).map((item) => {
             const isActive = activeNav === item;
             return (
               <button
@@ -274,7 +310,7 @@ export default function TrainingDashboard() {
                       "var(--text-muted)";
                 }}
               >
-                {item === "train" ? "Train" : item.charAt(0).toUpperCase() + item.slice(1)}
+                {item === "train" ? "Train" : item === "puzzles" ? "Puzzles" : item.charAt(0).toUpperCase() + item.slice(1)}
               </button>
             );
           })}
@@ -300,6 +336,78 @@ export default function TrainingDashboard() {
             </svg>
             Import Games
           </Button>
+
+          {/* Auth controls */}
+          {!authLoading && (
+            userId ? (
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span
+                  title={userEmail ?? userId}
+                  style={{
+                    fontSize: "12px",
+                    color: "var(--text-muted)",
+                    maxWidth: "140px",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {userEmail ?? "Signed in"}
+                </span>
+                <button
+                  onClick={handleSignOut}
+                  title="Sign out"
+                  style={{
+                    padding: "5px 10px",
+                    borderRadius: "6px",
+                    border: "1px solid var(--border)",
+                    background: "transparent",
+                    color: "var(--text-muted)",
+                    fontSize: "12px",
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    transition: "color 0.15s, border-color 0.15s",
+                  }}
+                  onMouseEnter={(e) => {
+                    (e.currentTarget as HTMLButtonElement).style.color = "var(--text-primary)";
+                    (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--border-subtle)";
+                  }}
+                  onMouseLeave={(e) => {
+                    (e.currentTarget as HTMLButtonElement).style.color = "var(--text-muted)";
+                    (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--border)";
+                  }}
+                >
+                  Sign Out
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setShowAuthModal(true)}
+                style={{
+                  padding: "6px 14px",
+                  borderRadius: "6px",
+                  border: "1px solid rgba(129,182,76,0.4)",
+                  background: "rgba(129,182,76,0.1)",
+                  color: "#81b64c",
+                  fontSize: "13px",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  transition: "background 0.15s, border-color 0.15s",
+                }}
+                onMouseEnter={(e) => {
+                  (e.currentTarget as HTMLButtonElement).style.background = "rgba(129,182,76,0.18)";
+                  (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(129,182,76,0.6)";
+                }}
+                onMouseLeave={(e) => {
+                  (e.currentTarget as HTMLButtonElement).style.background = "rgba(129,182,76,0.1)";
+                  (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(129,182,76,0.4)";
+                }}
+              >
+                Sign In
+              </button>
+            )
+          )}
           {activeNav === "train" && (
             <button
               onClick={() => setSidebarOpen((o) => !o)}
@@ -342,6 +450,8 @@ export default function TrainingDashboard() {
       >
         {activeNav === "games" ? (
           <GamesPanel />
+        ) : activeNav === "puzzles" ? (
+          <PuzzleTrainer />
         ) : (
           <>
         {/* ── Board section ── */}

@@ -3,6 +3,7 @@ import { enqueueGameAnalysis, isRedisQueueAvailable } from "@/lib/queue";
 import type { AnalyzeGameJobData } from "@/types";
 
 const PLACEHOLDER_USER_ID = "00000000-0000-0000-0000-000000000001";
+
 const ENQUEUE_TIMEOUT_MS = 8000;
 const ENQUEUE_CONCURRENCY = 20;
 const DEFAULT_LIMIT = 100;
@@ -70,6 +71,10 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Database not configured." }, { status: 503 });
   }
 
+  // Resolve userId: use authenticated session user, fall back to placeholder for guests.
+  const { data: { user: sessionUser } } = await supabase.auth.getUser();
+  const userId = sessionUser?.id ?? PLACEHOLDER_USER_ID;
+
   const queueAvailable = await isRedisQueueAvailable(5000);
   if (!queueAvailable) {
     return Response.json({
@@ -84,7 +89,7 @@ export async function POST(request: Request): Promise<Response> {
   let query = supabase
     .from("games")
     .select("id, user_id, pgn, white_username, black_username, status, played_at, lichess_game_id")
-    .eq("user_id", PLACEHOLDER_USER_ID)
+    .eq("user_id", userId)
     .order("played_at", { ascending: false })
     .limit(limit);
 

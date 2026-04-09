@@ -44,6 +44,58 @@ export function saveLinkedAccounts(accounts: LinkedAccounts): void {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
 }
 
+/**
+ * Persist linked accounts to Supabase user_metadata so they sync across devices.
+ * Falls back silently if auth is unavailable.
+ */
+export async function syncLinkedAccountsToSupabase(
+  accounts: LinkedAccounts
+): Promise<void> {
+  if (typeof window === "undefined") return;
+  try {
+    const { createBrowserClient } = await import("@/lib/supabase");
+    const supabase = createBrowserClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return; // guest — nothing to sync
+    await supabase.auth.updateUser({
+      data: { linkedAccounts: accounts },
+    });
+  } catch (err) {
+    console.warn("[linkedAccounts] Failed to sync to Supabase:", err);
+  }
+}
+
+/**
+ * Restore linked accounts from Supabase user_metadata into localStorage.
+ * Call this after login if localStorage is empty.
+ */
+export async function restoreLinkedAccountsFromSupabase(): Promise<LinkedAccounts | null> {
+  if (typeof window === "undefined") return null;
+  try {
+    const { createBrowserClient } = await import("@/lib/supabase");
+    const supabase = createBrowserClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return null;
+
+    const meta = user.user_metadata as Record<string, unknown> | null;
+    const stored = meta?.linkedAccounts as Partial<LinkedAccounts> | undefined;
+    if (!stored) return null;
+
+    const accounts: LinkedAccounts = {
+      lichess: normalizeUsername(stored.lichess),
+      chessCom: normalizeUsername(stored.chessCom),
+    };
+
+    // Only restore if we have something meaningful
+    if (!accounts.lichess && !accounts.chessCom) return null;
+
+    return accounts;
+  } catch (err) {
+    console.warn("[linkedAccounts] Failed to restore from Supabase:", err);
+    return null;
+  }
+}
+
 export function getLinkedUsername(
   accounts: LinkedAccounts,
   platform: LinkedPlatform

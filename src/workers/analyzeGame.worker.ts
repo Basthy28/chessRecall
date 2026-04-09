@@ -109,6 +109,28 @@ const _nativeFetch: typeof fetch | undefined =
     ? globalThis.fetch.bind(globalThis)
     : undefined;
 
+// ── ECO opening book (local JSON, no network required) ─────────────
+// Maps 4-part FEN (position + turn + castling + en-passant) → { eco, name }.
+// Built from src/lib/ecoBook.json at startup — O(1) lookup thereafter.
+interface EcoEntry { eco: string; name: string }
+const _ecoMap = new Map<string, EcoEntry>();
+try {
+  const ecoPath = resolve(process.cwd(), "src/lib/ecoBook.json");
+  const raw = JSON.parse(readFileSync(ecoPath, "utf-8")) as Record<string, EcoEntry>;
+  for (const [fen, entry] of Object.entries(raw)) {
+    const key = fen.split(" ").slice(0, 4).join(" ");
+    if (!_ecoMap.has(key)) _ecoMap.set(key, entry); // first entry wins on collision
+  }
+  console.log(`[worker] ECO book loaded: ${_ecoMap.size} positions`);
+} catch {
+  console.warn("[worker] Could not load ecoBook.json — book classification disabled");
+}
+
+function lookupEco(fen: string): EcoEntry | null {
+  const key = fen.split(" ").slice(0, 4).join(" ");
+  return _ecoMap.get(key) ?? null;
+}
+
 // ── Stockfish singleton ─────────────────────────────────────────────
 // The ASM module can only be initialized once per process.
 let _sharedEngine: StockfishEngine | null = null;
@@ -192,30 +214,102 @@ function pvToSan(fen: string, pvUci: string[]): string[] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Material values for sacrifice detection (standard piece values)
+// ─────────────────────────────────────────────────────────────────────────────
+const PIECE_VALUES: Record<string, number> = {
+  p: 1, n: 3, b: 3, r: 5, q: 9, k: 0,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sacrifice detector: returns true if the move gives up material.
+// "Gives up material" means:
+//   - The moving piece is more valuable than whatever it captures (or captures
+//     nothing — a quiet move that works by positional means is also interesting
+//     when winAfter > winBefore, e.g. a piece offered to empty square).
+// Uses chess.js to inspect the board before the move.
+// ─────────────────────────────────────────────────────────────────────────────
+function isSacrifice(fen: string, uciMove: string, winAfter: number, winBefore: number): boolean {
+  try {
+    const chess = new Chess(fen);
+    const from = uciMove.slice(0, 2) as Parameters<typeof chess.get>[0];
+    const to   = uciMove.slice(2, 4) as Parameters<typeof chess.get>[0];
+    const movingPiece = chess.get(from);
+    const targetPiece = chess.get(to);
+    if (!movingPiece) return false;
+
+    const movingValue  = PIECE_VALUES[movingPiece.type] ?? 0;
+    const captureValue = targetPiece ? (PIECE_VALUES[targetPiece.type] ?? 0) : 0;
+
+    if (captureValue === 0) {
+      // Quiet move to an empty square — counts as sacrifice only if the
+      // position genuinely improves (so we aren't flagging normal development).
+      return winAfter > winBefore - 0.05;
+    }
+
+    // Captures a lower-value (or equal-value king placeholder) piece
+    return movingValue > captureValue;
+  } catch {
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Brilliant move detection:
 //   1. The move is Stockfish's #1 choice (playedBest)
 //   2. No significant win% was lost (it really is the best)
-//   3. The second-best alternative is much worse (≥ 200 cp gap) — non-obvious
-//   4. The position was not already clearly winning before (< 80% winChance)
-//   5. The move wins or maintains the advantage (winAfter ≥ 0.60)
-//
-// This captures "only-winning-move in a tough position" without requiring
-// a full sacrifice detector (which needs deeper PV traversal).
+//   3. The second-best alternative is ≥ 150 cp worse (non-obvious)
+//   4. The position was not already clearly winning before (winBefore < 0.80)
+//   5. The move wins or maintains significant advantage (winAfter ≥ 0.55)
+//   6. NEW — sacrifice detector: the move gives up material AND
+//      the position after is no worse than before (winAfter > winBefore - 0.05)
 // ─────────────────────────────────────────────────────────────────────────────
 function isBrilliantMove(
   playedBest: boolean,
-  winBefore: number,  // win% of the position before the move
+  winBefore: number,  // win% of the position before the move (= winBest in caller)
   winBest: number,
   winAfter: number,
-  evalBefore: EvalResult
+  evalBefore: EvalResult,
+  pos: Position        // NEW: position context for sacrifice detection
 ): boolean {
   if (!playedBest) return false;
   if (winBest - winAfter >= 0.02) return false; // not actually best
   if (winBefore > 0.80) return false;           // was already clearly winning
-  if (winAfter < 0.60) return false;            // didn't achieve an advantage
+  if (winAfter < 0.55) return false;            // didn't achieve/maintain advantage
   if (evalBefore.second === null) return false;
   const gapCp = evalBefore.best.score - evalBefore.second.score;
-  return gapCp >= 200; // only this move works — non-obvious
+  if (gapCp < 150) return false;               // 2nd-best is not much worse — non-obvious check
+
+  // Sacrifice requirement: the move must give up material or be a positional
+  // investment that works (winAfter > winBefore - 0.05).
+  return isSacrifice(pos.fen, pos.movePlayed, winAfter, winBefore);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Classify a single move, handling mate scores correctly.
+//
+// Pure win% delta works for most positions but breaks when the player is
+// already losing: going from -300cp to "opponent mate-in-1" only produces a
+// delta of ~0.22 (mistake) even though the move is catastrophic.
+//
+// Special-case rules:
+//   - If opponent has a forced mating sequence after our move  → always blunder
+//   - If we had a forced mating sequence but didn't play the best move → always blunder
+//   - Otherwise use standard Lichess win% delta thresholds
+// ─────────────────────────────────────────────────────────────────────────────
+function classifyMoveWithMates(
+  evalBeforeScore: number,   // side-to-move score before our move (from eval best)
+  evalAfterScore: number,    // side-to-move score after our move (from opponent's eval, will be negated)
+  playedBest: boolean,
+): MoveClassification {
+  const MATE_THRESHOLD = 90_000;
+  // Opponent has forced mate after our move (their score is very high positive)
+  if (evalAfterScore > MATE_THRESHOLD) return "blunder";
+  // We had a forced mating sequence but didn't take it
+  if (evalBeforeScore > MATE_THRESHOLD && !playedBest) return "blunder";
+
+  const winBest = winChances(evalBeforeScore);
+  const winAfter = winChances(-evalAfterScore);
+  return classifyMove(winBest, winAfter);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -512,7 +606,9 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         }
       }
 
-      // ── Step 4: Classify each move & accumulate annotation rows ─────────
+      // ── Step 4: Classify each move & store annotations + puzzles ────────
+      // Annotations are stored for evaluation/debugging of worker quality.
+      // The browser also does its own WASM-based classification for live review.
       const annotationRows: object[] = [];
 
       for (let i = 0; i < moveCount; i++) {
@@ -522,21 +618,40 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
 
         if (!evalBefore || !evalAfter || !pos.movePlayed) continue;
 
-        // winBest: win% for the side to move if they played the best move
+        // winBest / winAfter — standard win% from side-to-move perspective
         const winBest = winChances(evalBefore.best.score);
-
-        // winAfter: win% for the same side AFTER their played move.
-        // evalAfter.best.score is from the OPPONENT's perspective → negate.
         const winAfter = winChances(-evalAfter.best.score);
 
         const playedBest = pos.movePlayed === evalBefore.best.move;
-        const baseClass = classifyMove(winBest, winAfter);
-        const miss = isMissedWin(winBest, winAfter) && baseClass !== "blunder";
-        // winBest doubles as winBefore (Stockfish score IS the position's best-play eval)
-        const brilliant = baseClass === "best" &&
-          isBrilliantMove(playedBest, winBest, winBest, winAfter, evalBefore);
-        const finalClass: MoveClassification = brilliant ? "brilliant" : miss ? "miss" : baseClass;
 
+        // Classify with mate-aware logic (avoids under-classifying blunders when
+        // the player is already losing and gives the opponent a forced mate).
+        const baseClass = classifyMoveWithMates(
+          evalBefore.best.score,
+          evalAfter.best.score,
+          playedBest,
+        );
+        const miss = isMissedWin(winBest, winAfter) && baseClass !== "blunder";
+
+        // Book move detection — synchronous lookup in local ECO book.
+        // Check the FEN *after* the move (positions[i+1] = resulting position).
+        const resultingFen = positions[i + 1]?.fen ?? "";
+        const ecoEntry = lookupEco(resultingFen);
+        const book = ecoEntry !== null && (i + 1) <= 20; // ply ≤ 20
+
+        // Brilliant detection (requires sacrifice + non-obvious best move)
+        const brilliant = !book && baseClass === "best" &&
+          isBrilliantMove(playedBest, winBest, winBest, winAfter, evalBefore, pos);
+
+        const finalClass: MoveClassification = book
+          ? "book"
+          : brilliant
+          ? "brilliant"
+          : miss
+          ? "miss"
+          : baseClass;
+
+        // Store annotation for every move (both players)
         annotationRows.push({
           game_id: gameId,
           user_id: userId,
@@ -545,11 +660,13 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           move_san: pos.san,
           fen_before: pos.fen,
           eval_best_cp: evalBefore.best.score,
-          eval_played_cp: -evalAfter.best.score, // from side-to-move perspective
+          eval_played_cp: -evalAfter.best.score,
           win_before: winBest,
           win_after: winAfter,
           classification: finalClass,
           is_miss: miss,
+          opening_name: ecoEntry?.name ?? null,
+          opening_eco: ecoEntry?.eco ?? null,
           depth: config.analysisDepth,
         });
 
@@ -628,20 +745,19 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         }
       }
 
-      // ── Step 6: Bulk-upsert move_annotations ────────────────────────────
+      // ── Step 6: Bulk-upsert annotations ─────────────────────────────────
       await job.updateProgress(90);
       if (supabase && annotationRows.length > 0) {
-        const CHUNK = 200; // Supabase upsert limit per call
+        const CHUNK = 200;
         for (let c = 0; c < annotationRows.length; c += CHUNK) {
-          const chunk = annotationRows.slice(c, c + CHUNK);
           const { error: annoError } = await supabase
             .from("move_annotations")
-            .upsert(chunk, { onConflict: "game_id,ply" });
+            .upsert(annotationRows.slice(c, c + CHUNK), { onConflict: "game_id,ply" });
           if (annoError) {
-            console.error(`[worker] move_annotations chunk ${c / CHUNK} failed:`, annoError.message);
+            console.error(`[worker] annotations chunk failed:`, annoError.message);
           }
         }
-        console.log(`[worker] ${annotationRows.length} annotations stored for game ${gameId}`);
+        console.log(`[worker] ${annotationRows.length} annotations stored`);
       }
 
       await updateGameStatus(gameId, "analyzed");
@@ -649,8 +765,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
 
       console.log(
         `[worker] Job ${job.id} complete — ` +
-        `${puzzlesFound} found, ${puzzlesValidated} validated, ` +
-        `${annotationRows.length} annotations`
+        `${puzzlesFound} puzzles found, ${puzzlesValidated} stored, ${annotationRows.length} annotations`
       );
 
       return { gameId, puzzlesFound, puzzlesValidated };

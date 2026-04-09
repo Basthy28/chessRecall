@@ -14,7 +14,6 @@ import { fetchChessComGames, convertChessComGameToDbGame } from "@/lib/chessdotc
 import { enqueueGameAnalysis, isRedisQueueAvailable } from "@/lib/queue";
 import type { AnalyzeGameJobData, Game } from "@/types";
 
-// Phase 1 placeholder — replaced by real auth in Phase 2.
 const PLACEHOLDER_USER_ID = "00000000-0000-0000-0000-000000000001";
 
 const USERNAME_REGEX = /^[a-zA-Z0-9_-]{1,25}$/;
@@ -87,13 +86,17 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
+  // Resolve userId: use authenticated session user, fall back to placeholder for guests.
+  const { data: { user: sessionUser } } = await supabase.auth.getUser();
+  const userId = sessionUser?.id ?? PLACEHOLDER_USER_ID;
+
   // ── Fetch games from the chosen platform ───────────────────────────
   let gameRows: Omit<Game, "id" | "created_at">[] = [];
 
   try {
     if (platform === "lichess") {
       const games = await fetchUserGames(username, 50);
-      gameRows = games.map((g) => convertLichessGameToDbGame(g, PLACEHOLDER_USER_ID));
+      gameRows = games.map((g) => convertLichessGameToDbGame(g, userId));
     } else {
       // Default behavior is incremental sync to avoid long-pending HTTP requests.
       // `fullSync: true` can be used for explicit full-history pulls.
@@ -105,7 +108,7 @@ export async function POST(request: Request): Promise<Response> {
         const existingCountResult = await (supabase
           .from("games")
           .select("id", { count: "exact", head: true })
-          .eq("user_id", PLACEHOLDER_USER_ID)
+          .eq("user_id", userId)
           .like("lichess_game_id", "cc_%")
           .or(
             `white_username.ilike.${normalizedUsername},black_username.ilike.${normalizedUsername}`
@@ -123,7 +126,7 @@ export async function POST(request: Request): Promise<Response> {
         const latestResult = await (supabase
           .from("games")
           .select("played_at")
-          .eq("user_id", PLACEHOLDER_USER_ID)
+          .eq("user_id", userId)
           .like("lichess_game_id", "cc_%")
           .or(
             `white_username.ilike.${normalizedUsername},black_username.ilike.${normalizedUsername}`
@@ -154,7 +157,7 @@ export async function POST(request: Request): Promise<Response> {
 
       const games = await fetchChessComGames(username, { sinceUnix, maxGames });
       gameRows = games.map((g) =>
-        convertChessComGameToDbGame(g, PLACEHOLDER_USER_ID, username)
+        convertChessComGameToDbGame(g, userId, username)
       );
     }
   } catch (err) {
@@ -231,7 +234,7 @@ export async function POST(request: Request): Promise<Response> {
 
           const jobData: AnalyzeGameJobData = {
             gameId: row.id,
-            userId: PLACEHOLDER_USER_ID,
+            userId,
             pgn: row.pgn,
             playerColor,
           };
@@ -284,11 +287,13 @@ export async function POST(request: Request): Promise<Response> {
 export async function GET(): Promise<Response> {
   try {
     const supabase = createServerClient();
+    const { data: { user: sessionUser } } = await supabase.auth.getUser();
+    const userId = sessionUser?.id ?? PLACEHOLDER_USER_ID;
 
     const { count: gamesCount, error: gamesError } = await supabase
       .from("games")
       .select("*", { count: "exact", head: true })
-      .eq("user_id", PLACEHOLDER_USER_ID);
+      .eq("user_id", userId);
 
     if (gamesError) {
       return Response.json({ error: "Failed to query games" }, { status: 500 });
@@ -297,7 +302,7 @@ export async function GET(): Promise<Response> {
     const { count: puzzlesCount, error: puzzlesError } = await supabase
       .from("puzzles")
       .select("*", { count: "exact", head: true })
-      .eq("user_id", PLACEHOLDER_USER_ID);
+      .eq("user_id", userId);
 
     if (puzzlesError) {
       return Response.json({ error: "Failed to query puzzles" }, { status: 500 });

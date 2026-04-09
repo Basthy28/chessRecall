@@ -89,6 +89,7 @@ export interface Puzzle {
 // ------------------------------------------------------------------
 
 export type MoveClassification =
+  | "book"      // 📖 — opening theory move confirmed by Lichess explorer
   | "brilliant" // !! — best move AND non-obvious sacrifice / only-winning-move
   | "great"     // !  — not top-1 but nearly as good, non-obvious
   | "best"      // ★  — engine's top choice (delta < 0.02)

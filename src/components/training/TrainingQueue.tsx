@@ -9,6 +9,7 @@ import {
   getLinkedUsername,
   readLinkedAccounts,
   saveLinkedAccounts,
+  syncLinkedAccountsToSupabase,
   type LinkedAccounts,
 } from "@/lib/linkedAccounts";
 
@@ -73,6 +74,7 @@ export default function TrainingQueue({
 
     setLinkedAccounts(next);
     saveLinkedAccounts(next);
+    void syncLinkedAccountsToSupabase(next);
     setImportMsg(
       `${platform === "chess.com" ? "Chess.com" : "Lichess"} account linked: ${normalized}`
     );
@@ -91,6 +93,7 @@ export default function TrainingQueue({
           : { ...linkedAccounts, lichess: trimmed };
       setLinkedAccounts(next);
       saveLinkedAccounts(next);
+      void syncLinkedAccountsToSupabase(next);
     }
 
     setImportState("loading");

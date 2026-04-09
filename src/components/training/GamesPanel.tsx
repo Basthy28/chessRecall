@@ -5,7 +5,7 @@ import { Chess } from "chess.js";
 import type { Square } from "chess.js";
 import type { Key } from "chessground/types";
 import Button from "@/components/ui/Button";
-import ChessBoard from "@/components/board/ChessBoard";
+import ChessBoard, { type MoveAnnotationOverlay } from "@/components/board/ChessBoard";
 import MoveTree, { type UnifiedNode } from "./MoveTree";
 import { createBrowserClient } from "@/lib/supabase";
 import {
@@ -44,6 +44,17 @@ interface GamesResponse {
   };
 }
 
+interface MoveAnnotation {
+  ply: number;
+  move_uci: string;
+  classification: import("@/lib/analysis").MoveClassification;
+  win_before: number;
+  win_after: number;
+  is_miss: boolean;
+  opening_name?: string | null;
+  opening_eco?: string | null;
+}
+
 interface LiveReviewResponse {
   game: {
     id: string;
@@ -59,6 +70,7 @@ interface LiveReviewResponse {
   };
   positions: string[];
   moves: Array<{ ply: number; san: string; from: string; to: string; timeSpentMs: number | null }>;
+  annotations: MoveAnnotation[];
   error?: string;
 }
 
@@ -141,6 +153,43 @@ function formatClock(totalSeconds: number | null): string {
   const seconds = clamped % 60;
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
+
+// Lichess accuracy formula.
+// "cpl" here = win% loss scaled to 0-100, NOT raw centipawns.
+// 103.1668 * e^(-0.04354 * avgLoss) - 3.167 where avgLoss = mean(max(0, win_before-win_after)*100).
+// Examples: avgLoss=2 → ~91%, avgLoss=6 → ~79%, avgLoss=15 → ~42%.
+function computeAccuracy(annotations: MoveAnnotation[]): number | null {
+  if (annotations.length === 0) return null;
+  const totalLoss = annotations.reduce((sum, a) => sum + Math.max(0, (a.win_before - a.win_after) * 100), 0);
+  const avgLoss = totalLoss / annotations.length;
+  return Math.round(Math.max(0, Math.min(100, 103.1668 * Math.exp(-0.04354 * avgLoss) - 3.167)));
+}
+
+const CLASSIFICATION_COLOR: Record<string, string> = {
+  brilliant: "#1baca6",
+  great: "#5ca0d3",
+  best: "#81b64c",
+  excellent: "#96bc4b",
+  good: "#96bc4b",
+  inaccuracy: "#ebba34",
+  mistake: "#e8802a",
+  blunder: "#f05149",
+  miss: "#f05149",
+  book: "#b09f87",
+};
+
+const CLASSIFICATION_LABEL: Record<string, string> = {
+  brilliant: "Brilliant !!",
+  great: "Great !",
+  best: "Best",
+  excellent: "Excellent !",
+  good: "Good",
+  inaccuracy: "Inaccuracy ?!",
+  mistake: "Mistake ?",
+  blunder: "Blunder ??",
+  miss: "Missed win",
+  book: "Book",
+};
 
 function parseScore(line: string): number | null {
   const mateMatch = line.match(/\bscore mate (-?\d+)\b/);
@@ -651,6 +700,149 @@ const NavLast = () => (
   </svg>
 );
 
+// ── Classification counts per player ───────────────────────────────
+const REPORT_ROWS: Array<{ key: import("@/lib/analysis").MoveClassification; label: string; symbol: string; color: string }> = [
+  { key: "brilliant", label: "Brilliant", symbol: "!!", color: "#1baca6" },
+  { key: "great",     label: "Great",     symbol: "!",  color: "#5ca0d3" },
+  { key: "best",      label: "Best",      symbol: "★",  color: "#81b64c" },
+  { key: "excellent", label: "Excellent", symbol: "!",  color: "#96bc4b" },
+  { key: "good",      label: "Good",      symbol: "✓",  color: "#96bc4b" },
+  { key: "book",      label: "Book",      symbol: "📖", color: "#b09f87" },
+  { key: "inaccuracy",label: "Inaccuracy",symbol: "?!", color: "#ebba34" },
+  { key: "mistake",   label: "Mistake",   symbol: "?",  color: "#e8802a" },
+  { key: "miss",      label: "Missed win",symbol: "✗",  color: "#f05149" },
+  { key: "blunder",   label: "Blunder",   symbol: "??", color: "#f05149" },
+];
+
+function GameReport({ review, onStartReview, onClose }: {
+  review: LiveReviewResponse;
+  onStartReview: () => void;
+  onClose: () => void;
+}) {
+  const anns = review.annotations ?? [];
+  const whiteAnns = anns.filter(a => a.ply % 2 === 1);
+  const blackAnns = anns.filter(a => a.ply % 2 === 0);
+
+  const whiteAcc = computeAccuracy(whiteAnns);
+  const blackAcc = computeAccuracy(blackAnns);
+
+  const countFor = (list: MoveAnnotation[], cls: string) =>
+    list.filter(a => a.classification === cls).length;
+
+  // Last book move's opening name
+  const openingEntry = [...anns].reverse().find(a => a.classification === "book" && a.opening_name);
+  const openingName = openingEntry?.opening_name ?? null;
+  const openingEco  = openingEntry?.opening_eco  ?? null;
+
+  const hasAnnotations = anns.length > 0;
+  const { whiteRating, blackRating } = review.game;
+
+  const accColor = (v: number | null) =>
+    v === null ? "#666" : v >= 90 ? "#81b64c" : v >= 75 ? "#ebba34" : "#e8802a";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, height: "calc(100dvh - 56px)", minHeight: 0, background: "var(--bg-base)", overflow: "hidden" }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: "12px", padding: "8px 16px", borderBottom: "1px solid #3c3a38", background: "#211f1c", flexShrink: 0 }}>
+        <button onClick={onClose} style={{ display: "flex", alignItems: "center", gap: "5px", padding: "5px 10px", borderRadius: "6px", border: "1px solid #3c3a38", background: "transparent", color: "#aaa", fontSize: "12px", cursor: "pointer", fontFamily: "inherit" }}>
+          <NavPrev /> Back
+        </button>
+        <span style={{ fontSize: "13px", fontWeight: 600, color: "#fff" }}>
+          {review.game.white} vs {review.game.black}
+        </span>
+        <span style={{ fontSize: "11px", color: "#666" }}>{new Date(review.game.playedAt).toLocaleDateString()}</span>
+      </div>
+
+      {/* Body */}
+      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-start", padding: "32px 16px", gap: "24px" }}>
+
+        {/* Players + accuracy */}
+        <div style={{ display: "flex", alignItems: "flex-start", gap: "48px", justifyContent: "center", width: "100%", maxWidth: "480px" }}>
+          {[
+            { name: review.game.white, rating: whiteRating, acc: whiteAcc, color: "white" as const },
+            { name: review.game.black, rating: blackRating, acc: blackAcc, color: "black" as const },
+          ].map(p => (
+            <div key={p.color} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "8px", flex: 1 }}>
+              {/* Avatar */}
+              <div style={{ width: "56px", height: "56px", borderRadius: "50%", background: p.color === "white" ? "#e8e6e2" : "#2c2b29", border: "3px solid #4a4846", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "24px" }}>
+                {p.color === "white" ? "♔" : "♚"}
+              </div>
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: "13px", fontWeight: 700, color: "#fff", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
+                {p.rating && <div style={{ fontSize: "11px", color: "#888" }}>{p.rating}</div>}
+              </div>
+              {hasAnnotations ? (
+                <div style={{ fontSize: "28px", fontWeight: 900, color: accColor(p.acc) }}>
+                  {p.acc !== null ? `${p.acc}%` : "—"}
+                </div>
+              ) : (
+                <div style={{ fontSize: "12px", color: "#555" }}>Not analyzed</div>
+              )}
+              {hasAnnotations && <div style={{ fontSize: "10px", color: "#666", textTransform: "uppercase", letterSpacing: "0.08em" }}>Accuracy</div>}
+            </div>
+          ))}
+        </div>
+
+        {/* Move counts table */}
+        {hasAnnotations && (
+          <div style={{ width: "100%", maxWidth: "420px", background: "#211f1c", borderRadius: "10px", border: "1px solid #3c3a38", overflow: "hidden" }}>
+            {REPORT_ROWS.map((row, i) => {
+              const wCount = countFor(whiteAnns, row.key);
+              const bCount = countFor(blackAnns, row.key);
+              if (wCount === 0 && bCount === 0) return null;
+              return (
+                <div key={row.key} style={{ display: "flex", alignItems: "center", padding: "8px 16px", borderBottom: i < REPORT_ROWS.length - 1 ? "1px solid #2c2a28" : "none", background: i % 2 === 0 ? "#211f1c" : "#262421" }}>
+                  <div style={{ width: "36px", textAlign: "right", fontSize: "15px", fontWeight: 900, color: "#fff" }}>{wCount}</div>
+                  <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+                    <span style={{ color: row.color, fontSize: "14px", fontWeight: 800 }}>{row.symbol}</span>
+                    <span style={{ fontSize: "12px", color: "#aaa", fontWeight: 600 }}>{row.label}</span>
+                  </div>
+                  <div style={{ width: "36px", textAlign: "left", fontSize: "15px", fontWeight: 900, color: "#fff" }}>{bCount}</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Opening + ratings */}
+        <div style={{ width: "100%", maxWidth: "420px", display: "flex", flexDirection: "column", gap: "8px" }}>
+          {openingName && (
+            <div style={{ background: "#211f1c", borderRadius: "8px", border: "1px solid #3c3a38", padding: "10px 14px" }}>
+              <div style={{ fontSize: "10px", color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: "3px" }}>{openingEco ?? "Opening"}</div>
+              <div style={{ fontSize: "13px", color: "#ccc", fontWeight: 600 }}>{openingName}</div>
+            </div>
+          )}
+          <div style={{ display: "flex", gap: "8px" }}>
+            {[
+              { label: "White Rating", value: whiteRating },
+              { label: "Black Rating", value: blackRating },
+            ].filter(x => x.value).map(x => (
+              <div key={x.label} style={{ flex: 1, background: "#211f1c", borderRadius: "8px", border: "1px solid #3c3a38", padding: "10px 14px", textAlign: "center" }}>
+                <div style={{ fontSize: "10px", color: "#666", textTransform: "uppercase", letterSpacing: "0.08em" }}>{x.label}</div>
+                <div style={{ fontSize: "18px", fontWeight: 800, color: "#fff" }}>{x.value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {!hasAnnotations && (
+          <div style={{ color: "#666", fontSize: "13px", textAlign: "center" }}>
+            No analysis data yet — analyze this game with the cluster worker to see stats.
+          </div>
+        )}
+
+        {/* Start Review */}
+        <button
+          onClick={onStartReview}
+          style={{ padding: "12px 48px", borderRadius: "8px", border: "none", background: "#81b64c", color: "#fff", fontSize: "15px", fontWeight: 800, cursor: "pointer", letterSpacing: "0.04em", marginTop: "8px" }}
+        >
+          Start Review
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Full-screen chess.com-style review view ────────────────────────
 function ReviewView({
   review,
@@ -681,6 +873,26 @@ function ReviewView({
     }
     return root;
   }, [review]);
+
+  // Build a map from UCI path → classification using stored annotations
+  const nodeClassifications = useMemo(() => {
+    const map: Record<string, import("@/lib/analysis").MoveClassification> = {};
+    for (const ann of review.annotations ?? []) {
+      const plyIdx = ann.ply - 1; // 0-indexed
+      if (plyIdx < 0 || plyIdx >= review.moves.length) continue;
+      const path = review.moves.slice(0, plyIdx + 1).map(m => m.from + m.to).join(",");
+      map[path] = ann.classification;
+    }
+    return map;
+  }, [review.annotations, review.moves]);
+
+  // Accuracy per color using Lichess formula
+  const { whiteAccuracy, blackAccuracy } = useMemo(() => {
+    const anns = review.annotations ?? [];
+    const white = anns.filter(a => a.ply % 2 === 1); // odd ply = white move
+    const black = anns.filter(a => a.ply % 2 === 0); // even ply = black move
+    return { whiteAccuracy: computeAccuracy(white), blackAccuracy: computeAccuracy(black) };
+  }, [review.annotations]);
 
   const [rootNode, setRootNode] = useState<UnifiedNode>(initialTree);
   const [preferredChildren, setPreferredChildren] = useState<Record<string, string>>({});
@@ -950,6 +1162,22 @@ function ReviewView({
     return null;
   }, [activeFen]);
 
+  // Board annotation: show the classification badge on the destination square of the last move
+  const boardAnnotation = useMemo((): MoveAnnotationOverlay | undefined => {
+    if (activePath.length === 0) return undefined;
+    const pathKey = activePath.join(",");
+    const cls = nodeClassifications[pathKey];
+    if (!cls || cls === "book" || cls === "best" || cls === "good" || cls === "excellent") return undefined;
+    const lastUci = activePath[activePath.length - 1];
+    const destSquare = lastUci.slice(2, 4) as Key;
+    const SYMBOLS: Record<string, string> = {
+      brilliant: "!!", great: "!", inaccuracy: "?!", mistake: "?", blunder: "??", miss: "✗",
+    };
+    const symbol = SYMBOLS[cls];
+    if (!symbol) return undefined;
+    return { square: destSquare, symbol, color: CLASSIFICATION_COLOR[cls] ?? "#999" };
+  }, [activePath, nodeClassifications]);
+
   const resultLabel = review.game.result === "win" ? "1-0" : review.game.result === "loss" ? "0-1" : "½-½";
   const whiteEval = analysis?.best.score ?? 0;
   const viewerColor = review.game.playerColor ?? null;
@@ -1217,6 +1445,7 @@ function ReviewView({
                     interactive
                     onMove={handleBoardMove}
                     showCoordinates
+                    annotation={boardAnnotation}
                   />
                 </div>
                 {bottomBoardProfile && (
@@ -1268,16 +1497,17 @@ function ReviewView({
             ))}
           </div>
 
+          {/* Player names + accuracy */}
           <div style={{ padding: "10px 12px", borderBottom: "1px solid #3c3a38", flexShrink: 0, display: "grid", gap: "6px" }}>
             {(
               orientation === "white"
                 ? [
-                    { side: "top", color: "black" as const, name: review.game.black },
-                    { side: "bottom", color: "white" as const, name: review.game.white },
+                    { side: "top", color: "black" as const, name: review.game.black, accuracy: blackAccuracy },
+                    { side: "bottom", color: "white" as const, name: review.game.white, accuracy: whiteAccuracy },
                   ]
                 : [
-                    { side: "top", color: "white" as const, name: review.game.white },
-                    { side: "bottom", color: "black" as const, name: review.game.black },
+                    { side: "top", color: "white" as const, name: review.game.white, accuracy: whiteAccuracy },
+                    { side: "bottom", color: "black" as const, name: review.game.black, accuracy: blackAccuracy },
                   ]
             ).map((player) => (
               <div
@@ -1288,22 +1518,44 @@ function ReviewView({
                   <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: player.color === "white" ? "#e8e6e2" : "#111", border: "1px solid rgba(255,255,255,0.18)", flexShrink: 0 }} />
                   <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{player.name}</span>
                 </span>
-                {viewerColor === player.color && (
-                  <span style={{ padding: "2px 6px", borderRadius: "999px", background: "#3c3a38", fontSize: "11px", fontWeight: 800 }}>
-                    You
-                  </span>
-                )}
+                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                  {player.accuracy !== null && (
+                    <span style={{ fontSize: "12px", fontWeight: 700, color: player.accuracy >= 90 ? "#81b64c" : player.accuracy >= 75 ? "#ebba34" : "#e8802a" }}>
+                      {player.accuracy}%
+                    </span>
+                  )}
+                  {viewerColor === player.color && (
+                    <span style={{ padding: "2px 6px", borderRadius: "999px", background: "#3c3a38", fontSize: "11px", fontWeight: 800 }}>
+                      You
+                    </span>
+                  )}
+                </div>
               </div>
             ))}
           </div>
 
-          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 12px', fontSize: '11px', color: '#999', alignItems: 'center', flexShrink: 0 }}>
+          {/* Current move classification badge */}
+          {(() => {
+            if (activePath.length === 0) return null;
+            const pathKey = activePath.join(",");
+            const cls = nodeClassifications[pathKey];
+            if (!cls || cls === "book") return null;
+            const color = CLASSIFICATION_COLOR[cls] ?? "#999";
+            const label = CLASSIFICATION_LABEL[cls] ?? cls;
+            return (
+              <div style={{ padding: "6px 12px", borderBottom: "1px solid #3c3a38", flexShrink: 0, display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: color, flexShrink: 0 }} />
+                <span style={{ fontSize: "13px", fontWeight: 700, color }}>{label}</span>
+              </div>
+            );
+          })()}
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 12px', fontSize: '11px', color: '#999', alignItems: 'center', flexShrink: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
               <span style={{ color: '#fff', fontWeight: 'bold' }}>✓ Analysis</span>
-              <span>•••</span>
             </div>
             <div>
-              {analysis?.depth ? `depth=${analysis.depth}` : "depth=..."} | t=20s | SF18
+              {analysis?.depth ? `depth ${analysis.depth}` : "..."} | SF18
             </div>
           </div>
 
@@ -1367,7 +1619,7 @@ function ReviewView({
               Starting Position
             </div>
             {/* Replaced MoveList with MoveTree */}
-           <MoveTree rootNode={rootNode} activePath={activePath} onSelectPath={handleSelectPath} />
+           <MoveTree rootNode={rootNode} activePath={activePath} onSelectPath={handleSelectPath} nodeClassifications={nodeClassifications} />
           </div>
 
           <div style={{ padding: '12px', background: '#211f1c', display: 'flex', justifyContent: 'center', flexShrink: 0 }}>
@@ -1410,7 +1662,8 @@ export default function GamesPanel() {
   const [actionLoading, setActionLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [reviewLoading, setReviewLoading] = useState(false);
-  const [review, setReview] = useState<LiveReviewResponse | null>(null);
+  const [report, setReport] = useState<LiveReviewResponse | null>(null);  // game report / stats
+  const [review, setReview] = useState<LiveReviewResponse | null>(null);  // board review
   const [reviewIndex, setReviewIndex] = useState(0);
 
   useEffect(() => {
@@ -1604,7 +1857,7 @@ export default function GamesPanel() {
       if (!res.ok) {
         setMessage(json.error ?? "Could not open live review for this game.");
       } else {
-        setReview(json);
+        setReport(json);  // show report/stats first
         setReviewIndex(0);
       }
     } catch {
@@ -1614,6 +1867,17 @@ export default function GamesPanel() {
     }
   }
 
+  // ── Game report / stats panel ──────────────────────────────────
+  if (report && !review) {
+    return (
+      <GameReport
+        review={report}
+        onStartReview={() => { setReview(report); }}
+        onClose={() => { setReport(null); setReviewIndex(0); }}
+      />
+    );
+  }
+
   // ── Review mode: full chess.com-style layout ───────────────────
   if (review) {
     return (
@@ -1621,7 +1885,7 @@ export default function GamesPanel() {
         review={review}
         reviewIndex={reviewIndex}
         setReviewIndex={setReviewIndex}
-        onClose={() => { setReview(null); setReviewIndex(0); }}
+        onClose={() => { setReview(null); setReport(null); setReviewIndex(0); }}
       />
     );
   }

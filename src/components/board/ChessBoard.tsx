@@ -7,6 +7,12 @@ import type { Api } from "chessground/api";
 import type { Config } from "chessground/config";
 import type { Color, Key } from "chessground/types";
 
+export interface MoveAnnotationOverlay {
+  square: Key;   // destination square of the annotated move
+  symbol: string; // "!!", "?", "!?", "★", etc.
+  color: string;  // CSS color
+}
+
 interface ChessBoardProps {
   fen?: string;
   orientation?: Color;
@@ -16,6 +22,7 @@ interface ChessBoardProps {
   allowAnyColorMoves?: boolean;
   className?: string;
   showCoordinates?: boolean;
+  annotation?: MoveAnnotationOverlay;
 }
 
 function getLegalDests(fen: string): Map<Key, Key[]> {
@@ -63,6 +70,17 @@ function getCheckColor(fen: string): Color | false {
   return chess.turn() === "w" ? "white" : "black";
 }
 
+function squareToPercent(square: Key, orientation: Color): { left: string; top: string } {
+  const file = square.charCodeAt(0) - 97; // a=0..h=7
+  const rank = parseInt(square[1], 10) - 1; // 1=0..8=7
+  const col = orientation === "white" ? file : 7 - file;
+  const row = orientation === "white" ? 7 - rank : rank;
+  return {
+    left: `${col * 12.5 + 9}%`,
+    top: `${row * 12.5 + 0.5}%`,
+  };
+}
+
 export default function ChessBoard({
   fen,
   orientation = "white",
@@ -72,6 +90,7 @@ export default function ChessBoard({
   allowAnyColorMoves = false,
   className = "",
   showCoordinates = false,
+  annotation,
 }: ChessBoardProps) {
   const innerRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<Api | null>(null);
@@ -264,6 +283,36 @@ export default function ChessBoard({
         ref={innerRef}
         style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
       />
+      {annotation && (() => {
+        const pos = squareToPercent(annotation.square, orientation);
+        return (
+          <div
+            style={{
+              position: "absolute",
+              left: pos.left,
+              top: pos.top,
+              pointerEvents: "none",
+              zIndex: 5,
+              background: annotation.color,
+              color: "#fff",
+              borderRadius: "50%",
+              width: "22%",
+              maxWidth: "28px",
+              aspectRatio: "1",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: "clamp(8px, 1.8vw, 13px)",
+              fontWeight: 900,
+              boxShadow: "0 1px 4px rgba(0,0,0,0.7)",
+              lineHeight: 1,
+              transform: "translate(-2px, -2px)",
+            }}
+          >
+            {annotation.symbol}
+          </div>
+        );
+      })()}
     </div>
   );
 }

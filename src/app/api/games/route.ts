@@ -1,6 +1,7 @@
 import { createServerClient } from "@/lib/supabase";
 
 const PLACEHOLDER_USER_ID = "00000000-0000-0000-0000-000000000001";
+
 const DEFAULT_LIMIT = 200;
 const MAX_LIMIT = 1000;
 
@@ -13,6 +14,10 @@ export async function GET(request: Request): Promise<Response> {
   } catch {
     return Response.json({ error: "Database not configured." }, { status: 503 });
   }
+
+  // Resolve userId: use authenticated session user, fall back to placeholder for guests.
+  const { data: { user: sessionUser } } = await supabase.auth.getUser();
+  const userId = sessionUser?.id ?? PLACEHOLDER_USER_ID;
 
   const url = new URL(request.url);
   const username = (url.searchParams.get("username") ?? "").trim().toLowerCase();
@@ -32,7 +37,7 @@ export async function GET(request: Request): Promise<Response> {
     .select(
       "id, lichess_game_id, white_username, black_username, white_rating, black_rating, played_at, time_control, result, status"
     )
-    .eq("user_id", PLACEHOLDER_USER_ID)
+    .eq("user_id", userId)
     .order("played_at", { ascending: false })
     .limit(limit);
 
