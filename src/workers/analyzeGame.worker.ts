@@ -96,6 +96,7 @@ interface EvalResult {
 const ENGINE_MODE = (process.env.ENGINE_MODE ?? "wasm") as "native" | "wasm";
 const STOCKFISH_THREADS = Math.max(1, Number(process.env.STOCKFISH_THREADS ?? "1"));
 const STOCKFISH_HASH_MB = Math.max(64, Number(process.env.STOCKFISH_HASH_MB ?? "256"));
+const STOCKFISH_PATH = process.env.STOCKFISH_PATH ?? "/usr/games/stockfish";
 // Use movetime (ms) when > 0, otherwise fall back to depth
 const STOCKFISH_MOVETIME_MS = Number(process.env.STOCKFISH_MOVETIME_MS ?? "0");
 const ENV_DEPTH = process.env.ANALYSIS_DEPTH ? Number(process.env.ANALYSIS_DEPTH) : null;
@@ -232,7 +233,8 @@ function isMissedWin(winBest: number, winAfter: number): boolean {
 // Output lines are delivered to engine.listener one at a time.
 // ─────────────────────────────────────────────────────────────────────────────
 function spawnNativeEngine(): StockfishEngine {
-  const proc = spawn("stockfish");
+  // Use an explicit binary path so we never hit node_modules/.bin/stockfish (WASM wrapper).
+  const proc = spawn(STOCKFISH_PATH);
   let buf = "";
 
   const engine: StockfishEngine = {

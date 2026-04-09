@@ -3,7 +3,7 @@ import { enqueueGameAnalysis, isRedisQueueAvailable } from "@/lib/queue";
 import type { AnalyzeGameJobData } from "@/types";
 
 const PLACEHOLDER_USER_ID = "00000000-0000-0000-0000-000000000001";
-const ENQUEUE_TIMEOUT_MS = 2500;
+const ENQUEUE_TIMEOUT_MS = 8000;
 const ENQUEUE_CONCURRENCY = 20;
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
@@ -70,7 +70,7 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Database not configured." }, { status: 503 });
   }
 
-  const queueAvailable = await isRedisQueueAvailable();
+  const queueAvailable = await isRedisQueueAvailable(5000);
   if (!queueAvailable) {
     return Response.json({
       selected: 0,

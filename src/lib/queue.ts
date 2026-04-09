@@ -21,7 +21,7 @@ function getRedis(): IORedis {
       password: process.env.REDIS_PASSWORD,
       lazyConnect: true,
       enableOfflineQueue: false,
-      connectTimeout: 2000,
+      connectTimeout: 8000,
       maxRetriesPerRequest: null,
       retryStrategy: (times) => (times > 2 ? null : Math.min(times * 250, 1000)),
     });
@@ -55,7 +55,7 @@ export async function enqueueGameAnalysis(data: AnalyzeGameJobData): Promise<str
   return job.id!;
 }
 
-export async function isRedisQueueAvailable(timeoutMs: number = 1200): Promise<boolean> {
+export async function isRedisQueueAvailable(timeoutMs: number = 5000): Promise<boolean> {
   const probe = new IORedis({
     host: process.env.REDIS_HOST ?? "127.0.0.1",
     port: Number(process.env.REDIS_PORT ?? 6379),
@@ -75,8 +75,10 @@ export async function isRedisQueueAvailable(timeoutMs: number = 1200): Promise<b
         setTimeout(() => reject(new Error("Redis ping timeout")), timeoutMs);
       }),
     ]);
+    console.log("[queue] Redis probe: connected OK");
     return true;
-  } catch {
+  } catch (err) {
+    console.error("[queue] Redis probe failed:", (err as Error).message);
     return false;
   } finally {
     probe.disconnect();

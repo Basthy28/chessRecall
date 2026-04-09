@@ -1472,10 +1472,18 @@ export default function GamesPanel() {
     [linkedAccounts]
   );
 
-  // Realtime subscription — fires whenever any game row changes in the DB.
-  // Replaces the old polling loop: no stacked intervals, instant status updates.
+  // Realtime subscription — patches game status in-place from the event payload.
+  // No API call needed for status-only changes; full reload only when a game
+  // transitions to "analyzed" (so annotations/puzzles counts are fresh).
   useEffect(() => {
     if (!hasRunningAnalysis || review) return;
+
+    // Debounce full reloads so rapid bursts (many games finishing at once) collapse.
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleReload = () => {
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => { void loadGames({ silent: true }); }, 1500);
+    };
 
     const supabase = createBrowserClient();
     const channel = supabase
@@ -1483,11 +1491,30 @@ export default function GamesPanel() {
       .on(
         "postgres_changes",
         { event: "UPDATE", schema: "public", table: "games" },
-        () => { void loadGames({ silent: true }); }
+        (payload: { new: Partial<GameRow> }) => {
+          const updated = payload.new;
+          if (!updated.id || !updated.status) return;
+
+          // Optimistically patch the status in local state — no fetch needed.
+          setGames((prev) =>
+            prev.map((g) =>
+              g.id === updated.id ? { ...g, status: updated.status as GameStatus } : g
+            )
+          );
+
+          // When a game finishes analysis we want fresh stats/counts, but debounce
+          // so a batch of completions only triggers one reload.
+          if (updated.status === "analyzed" || updated.status === "failed") {
+            scheduleReload();
+          }
+        }
       )
       .subscribe();
 
-    return () => { void supabase.removeChannel(channel); };
+    return () => {
+      if (reloadTimer) clearTimeout(reloadTimer);
+      void supabase.removeChannel(channel);
+    };
   }, [hasRunningAnalysis, loadGames, review]);
 
   async function queueSelectedGame() {

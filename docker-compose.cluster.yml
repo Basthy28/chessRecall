@@ -27,12 +27,12 @@ services:
       - --appendonly
       - "yes"
       - --requirepass
-      - "${REDIS_PASSWORD}"   # set a strong password in .env
+      - "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env or pass --env-file}"   # set a strong password in .env
     volumes:
       - redis_data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env or pass --env-file}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -58,7 +58,7 @@ services:
       # ── Redis (internal Docker network) ───────────────────────────────────
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env or pass --env-file}"
 
       # ── Supabase ──────────────────────────────────────────────────────────
       NEXT_PUBLIC_SUPABASE_URL: "${NEXT_PUBLIC_SUPABASE_URL}"
