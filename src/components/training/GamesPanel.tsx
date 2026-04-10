@@ -857,7 +857,6 @@ function ReviewView({
 }) {
   const total = review.positions.length - 1;
   const [windowWidth, setWindowWidth] = useState(1280);
-  const [sideTab, setSideTab] = useState<"Moves" | "Info" | "Openings">("Moves");
   const [orientation, setOrientation] = useState<"white" | "black">(
     review.game.playerColor === "black" ? "black" : "white"
   );
@@ -1487,120 +1486,52 @@ function ReviewView({
           </div>
 
           <div style={{ display: 'flex', borderBottom: '1px solid #3c3a38', flexShrink: 0 }}>
-            {(['Moves', 'Info', 'Openings'] as const).map((tab) => (
-              <button key={tab} onClick={() => setSideTab(tab)} style={{
+            {['Moves', 'Info', 'Openings'].map((tab, i) => (
+              <button key={tab} style={{
                 flex: 1, padding: '10px 0', fontSize: '12px', fontWeight: 600,
-                color: sideTab === tab ? '#fff' : '#666',
-                borderBottom: sideTab === tab ? '2px solid #81b64c' : '2px solid transparent',
-                background: 'transparent', border: 'none', borderBottomStyle: 'solid',
-                borderBottomWidth: '2px', borderBottomColor: sideTab === tab ? '#81b64c' : 'transparent',
-                cursor: 'pointer', fontFamily: 'inherit',
+                color: i === 0 ? '#fff' : '#999',
+                background: 'transparent', border: 'none', cursor: 'pointer',
               }}>
                 {tab}
               </button>
             ))}
           </div>
 
-          {/* ── Info tab ─────────────────────────────────────────── */}
-          {sideTab === 'Info' && (() => {
-            const anns = review.annotations ?? [];
-            const wAnns = anns.filter(a => a.ply % 2 === 1);
-            const bAnns = anns.filter(a => a.ply % 2 === 0);
-            const openingEntry = [...anns].reverse().find(a => a.classification === 'book' && a.opening_name);
-            const accColor = (v: number | null) => v === null ? '#666' : v >= 90 ? '#81b64c' : v >= 75 ? '#ebba34' : '#e8802a';
-
-            return (
-              <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 0 }}>
-                {/* Accuracy header */}
-                <div style={{ display: 'flex', padding: '14px 12px', borderBottom: '1px solid #3c3a38', gap: '8px', background: '#211f1c' }}>
-                  {[
-                    { name: review.game.white, rating: review.game.whiteRating, acc: whiteAccuracy, color: 'white' as const },
-                    { name: review.game.black, rating: review.game.blackRating, acc: blackAccuracy, color: 'black' as const },
-                  ].map(p => (
-                    <div key={p.color} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
-                      <div style={{ width: '36px', height: '36px', borderRadius: '50%', background: p.color === 'white' ? '#e8e6e2' : '#2c2b29', border: '2px solid #4a4846', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '18px' }}>
-                        {p.color === 'white' ? '♔' : '♚'}
-                      </div>
-                      <div style={{ fontSize: '11px', fontWeight: 700, color: '#ccc', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%' }}>{p.name}</div>
-                      {p.rating && <div style={{ fontSize: '10px', color: '#666' }}>{p.rating}</div>}
-                      <div style={{ fontSize: '22px', fontWeight: 900, color: accColor(p.acc), lineHeight: 1 }}>{p.acc !== null ? `${p.acc}%` : '—'}</div>
-                      <div style={{ fontSize: '9px', color: '#555', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Accuracy</div>
-                    </div>
-                  ))}
-                </div>
-
-                {/* Move counts table */}
-                {anns.length > 0 && (
-                  <div style={{ flexShrink: 0 }}>
-                    {/* Header row */}
-                    <div style={{ display: 'flex', padding: '6px 12px', borderBottom: '1px solid #3c3a38', background: '#1e1c1a' }}>
-                      <div style={{ width: '32px', textAlign: 'right', fontSize: '10px', color: '#555', textTransform: 'uppercase' }}>W</div>
-                      <div style={{ flex: 1 }} />
-                      <div style={{ width: '32px', textAlign: 'left', fontSize: '10px', color: '#555', textTransform: 'uppercase' }}>B</div>
-                    </div>
-                    {REPORT_ROWS.map((row) => {
-                      const wc = wAnns.filter(a => a.classification === row.key).length;
-                      const bc = bAnns.filter(a => a.classification === row.key).length;
-                      if (wc === 0 && bc === 0) return null;
-                      return (
-                        <div key={row.key} style={{ display: 'flex', alignItems: 'center', padding: '7px 12px', borderBottom: '1px solid #2a2826' }}>
-                          <div style={{ width: '32px', textAlign: 'right', fontSize: '14px', fontWeight: 900, color: '#fff' }}>{wc}</div>
-                          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
-                            <span style={{ color: row.color, fontSize: '13px', fontWeight: 800, minWidth: '16px', textAlign: 'center' }}>{row.symbol}</span>
-                            <span style={{ fontSize: '11px', color: '#aaa', fontWeight: 600 }}>{row.label}</span>
-                          </div>
-                          <div style={{ width: '32px', textAlign: 'left', fontSize: '14px', fontWeight: 900, color: '#fff' }}>{bc}</div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {/* Opening + ratings */}
-                <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  {openingEntry?.opening_name && (
-                    <div style={{ background: '#211f1c', borderRadius: '6px', border: '1px solid #3c3a38', padding: '8px 10px' }}>
-                      <div style={{ fontSize: '9px', color: '#555', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '2px' }}>{openingEntry.opening_eco ?? 'Opening'}</div>
-                      <div style={{ fontSize: '12px', color: '#ccc', fontWeight: 600 }}>{openingEntry.opening_name}</div>
-                    </div>
+          {/* Player names + accuracy */}
+          <div style={{ padding: "10px 12px", borderBottom: "1px solid #3c3a38", flexShrink: 0, display: "grid", gap: "6px" }}>
+            {(
+              orientation === "white"
+                ? [
+                    { side: "top", color: "black" as const, name: review.game.black, accuracy: blackAccuracy },
+                    { side: "bottom", color: "white" as const, name: review.game.white, accuracy: whiteAccuracy },
+                  ]
+                : [
+                    { side: "top", color: "white" as const, name: review.game.white, accuracy: whiteAccuracy },
+                    { side: "bottom", color: "black" as const, name: review.game.black, accuracy: blackAccuracy },
+                  ]
+            ).map((player) => (
+              <div
+                key={`${player.side}-${player.color}`}
+                style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px" }}
+              >
+                <span style={{ fontSize: "12px", fontWeight: 800, color: "#fff", display: "inline-flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
+                  <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: player.color === "white" ? "#e8e6e2" : "#111", border: "1px solid rgba(255,255,255,0.18)", flexShrink: 0 }} />
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{player.name}</span>
+                </span>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                  {player.accuracy !== null && (
+                    <span style={{ fontSize: "12px", fontWeight: 700, color: player.accuracy >= 90 ? "#81b64c" : player.accuracy >= 75 ? "#ebba34" : "#e8802a" }}>
+                      {player.accuracy}%
+                    </span>
                   )}
-                  {(review.game.whiteRating || review.game.blackRating) && (
-                    <div style={{ display: 'flex', gap: '6px' }}>
-                      {[{ label: 'White', val: review.game.whiteRating }, { label: 'Black', val: review.game.blackRating }].filter(x => x.val).map(x => (
-                        <div key={x.label} style={{ flex: 1, background: '#211f1c', borderRadius: '6px', border: '1px solid #3c3a38', padding: '8px', textAlign: 'center' }}>
-                          <div style={{ fontSize: '9px', color: '#555', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{x.label}</div>
-                          <div style={{ fontSize: '16px', fontWeight: 800, color: '#fff' }}>{x.val}</div>
-                        </div>
-                      ))}
-                    </div>
+                  {viewerColor === player.color && (
+                    <span style={{ padding: "2px 6px", borderRadius: "999px", background: "#3c3a38", fontSize: "11px", fontWeight: 800 }}>
+                      You
+                    </span>
                   )}
-                  {anns.length === 0 && <div style={{ fontSize: '12px', color: '#555', textAlign: 'center', padding: '20px 0' }}>Analyze this game to see stats.</div>}
                 </div>
               </div>
-            );
-          })()}
-
-          {/* ── Moves tab ────────────────────────────────────────── */}
-          {sideTab === 'Moves' && <>
-          {/* Player names */}
-          <div style={{ padding: "8px 12px", borderBottom: "1px solid #3c3a38", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flex: 1 }}>
-              {[
-                { color: 'white' as const, name: review.game.white, acc: whiteAccuracy },
-                { color: 'black' as const, name: review.game.black, acc: blackAccuracy },
-              ].map(p => (
-                <div key={p.color} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span style={{ fontSize: '12px', fontWeight: 800, color: '#fff', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                    <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: p.color === 'white' ? '#e8e6e2' : '#111', border: '1px solid rgba(255,255,255,0.2)', flexShrink: 0 }} />
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '140px' }}>{p.name}</span>
-                  </span>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    {p.acc !== null && <span style={{ fontSize: '11px', fontWeight: 700, color: p.acc >= 90 ? '#81b64c' : p.acc >= 75 ? '#ebba34' : '#e8802a' }}>{p.acc}%</span>}
-                    {viewerColor === p.color && <span style={{ padding: '1px 5px', borderRadius: '999px', background: '#3c3a38', fontSize: '10px', fontWeight: 800 }}>You</span>}
-                  </div>
-                </div>
-              ))}
-            </div>
+            ))}
           </div>
 
           {/* Current move classification badge */}
@@ -1709,7 +1640,6 @@ function ReviewView({
                 ))}
             </div>
           </div>
-          </>}
         </div>
       </div>
     </div>
@@ -1732,7 +1662,8 @@ export default function GamesPanel() {
   const [actionLoading, setActionLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [reviewLoading, setReviewLoading] = useState(false);
-  const [review, setReview] = useState<LiveReviewResponse | null>(null);
+  const [report, setReport] = useState<LiveReviewResponse | null>(null);  // game report / stats
+  const [review, setReview] = useState<LiveReviewResponse | null>(null);  // board review
   const [reviewIndex, setReviewIndex] = useState(0);
 
   useEffect(() => {
@@ -1926,7 +1857,7 @@ export default function GamesPanel() {
       if (!res.ok) {
         setMessage(json.error ?? "Could not open live review for this game.");
       } else {
-        setReview(json);
+        setReport(json);  // show report/stats first
         setReviewIndex(0);
       }
     } catch {
