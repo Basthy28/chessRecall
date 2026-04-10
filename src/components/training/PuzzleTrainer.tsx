@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { Chess } from "chess.js";
 import type { Key } from "chessground/types";
 import ChessBoard from "@/components/board/ChessBoard";
@@ -142,18 +142,21 @@ export default function PuzzleTrainer() {
   const [puzzles, setPuzzles] = useState<Puzzle[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [state, setState] = useState<PuzzleState>("solving");
-  const [displayFen, setDisplayFen] = useState<string | undefined>(undefined);
-  const [lastMove, setLastMove] = useState<[Key, Key] | undefined>(undefined);
+  
+  // Interactive puzzle state
+  const [playedMoves, setPlayedMoves] = useState<string[]>([]);
+  const [viewPly, setViewPly] = useState<number>(0);
+  const [debugLastEval, setDebugLastEval] = useState<string>("Ninghuem jogou nada ainda");
+
+  // Wrong move visual feedback
+  const [wrongFen, setWrongFen] = useState<string | undefined>();
+  const [wrongLastMove, setWrongLastMove] = useState<[Key, Key] | undefined>();
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
-  const [animatingLine, setAnimatingLine] = useState(false);
-  const [lineIndex, setLineIndex] = useState(0);
-  const [lineFens, setLineFens] = useState<string[]>([]);
-  const [lineLastMoves, setLineLastMoves] = useState<Array<[Key, Key]>>([]);
 
   const wrongResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lineAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Fetch due puzzles ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -189,132 +192,173 @@ export default function PuzzleTrainer() {
 
   useEffect(() => {
     if (!currentPuzzle) return;
-    setDisplayFen(currentPuzzle.fen);
-    setLastMove(undefined);
+    setPlayedMoves([]);
+    setViewPly(0);
     setState("solving");
-    setAnimatingLine(false);
-    setLineIndex(0);
-    setLineFens([]);
-    setLineLastMoves([]);
+    setWrongFen(undefined);
+    setWrongLastMove(undefined);
   }, [currentPuzzle]);
 
-  // ── Keyboard shortcuts for SRS rating ────────────────────────────────────
+  // Compute Fen and LastMove based on viewPly
+  const baseFen = currentPuzzle?.fen ?? "start";
+  const { displayFen, displayLastMove } = useMemo(() => {
+    let f = baseFen;
+    let lm: [Key, Key] | undefined;
+    
+    if (wrongFen) {
+      return { displayFen: wrongFen, displayLastMove: wrongLastMove };
+    }
+
+    if (currentPuzzle) {
+      for (let i = 0; i < viewPly; i++) {
+        const uci = playedMoves[i];
+        if (!uci) break;
+        const newF = applyUciMove(f, uci);
+        if (newF) f = newF;
+        lm = uciToSquares(uci);
+      }
+    }
+    return { displayFen: f, displayLastMove: lm };
+  }, [baseFen, currentPuzzle, viewPly, playedMoves, wrongFen, wrongLastMove]);
+
+
+  const revealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── Keyboard shortcuts for SRS rating & history review ─────────────────────
   useEffect(() => {
-    if (state !== "rating") return;
     function handleKey(e: KeyboardEvent) {
+      if (state === "rating" || state === "correct") {
+        if (e.key === "ArrowLeft") setViewPly((p) => Math.max(0, p - 1));
+        if (e.key === "ArrowRight") setViewPly((p) => Math.min(playedMoves.length, p + 1));
+      }
+      
+      if (state !== "rating") return;
       if (e.key === "1") handleSrsRating("hard");
       else if (e.key === "2") handleSrsRating("good");
       else if (e.key === "3") handleSrsRating("easy");
     }
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state]);
+  }, [state, playedMoves.length, handleSrsRating]);
 
   // ── Cleanup timers on unmount ─────────────────────────────────────────────
   useEffect(() => {
     return () => {
       if (wrongResetTimerRef.current) clearTimeout(wrongResetTimerRef.current);
-      if (lineAnimTimerRef.current) clearTimeout(lineAnimTimerRef.current);
+      if (revealTimerRef.current) clearInterval(revealTimerRef.current);
     };
-  }, []);
-
-  // ── Animate solution line after correct move ──────────────────────────────
-  const animateSolutionLine = useCallback((puzzle: Puzzle) => {
-    setAnimatingLine(true);
-
-    // Build the sequence of FENs for the solution line
-    const fens: string[] = [];
-    const moves: Array<[Key, Key]> = [];
-    let fen = puzzle.fen;
-
-    // First apply the solution move itself
-    const solutionFen = applyUciMove(fen, puzzle.solution_move);
-    if (solutionFen) {
-      fens.push(solutionFen);
-      moves.push(uciToSquares(puzzle.solution_move));
-      fen = solutionFen;
-    }
-
-    // Then apply the rest of the PV line (skip first element which is solution_move)
-    for (let i = 1; i < puzzle.solution_line_uci.length; i++) {
-      const uci = puzzle.solution_line_uci[i];
-      const nextFen = applyUciMove(fen, uci);
-      if (!nextFen) break;
-      fens.push(nextFen);
-      moves.push(uciToSquares(uci));
-      fen = nextFen;
-    }
-
-    setLineFens(fens);
-    setLineLastMoves(moves);
-    setLineIndex(0);
-
-    // Show first move immediately
-    if (fens.length > 0) {
-      setDisplayFen(fens[0]);
-      setLastMove(moves[0]);
-    }
-
-    // Animate subsequent moves
-    let idx = 1;
-    function step() {
-      if (idx >= fens.length) {
-        setAnimatingLine(false);
-        return;
-      }
-      lineAnimTimerRef.current = setTimeout(() => {
-        setDisplayFen(fens[idx]);
-        setLastMove(moves[idx]);
-        setLineIndex(idx);
-        idx++;
-        step();
-      }, 700);
-    }
-    if (fens.length > 1) {
-      lineAnimTimerRef.current = setTimeout(step, 700);
-    } else {
-      setAnimatingLine(false);
-    }
   }, []);
 
   // ── Handle user move ──────────────────────────────────────────────────────
   const handleMove = useCallback((orig: Key, dest: Key) => {
-    if (!currentPuzzle) return;
-    if (state !== "solving") return;
+    if (!currentPuzzle || state !== "solving") return;
+
+    // Must be at the latest ply to play
+    if (viewPly !== playedMoves.length) {
+      setViewPly(playedMoves.length);
+      return;
+    }
 
     const moveUci = `${orig}${dest}`;
-    const isCorrect = moveUci === currentPuzzle.solution_move;
+    
+    // Support either the new solution_line_uci array, legacy solution_move, or Postgres stringified arrays
+    let targetLine: string[] = [];
+    if (Array.isArray(currentPuzzle.solution_line_uci) && currentPuzzle.solution_line_uci.length > 0) {
+      targetLine = currentPuzzle.solution_line_uci;
+    } else if (typeof currentPuzzle.solution_line_uci === 'string') {
+      try {
+        targetLine = JSON.parse(currentPuzzle.solution_line_uci);
+      } catch {
+        const s = (currentPuzzle.solution_line_uci as string).replace(/^{|}$/g, '');
+        targetLine = s.split(',').map(x => x.replace(/^"|"$/g, '').trim()).filter(Boolean);
+      }
+    }
+    if (!targetLine || targetLine.length === 0) {
+      targetLine = [currentPuzzle.solution_move];
+    }
+
+    const expectedMove = targetLine[playedMoves.length];
+    
+    // Use startsWith to elegantly handle cases where the puzzle expects a promotion (e.g. "e7e8q") 
+    // but the UI dragging interaction only emitted "e7e8".
+    const isCorrect = expectedMove && expectedMove.startsWith(moveUci);
+    setDebugLastEval(`Eu arrastei ${moveUci}. O sistema queria ${expectedMove}. Deu isCorrect=${isCorrect}`);
 
     if (isCorrect) {
-      setLastMove([orig, dest]);
-      const newFen = applyUciMove(currentPuzzle.fen, moveUci);
-      if (newFen) setDisplayFen(newFen);
-      setState("correct");
-      // Start animating the solution line after a short pause
-      setTimeout(() => animateSolutionLine(currentPuzzle), 400);
-    } else {
-      // Show wrong move briefly then snap back
-      setState("wrong");
-      const wrongFen = applyUciMove(currentPuzzle.fen, moveUci);
-      if (wrongFen) {
-        setDisplayFen(wrongFen);
-        setLastMove([orig, dest]);
+      const newPlayed = [...playedMoves, moveUci];
+      setPlayedMoves(newPlayed);
+      setViewPly(newPlayed.length);
+
+      const isFinished = newPlayed.length >= targetLine.length;
+
+      if (isFinished) {
+        setState("correct");
+        setTimeout(() => setState("rating"), 600);
+      } else {
+        // Opponent's turn
+        const nextMoveUci = targetLine[newPlayed.length];
+        
+        setTimeout(() => {
+            setPlayedMoves(prev => {
+               const p2 = [...prev, nextMoveUci];
+               setViewPly(p2.length);
+               return p2;
+            });
+        }, 350);
       }
+    } else {
+      // Wrong move logic
+      setState("wrong");
+      const wFen = applyUciMove(displayFen, moveUci);
+      if (wFen) {
+         setWrongFen(wFen);
+         setWrongLastMove([orig, dest]);
+      }
+      if (wrongResetTimerRef.current) clearTimeout(wrongResetTimerRef.current);
       wrongResetTimerRef.current = setTimeout(() => {
-        setDisplayFen(currentPuzzle.fen);
-        setLastMove(undefined);
-        setState("solving");
-      }, 900);
+         setWrongFen(undefined);
+         setWrongLastMove(undefined);
+         setState("solving");
+      }, 5000);
     }
-  }, [currentPuzzle, state, animateSolutionLine]);
+  }, [currentPuzzle, state, viewPly, playedMoves, displayFen]);
 
   // ── Reveal solution manually ──────────────────────────────────────────────
   const handleRevealSolution = useCallback(() => {
     if (!currentPuzzle) return;
+
+    let targetLine: string[] = [];
+    if (Array.isArray(currentPuzzle.solution_line_uci) && currentPuzzle.solution_line_uci.length > 0) {
+      targetLine = currentPuzzle.solution_line_uci;
+    } else if (typeof currentPuzzle.solution_line_uci === 'string') {
+      try {
+        targetLine = JSON.parse(currentPuzzle.solution_line_uci);
+      } catch {
+        const s = (currentPuzzle.solution_line_uci as string).replace(/^{|}$/g, '');
+        targetLine = s.split(',').map(x => x.replace(/^"|"$/g, '').trim()).filter(Boolean);
+      }
+    }
+    if (!targetLine || targetLine.length === 0) {
+      targetLine = [currentPuzzle.solution_move];
+    }
+
+    setPlayedMoves(targetLine);
+    setViewPly(0);
     setState("correct");
-    setTimeout(() => animateSolutionLine(currentPuzzle), 200);
-  }, [currentPuzzle, animateSolutionLine]);
+
+    if (revealTimerRef.current) clearInterval(revealTimerRef.current);
+    
+    let current = 0;
+    revealTimerRef.current = setInterval(() => {
+      current++;
+      if (current > targetLine.length) {
+        if (revealTimerRef.current) clearInterval(revealTimerRef.current);
+        setTimeout(() => setState("rating"), 500);
+      } else {
+        setViewPly(current);
+      }
+    }, 600);
+  }, [currentPuzzle]);
 
   // ── SRS rating update ─────────────────────────────────────────────────────
   const handleSrsRating = useCallback(async (choice: SrsChoice) => {
@@ -342,20 +386,6 @@ export default function PuzzleTrainer() {
     // Move to next puzzle
     setCurrentIndex((prev) => prev + 1);
   }, [currentPuzzle, state]);
-
-  // ── Trigger rating panel after correct move + line animation ────────────
-  useEffect(() => {
-    if (state === "correct" && !animatingLine && lineFens.length > 0) {
-      // Show rating panel after animation completes
-      const timer = setTimeout(() => setState("rating"), 500);
-      return () => clearTimeout(timer);
-    }
-    if (state === "correct" && !animatingLine && lineFens.length === 0) {
-      // No line to animate, show rating immediately
-      const timer = setTimeout(() => setState("rating"), 600);
-      return () => clearTimeout(timer);
-    }
-  }, [state, animatingLine, lineFens.length]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   if (loading) {
@@ -651,11 +681,11 @@ export default function PuzzleTrainer() {
           }}
         >
           <ChessBoard
-            fen={displayFen ?? currentPuzzle.fen}
+            fen={displayFen}
             orientation={currentPuzzle.player_color}
             interactive={boardInteractive}
             onMove={handleMove}
-            lastMove={lastMove}
+            lastMove={displayLastMove}
             showCoordinates
           />
         </div>
@@ -713,25 +743,32 @@ export default function PuzzleTrainer() {
                     Line:
                   </span>
                   {currentPuzzle.solution_line_san.map((san, i) => (
-                    <span
+                    <button
                       key={i}
+                      onClick={() => setViewPly(i + 1)}
                       style={{
                         padding: "1px 6px",
                         borderRadius: "4px",
-                        background: i <= lineIndex
+                        background: i < viewPly
                           ? "rgba(134,166,102,0.15)"
                           : "var(--bg-elevated)",
-                        border: `1px solid ${i <= lineIndex ? "rgba(134,166,102,0.3)" : "var(--border)"}`,
+                        border: `1px solid ${i < viewPly ? "rgba(134,166,102,0.3)" : "var(--border)"}`,
                         fontSize: "12px",
                         fontFamily: "monospace",
                         fontWeight: 600,
-                        color: i <= lineIndex ? "var(--green)" : "var(--text-muted)",
+                        color: i < viewPly ? "var(--green)" : "var(--text-muted)",
                         transition: "background 300ms, color 300ms",
+                        cursor: "pointer",
                       }}
                     >
                       {san}
-                    </span>
+                    </button>
                   ))}
+                  {viewPly < playedMoves.length && (
+                    <span style={{ fontSize: "11px", color: "var(--orange)", marginLeft: "4px", opacity: 0.8 }}>
+                      (Viewing history)
+                    </span>
+                  )}
                 </div>
               )}
             </div>
@@ -801,34 +838,6 @@ export default function PuzzleTrainer() {
                 Skip
               </button>
             </div>
-          )}
-
-          {/* Correct phase, still animating: next puzzle button */}
-          {isCorrect && !isRating && !animatingLine && (
-            <button
-              onClick={() => setState("rating")}
-              style={{
-                padding: "9px 16px",
-                borderRadius: "7px",
-                border: "1px solid rgba(134,166,102,0.35)",
-                background: "rgba(134,166,102,0.1)",
-                color: "var(--green)",
-                fontSize: "13px",
-                fontWeight: 600,
-                cursor: "pointer",
-                fontFamily: "inherit",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: "6px",
-              }}
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <line x1="5" y1="12" x2="19" y2="12"/>
-                <polyline points="12 5 19 12 12 19"/>
-              </svg>
-              Next puzzle
-            </button>
           )}
 
           {/* Rating phase: SRS buttons */}

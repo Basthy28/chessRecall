@@ -97,8 +97,8 @@ const ENGINE_MODE = (process.env.ENGINE_MODE ?? "wasm") as "native" | "wasm";
 const STOCKFISH_THREADS = Math.max(1, Number(process.env.STOCKFISH_THREADS ?? "1"));
 const STOCKFISH_HASH_MB = Math.max(64, Number(process.env.STOCKFISH_HASH_MB ?? "256"));
 const STOCKFISH_PATH = process.env.STOCKFISH_PATH ?? "/usr/games/stockfish";
-// Use movetime (ms) when > 0, otherwise fall back to depth
-const STOCKFISH_MOVETIME_MS = Number(process.env.STOCKFISH_MOVETIME_MS ?? "0");
+// Use movetime (ms) when > 0, otherwise fall back to depth. Defaulting to 1000ms gives much deeper endgame analysis.
+const STOCKFISH_MOVETIME_MS = Number(process.env.STOCKFISH_MOVETIME_MS ?? "1000");
 const ENV_DEPTH = process.env.ANALYSIS_DEPTH ? Number(process.env.ANALYSIS_DEPTH) : null;
 
 // ── Save native fetch before Stockfish ASM can nullify it ──────────

@@ -94,6 +94,12 @@ export default function ChessBoard({
 }: ChessBoardProps) {
   const innerRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<Api | null>(null);
+  const onMoveRef = useRef(onMove);
+
+  // Sync onMove ref
+  useEffect(() => {
+    onMoveRef.current = onMove;
+  }, [onMove]);
 
   // ── Initialize once after mount ────────────────────────────────────
   useEffect(() => {
@@ -127,7 +133,7 @@ export default function ChessBoard({
       draggable: { enabled: interactive },
       selectable: { enabled: interactive },
       events: {
-        move: (orig, dest) => onMove?.(orig, dest),
+        move: (orig, dest) => onMoveRef.current?.(orig, dest),
       },
     };
 
