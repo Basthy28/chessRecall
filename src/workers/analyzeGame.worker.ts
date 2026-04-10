@@ -214,74 +214,70 @@ function pvToSan(fen: string, pvUci: string[]): string[] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Material values for sacrifice detection (standard piece values)
+// validatePuzzleLine: Re-evaluates a PV line to ensure it forms a strict puzzle.
+// - Player moves MUST be the only winning reply (gap > minGapCp)
+// - Opponent moves must match the engine's best defense.
 // ─────────────────────────────────────────────────────────────────────────────
-const PIECE_VALUES: Record<string, number> = {
-  p: 1, n: 3, b: 3, r: 5, q: 9, k: 0,
-};
+async function validatePuzzleLine(
+  engine: StockfishEngine,
+  initialFen: string,
+  pvUci: string[],
+  engineDepth: number,
+  minGapCp: number
+): Promise<string[]> {
+  const validUci: string[] = [];
+  const chess = new Chess(initialFen);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Sacrifice detector: returns true if the move gives up material.
-// "Gives up material" means:
-//   - The moving piece is more valuable than whatever it captures (or captures
-//     nothing — a quiet move that works by positional means is also interesting
-//     when winAfter > winBefore, e.g. a piece offered to empty square).
-// Uses chess.js to inspect the board before the move.
-// ─────────────────────────────────────────────────────────────────────────────
-function isSacrifice(fen: string, uciMove: string, winAfter: number, winBefore: number): boolean {
-  try {
-    const chess = new Chess(fen);
-    const from = uciMove.slice(0, 2) as Parameters<typeof chess.get>[0];
-    const to   = uciMove.slice(2, 4) as Parameters<typeof chess.get>[0];
-    const movingPiece = chess.get(from);
-    const targetPiece = chess.get(to);
-    if (!movingPiece) return false;
+  for (let i = 0; i < pvUci.length; i++) {
+    const moveUci = pvUci[i];
+    const isPlayerTurn = (i % 2 === 0);
 
-    const movingValue  = PIECE_VALUES[movingPiece.type] ?? 0;
-    const captureValue = targetPiece ? (PIECE_VALUES[targetPiece.type] ?? 0) : 0;
+    if (i > 0) {
+      const currentFen = chess.fen();
+      try {
+        // MultiPV=2 to check for alternatives
+        const ev = await evaluatePosition(engine, currentFen, engineDepth, 2, STOCKFISH_MOVETIME_MS);
+        
+        // If the engine no longer likes this move, the sequence is unstable.
+        if (ev.best.move !== moveUci) {
+          break;
+        }
 
-    if (captureValue === 0) {
-      // Quiet move to an empty square — counts as sacrifice only if the
-      // position genuinely improves (so we aren't flagging normal development).
-      return winAfter > winBefore - 0.05;
+        // Only the player's moves need to be "forced" (only winning move).
+        // The opponent just plays the best defense.
+        if (isPlayerTurn && ev.second !== null) {
+          const gap = ev.best.score - ev.second.score;
+          if (gap < minGapCp) {
+            break; // Alternative is too good; not a strict puzzle sequence anymore.
+          }
+        }
+      } catch {
+        break; // Stop extending the puzzle on engine error
+      }
     }
 
-    // Captures a lower-value (or equal-value king placeholder) piece
-    return movingValue > captureValue;
-  } catch {
-    return false;
+    try {
+      const m = chess.move({
+        from: moveUci.slice(0, 2),
+        to: moveUci.slice(2, 4),
+        promotion: moveUci.length > 4 ? moveUci[4] : undefined
+      });
+      if (!m) break;
+    } catch {
+      break;
+    }
+    
+    validUci.push(moveUci);
   }
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Brilliant move detection:
-//   1. The move is Stockfish's #1 choice (playedBest)
-//   2. No significant win% was lost (it really is the best)
-//   3. The second-best alternative is ≥ 150 cp worse (non-obvious)
-//   4. The position was not already clearly winning before (winBefore < 0.80)
-//   5. The move wins or maintains significant advantage (winAfter ≥ 0.55)
-//   6. NEW — sacrifice detector: the move gives up material AND
-//      the position after is no worse than before (winAfter > winBefore - 0.05)
-// ─────────────────────────────────────────────────────────────────────────────
-function isBrilliantMove(
-  playedBest: boolean,
-  winBefore: number,  // win% of the position before the move (= winBest in caller)
-  winBest: number,
-  winAfter: number,
-  evalBefore: EvalResult,
-  pos: Position        // NEW: position context for sacrifice detection
-): boolean {
-  if (!playedBest) return false;
-  if (winBest - winAfter >= 0.02) return false; // not actually best
-  if (winBefore > 0.80) return false;           // was already clearly winning
-  if (winAfter < 0.55) return false;            // didn't achieve/maintain advantage
-  if (evalBefore.second === null) return false;
-  const gapCp = evalBefore.best.score - evalBefore.second.score;
-  if (gapCp < 150) return false;               // 2nd-best is not much worse — non-obvious check
+  // Ensure the puzzle ends on a player's move so they complete a tactic.
+  // i=0 is player, i=1 is opponent. Length 1 = player only (odd).
+  // Length 2 = player then opponent (even) -> we pop it so it ends on player.
+  if (validUci.length % 2 === 0) {
+    validUci.pop();
+  }
 
-  // Sacrifice requirement: the move must give up material or be a positional
-  // investment that works (winAfter > winBefore - 0.05).
-  return isSacrifice(pos.fen, pos.movePlayed, winAfter, winBefore);
+  return validUci;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -302,8 +298,14 @@ function classifyMoveWithMates(
   playedBest: boolean,
 ): MoveClassification {
   const MATE_THRESHOLD = 90_000;
-  // Opponent has forced mate after our move (their score is very high positive)
-  if (evalAfterScore > MATE_THRESHOLD) return "blunder";
+
+  // Were we already getting mated before this move? (engine reports negative mate score)
+  // If so, any move we play will still leave opponent with forced mate — not our fault.
+  const alreadyGettingMated = evalBeforeScore < -MATE_THRESHOLD;
+
+  // Opponent has forced mate after our move — only a blunder if we weren't already lost
+  if (evalAfterScore > MATE_THRESHOLD && !alreadyGettingMated) return "blunder";
+
   // We had a forced mating sequence but didn't take it
   if (evalBeforeScore > MATE_THRESHOLD && !playedBest) return "blunder";
 
@@ -606,11 +608,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         }
       }
 
-      // ── Step 4: Classify each move & store annotations + puzzles ────────
-      // Annotations are stored for evaluation/debugging of worker quality.
-      // The browser also does its own WASM-based classification for live review.
-      const annotationRows: object[] = [];
-
+      // ── Step 4: Classify each move & store puzzles ────────
       for (let i = 0; i < moveCount; i++) {
         const pos = positions[i];
         const evalBefore = allEvals[i];
@@ -633,43 +631,6 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         );
         const miss = isMissedWin(winBest, winAfter) && baseClass !== "blunder";
 
-        // Book move detection — synchronous lookup in local ECO book.
-        // Check the FEN *after* the move (positions[i+1] = resulting position).
-        const resultingFen = positions[i + 1]?.fen ?? "";
-        const ecoEntry = lookupEco(resultingFen);
-        const book = ecoEntry !== null && (i + 1) <= 20; // ply ≤ 20
-
-        // Brilliant detection (requires sacrifice + non-obvious best move)
-        const brilliant = !book && baseClass === "best" &&
-          isBrilliantMove(playedBest, winBest, winBest, winAfter, evalBefore, pos);
-
-        const finalClass: MoveClassification = book
-          ? "book"
-          : brilliant
-          ? "brilliant"
-          : miss
-          ? "miss"
-          : baseClass;
-
-        // Store annotation for every move (both players)
-        annotationRows.push({
-          game_id: gameId,
-          user_id: userId,
-          ply: i + 1,
-          move_uci: pos.movePlayed,
-          move_san: pos.san,
-          fen_before: pos.fen,
-          eval_best_cp: evalBefore.best.score,
-          eval_played_cp: -evalAfter.best.score,
-          win_before: winBest,
-          win_after: winAfter,
-          classification: finalClass,
-          is_miss: miss,
-          opening_name: ecoEntry?.name ?? null,
-          opening_eco: ecoEntry?.eco ?? null,
-          depth: config.analysisDepth,
-        });
-
         // ── Step 5: Create SRS puzzles (player turns only) ───────────────
         if (pos.turn !== playerTurn) continue;
 
@@ -686,9 +647,20 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
 
         let solutionSan: string;
         let solutionLineSan: string[];
+        let validPvLine: string[];
         try {
-          solutionSan = uciToSan(pos.fen, evalBefore.best.move);
-          solutionLineSan = pvToSan(pos.fen, evalBefore.best.pv);
+          // Verify that the PV line is actually forced
+          validPvLine = await validatePuzzleLine(
+            engine,
+            pos.fen,
+            evalBefore.best.pv,
+            config.analysisDepth,
+            config.minSolutionGap
+          );
+          if (validPvLine.length < 1) continue;
+
+          solutionSan = uciToSan(pos.fen, validPvLine[0]);
+          solutionLineSan = pvToSan(pos.fen, validPvLine);
         } catch (err) {
           console.warn(`[worker] uciToSan failed at ply ${i + 1}:`, err instanceof Error ? err.message : err);
           continue;
@@ -702,11 +674,11 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           user_id: userId,
           fen: pos.fen,
           blunder_move: pos.movePlayed,
-          solution_move: evalBefore.best.move,
+          solution_move: validPvLine[0],
           solution_san: solutionSan,
-          solution_line_uci: evalBefore.best.pv,
+          solution_line_uci: validPvLine,
           solution_line_san: solutionLineSan,
-          is_brilliant: finalClass === "brilliant",
+          is_brilliant: false,
           eval_before: Math.round(winBest * 10000),
           eval_after: Math.round(winAfter * 10000),
           eval_best: evalBefore.best.score,
@@ -745,27 +717,12 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         }
       }
 
-      // ── Step 6: Bulk-upsert annotations ─────────────────────────────────
-      await job.updateProgress(90);
-      if (supabase && annotationRows.length > 0) {
-        const CHUNK = 200;
-        for (let c = 0; c < annotationRows.length; c += CHUNK) {
-          const { error: annoError } = await supabase
-            .from("move_annotations")
-            .upsert(annotationRows.slice(c, c + CHUNK), { onConflict: "game_id,ply" });
-          if (annoError) {
-            console.error(`[worker] annotations chunk failed:`, annoError.message);
-          }
-        }
-        console.log(`[worker] ${annotationRows.length} annotations stored`);
-      }
-
       await updateGameStatus(gameId, "analyzed");
       await job.updateProgress(100);
 
       console.log(
         `[worker] Job ${job.id} complete — ` +
-        `${puzzlesFound} puzzles found, ${puzzlesValidated} stored, ${annotationRows.length} annotations`
+        `${puzzlesFound} puzzles found, ${puzzlesValidated} stored`
       );
 
       return { gameId, puzzlesFound, puzzlesValidated };
