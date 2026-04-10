@@ -224,6 +224,33 @@ export default function PuzzleTrainer() {
 
   const revealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // ── SRS rating update ─────────────────────────────────────────────────────
+  const handleSrsRating = useCallback(async (choice: SrsChoice) => {
+    if (!currentPuzzle) return;
+
+    const dueAt = new Date(Date.now() + SRS_INTERVALS[choice]).toISOString();
+    const isCorrect = state === "rating"; // always correct if rating panel is shown after solving
+
+    try {
+      const supabase = createBrowserClient();
+      await supabase
+        .from("puzzles")
+        .update({
+          times_seen: (currentPuzzle.times_seen ?? 0) + 1,
+          times_correct: (currentPuzzle.times_correct ?? 0) + (isCorrect ? 1 : 0),
+          srs_ease: 2.5,
+          srs_due_at: dueAt,
+          last_reviewed_at: new Date().toISOString(),
+        })
+        .eq("id", currentPuzzle.id);
+    } catch {
+      // Silently fail — puzzle still advances
+    }
+
+    // Move to next puzzle
+    setCurrentIndex((prev) => prev + 1);
+  }, [currentPuzzle, state]);
+
   // ── Keyboard shortcuts for SRS rating & history review ─────────────────────
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
@@ -359,33 +386,6 @@ export default function PuzzleTrainer() {
       }
     }, 600);
   }, [currentPuzzle]);
-
-  // ── SRS rating update ─────────────────────────────────────────────────────
-  const handleSrsRating = useCallback(async (choice: SrsChoice) => {
-    if (!currentPuzzle) return;
-
-    const dueAt = new Date(Date.now() + SRS_INTERVALS[choice]).toISOString();
-    const isCorrect = state === "rating"; // always correct if rating panel is shown after solving
-
-    try {
-      const supabase = createBrowserClient();
-      await supabase
-        .from("puzzles")
-        .update({
-          times_seen: (currentPuzzle.times_seen ?? 0) + 1,
-          times_correct: (currentPuzzle.times_correct ?? 0) + (isCorrect ? 1 : 0),
-          srs_ease: 2.5,
-          srs_due_at: dueAt,
-          last_reviewed_at: new Date().toISOString(),
-        })
-        .eq("id", currentPuzzle.id);
-    } catch {
-      // Silently fail — puzzle still advances
-    }
-
-    // Move to next puzzle
-    setCurrentIndex((prev) => prev + 1);
-  }, [currentPuzzle, state]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   if (loading) {

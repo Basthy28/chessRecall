@@ -47,6 +47,7 @@ export function getAnalyzeQueue(): Queue<AnalyzeGameJobData, AnalyzeGameJobResul
 export async function enqueueGameAnalysis(data: AnalyzeGameJobData): Promise<string> {
   const queue = getAnalyzeQueue();
   const job = await queue.add("analyze", data, {
+    jobId: `game-${data.gameId}`,   // stable ID — BullMQ ignores duplicates
     attempts: 3,
     backoff: { type: "exponential", delay: 5000 },
     removeOnComplete: { count: 100 },

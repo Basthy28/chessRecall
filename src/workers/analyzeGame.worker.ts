@@ -373,12 +373,12 @@ async function initStockfish(): Promise<StockfishEngine> {
 
   if (ENGINE_MODE === "native") {
     // Native binary — fastest, use on the Oracle cluster after `apt install stockfish`
-    console.log(`[worker] Stockfish: native binary, threads=${STOCKFISH_THREADS} hash=${STOCKFISH_HASH_MB}MB`);
+    console.log(`[worker] Stockfish: native binary, threads=${STOCKFISH_THREADS} hash=${STOCKFISH_HASH_MB}MB movetime=${STOCKFISH_MOVETIME_MS}ms`);
     engine = spawnNativeEngine();
   } else {
     // WASM fallback — works anywhere without installing anything
     const engineVariant = STOCKFISH_THREADS > 1 ? "full" : "lite-single";
-    console.log(`[worker] Stockfish: WASM/${engineVariant} threads=${STOCKFISH_THREADS} hash=${STOCKFISH_HASH_MB}MB`);
+    console.log(`[worker] Stockfish: WASM/${engineVariant} threads=${STOCKFISH_THREADS} hash=${STOCKFISH_HASH_MB}MB movetime=${STOCKFISH_MOVETIME_MS}ms`);
     engine = await initEngine(engineVariant);
 
     // Restore fetch if Stockfish ASM nullified it
@@ -638,6 +638,12 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         const isPuzzleMiss = miss;
 
         if (!isBlunder && !isPuzzleMiss) continue;
+
+        // Skip puzzles from already-hopeless positions.
+        // If the player had < 15% win chance before the move, the game was
+        // already decided — training on these doesn't build useful pattern memory.
+        const MIN_WIN_CHANCE_FOR_PUZZLE = 0.15; // 15%
+        if (winBest < MIN_WIN_CHANCE_FOR_PUZZLE) continue;
 
         // For blunders: enforce Only-Winning-Move rule (gap between best and 2nd-best)
         if (isBlunder && evalBefore.second !== null) {

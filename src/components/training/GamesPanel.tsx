@@ -1879,6 +1879,17 @@ export default function GamesPanel() {
     );
   }
 
+  // ── Report mode: accuracy & classification summary ────────────────────
+  if (report) {
+    return (
+      <GameReport
+        review={report}
+        onStartReview={() => setReview(report)}
+        onClose={() => setReport(null)}
+      />
+    );
+  }
+
   // ── Games list ─────────────────────────────────────────────────
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, padding: "16px 20px", gap: "10px" }}>
