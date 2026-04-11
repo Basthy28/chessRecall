@@ -1,5 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 
+let browserClientSingleton: ReturnType<typeof createClient> | null = null;
+
 /**
  * Supabase client helpers.
  *
@@ -48,10 +50,12 @@ export async function getUserFromRequest(request: Request) {
 
 // Browser/client-side client (uses anon key)
 export function createBrowserClient() {
+  if (browserClientSingleton) return browserClientSingleton;
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
   if (!url || !key) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
-  return createClient(url, key);
+  browserClientSingleton = createClient(url, key);
+  return browserClientSingleton;
 }
 
 /**
