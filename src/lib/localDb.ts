@@ -3,6 +3,7 @@ import type { Game, GameStatus, Puzzle } from "@/types";
 
 type Platform = "lichess" | "chess.com" | "all";
 type SrsChoice = "hard" | "good" | "easy";
+type SyncPlatform = "lichess" | "chess.com";
 
 let poolSingleton: Pool | null = null;
 let schemaReady: Promise<void> | null = null;
@@ -76,6 +77,17 @@ async function ensureSchema(): Promise<void> {
       CREATE INDEX IF NOT EXISTS games_user_id_status_idx ON games (user_id, status);
       CREATE INDEX IF NOT EXISTS puzzles_user_id_srs_due_at_idx ON puzzles (user_id, srs_due_at);
       CREATE INDEX IF NOT EXISTS puzzles_game_id_idx ON puzzles (game_id);
+
+      CREATE TABLE IF NOT EXISTS import_sync_cooldowns (
+        user_id uuid NOT NULL,
+        platform text NOT NULL CHECK (platform IN ('lichess','chess.com')),
+        username text NOT NULL,
+        last_synced_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_id, platform, username)
+      );
+
+      CREATE INDEX IF NOT EXISTS import_sync_cooldowns_last_synced_at_idx
+      ON import_sync_cooldowns (last_synced_at DESC);
     `);
   })();
 
@@ -410,4 +422,44 @@ export async function applyPuzzleSrsRating(userId: string, puzzleId: string, cho
   );
 
   return (rowCount ?? 0) > 0;
+}
+
+export async function getImportCooldownRemainingMs(
+  userId: string,
+  platform: SyncPlatform,
+  username: string,
+  cooldownMs: number
+): Promise<number> {
+  await ensureSchema();
+  const pool = getPool();
+  const normalized = username.trim().toLowerCase();
+  const { rows } = await pool.query(
+    `SELECT last_synced_at
+     FROM import_sync_cooldowns
+     WHERE user_id = $1 AND platform = $2 AND username = $3
+     LIMIT 1`,
+    [userId, platform, normalized]
+  );
+
+  const last = rows[0]?.last_synced_at ? new Date(String(rows[0].last_synced_at)).getTime() : 0;
+  if (!last) return 0;
+  const remaining = cooldownMs - (Date.now() - last);
+  return Math.max(0, remaining);
+}
+
+export async function markImportSyncedNow(
+  userId: string,
+  platform: SyncPlatform,
+  username: string
+): Promise<void> {
+  await ensureSchema();
+  const pool = getPool();
+  const normalized = username.trim().toLowerCase();
+  await pool.query(
+    `INSERT INTO import_sync_cooldowns (user_id, platform, username, last_synced_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (user_id, platform, username)
+     DO UPDATE SET last_synced_at = now()`,
+    [userId, platform, normalized]
+  );
 }

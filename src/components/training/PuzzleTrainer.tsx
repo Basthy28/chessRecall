@@ -167,6 +167,7 @@ export default function PuzzleTrainer() {
   // ── Fetch due puzzles ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!userId) {
+      setError("Sign in to load puzzles.");
       setLoading(false);
       return;
     }
@@ -181,6 +182,9 @@ export default function PuzzleTrainer() {
         });
         if (!res.ok) {
           const payload = (await res.json().catch(() => ({}))) as { error?: string };
+          if (res.status === 401) {
+            throw new Error("Sign in to load puzzles.");
+          }
           throw new Error(payload.error ?? "Failed to load puzzles");
         }
         const payload = (await res.json()) as { puzzles?: Puzzle[] };

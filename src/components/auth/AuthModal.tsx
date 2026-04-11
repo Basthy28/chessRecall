@@ -57,23 +57,8 @@ export default function AuthModal({ onAuthSuccess, onDismiss }: AuthModalProps) 
             onAuthSuccess(data.user.id);
           }
         } else {
-          const { data, error: authError } = await supabase.auth.signUp({
-            email: email.trim(),
-            password,
-          });
-          if (authError) {
-            setError(authError.message);
-            return;
-          }
-          if (data.user && data.session) {
-            // Immediately signed in (email confirmation disabled)
-            onAuthSuccess(data.user.id);
-          } else if (data.user) {
-            // Email confirmation required
-            setInfo(
-              "Check your email to confirm your account, then sign in."
-            );
-          }
+          setInfo("Sign up is coming soon. Please use Sign In for now.");
+          return;
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : "An unexpected error occurred.");
@@ -154,7 +139,9 @@ export default function AuthModal({ onAuthSuccess, onDismiss }: AuthModalProps) 
             <button
               key={m}
               type="button"
+              disabled={m === "signup"}
               onClick={() => {
+                if (m === "signup") return;
                 setMode(m);
                 setError(null);
                 setInfo(null);
@@ -164,15 +151,15 @@ export default function AuthModal({ onAuthSuccess, onDismiss }: AuthModalProps) 
                 borderRadius: "6px",
                 border: "none",
                 background: mode === m ? "#81b64c" : "transparent",
-                color: mode === m ? "#fff" : "rgba(255,255,255,0.5)",
+                color: m === "signup" ? "rgba(255,255,255,0.35)" : mode === m ? "#fff" : "rgba(255,255,255,0.5)",
                 fontSize: "13px",
                 fontWeight: mode === m ? 600 : 400,
-                cursor: "pointer",
+                cursor: m === "signup" ? "not-allowed" : "pointer",
                 fontFamily: "inherit",
                 transition: "background 0.15s, color 0.15s",
               }}
             >
-              {m === "signin" ? "Sign In" : "Sign Up"}
+              {m === "signin" ? "Sign In" : "SOON"}
             </button>
           ))}
         </div>

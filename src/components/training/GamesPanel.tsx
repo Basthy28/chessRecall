@@ -21,6 +21,7 @@ import {
 import { useLiveAnalysis } from "@/hooks/useLiveAnalysis";
 
 const AUTO_SYNC_INTERVAL_MS = 30 * 60 * 1000; // 30 min between auto-syncs
+const MANUAL_SYNC_COOLDOWN_MS = 5 * 60 * 1000;
 
 function getLastSyncKey(p: "lichess" | "chess.com", username: string) {
   return `lastSync_${p}_${username}`;
@@ -63,6 +64,14 @@ interface GamesResponse {
     failed: number;
   };
   nextCursor: string | null;
+}
+
+interface ImportResponse {
+  imported?: number;
+  queued?: number;
+  queueUnavailable?: boolean;
+  cooldownRemainingMs?: number;
+  error?: string;
 }
 
 
@@ -1790,12 +1799,59 @@ export default function GamesPanel() {
           setLastSyncMs(p, username);
           setLastSynced(prev => ({ ...prev, [`${p}_${username}`]: Date.now() }));
           void loadGames({ silent: true });
+        } else if (res.status === 429) {
+          const payload = (await res.json().catch(() => ({}))) as ImportResponse;
+          const remainingMs = payload.cooldownRemainingMs ?? AUTO_SYNC_INTERVAL_MS;
+          const assumedLast = Date.now() - (AUTO_SYNC_INTERVAL_MS - remainingMs);
+          setLastSynced(prev => ({ ...prev, [`${p}_${username}`]: assumedLast }));
         }
       } catch { /**/ } finally {
         setSyncingPlatforms(prev => { const s = new Set(prev); s.delete(p); return s; });
       }
     }
   }, [loadGames]);
+
+  const manualSync = useCallback(async (p: "lichess" | "chess.com") => {
+    const username = getLinkedUsername(linkedAccounts, p);
+    if (!username) {
+      setMessage(`Link your ${p === "lichess" ? "Lichess" : "Chess.com"} account first.`);
+      return;
+    }
+
+    const elapsed = Date.now() - getLastSyncMs(p, username);
+    if (elapsed < MANUAL_SYNC_COOLDOWN_MS) {
+      const waitSec = Math.ceil((MANUAL_SYNC_COOLDOWN_MS - elapsed) / 1000);
+      setMessage(`Please wait ${waitSec}s before syncing ${p} again.`);
+      return;
+    }
+
+    setSyncingPlatforms(prev => new Set(prev).add(p));
+    setMessage("");
+    try {
+      const res = await fetch("/api/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
+        body: JSON.stringify({ username, platform: p }),
+      });
+      const payload = (await res.json().catch(() => ({}))) as ImportResponse;
+
+      if (res.ok) {
+        setLastSyncMs(p, username);
+        setLastSynced(prev => ({ ...prev, [`${p}_${username}`]: Date.now() }));
+        setMessage(`Synced ${p}: imported ${payload.imported ?? 0}, queued ${payload.queued ?? 0}.`);
+        void loadGames({ silent: true });
+      } else if (res.status === 429) {
+        const remainingSec = Math.ceil((payload.cooldownRemainingMs ?? MANUAL_SYNC_COOLDOWN_MS) / 1000);
+        setMessage(`Sync cooldown active for ${p}. Try again in ${remainingSec}s.`);
+      } else {
+        setMessage(payload.error ?? `Failed to sync ${p}.`);
+      }
+    } catch {
+      setMessage(`Network error while syncing ${p}.`);
+    } finally {
+      setSyncingPlatforms(prev => { const s = new Set(prev); s.delete(p); return s; });
+    }
+  }, [linkedAccounts, loadGames]);
 
   // Trigger auto-sync on mount and whenever linked accounts change
   useEffect(() => {
@@ -1972,6 +2028,13 @@ export default function GamesPanel() {
                       {minAgo < 1 ? "just now" : minAgo < 60 ? `${minAgo}m ago` : `${Math.floor(minAgo / 60)}h ago`}
                     </span>
                   ) : null}
+                  <button
+                    onClick={() => void manualSync(p)}
+                    disabled={isSyncing}
+                    style={{ fontSize: "11px", color: "var(--accent)", background: "var(--accent-dim)", border: "1px solid rgba(129,182,76,0.4)", borderRadius: "4px", padding: "2px 8px", cursor: isSyncing ? "default" : "pointer", fontFamily: "inherit", flexShrink: 0, opacity: isSyncing ? 0.5 : 1 }}
+                  >
+                    Sync now
+                  </button>
                   <button
                     onClick={() => unlinkAccount(p)}
                     style={{ fontSize: "11px", color: "var(--text-muted)", background: "none", border: "1px solid var(--border)", borderRadius: "4px", padding: "2px 8px", cursor: "pointer", fontFamily: "inherit", flexShrink: 0 }}

@@ -12,7 +12,9 @@ import {
   countChessComGamesForUserAndName,
   countGamesByUser,
   countPuzzlesByUser,
+  getImportCooldownRemainingMs,
   latestPlayedAtForChessComUser,
+  markImportSyncedNow,
   updateGameStatusByIds,
   upsertGames,
 } from "@/lib/localDb";
@@ -33,6 +35,7 @@ const ENQUEUE_CONCURRENCY = 20;
 const ENQUEUE_TIMEOUT_MS = 2500;
 const DEFAULT_ANALYZE_QUEUE_LIMIT = 120;
 const MAX_ANALYZE_QUEUE_LIMIT = 2000;
+const IMPORT_COOLDOWN_MS = 5 * 60 * 1000;
 
 async function enqueueWithTimeout(jobData: AnalyzeGameJobData): Promise<void> {
   await Promise.race([
@@ -86,6 +89,22 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
   const userId = sessionUser.id;
+
+  const cooldownRemainingMs = await getImportCooldownRemainingMs(
+    userId,
+    platform,
+    username,
+    IMPORT_COOLDOWN_MS
+  );
+  if (cooldownRemainingMs > 0) {
+    return Response.json(
+      {
+        error: `Sync cooldown active. Try again in ${Math.ceil(cooldownRemainingMs / 1000)}s.`,
+        cooldownRemainingMs,
+      },
+      { status: 429 }
+    );
+  }
 
   // ── Fetch games from the chosen platform ───────────────────────────
   let gameRows: Omit<Game, "id" | "created_at">[] = [];
@@ -144,6 +163,7 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   if (gameRows.length === 0) {
+    await markImportSyncedNow(userId, platform, username);
     return Response.json({ imported: 0, queued: 0, username, platform, fullSync });
   }
 
@@ -212,6 +232,7 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const queueUnavailable = queued < imported;
+  await markImportSyncedNow(userId, platform, username);
   return Response.json({
     imported,
     queued,
