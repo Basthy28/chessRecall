@@ -183,7 +183,7 @@ export default function TrainingDashboard() {
     MOCK_PUZZLES[0] ?? null
   );
   const [showSolution, setShowSolution] = useState(false);
-  const [activeNav, setActiveNav] = useState<"train" | "puzzles" | "games" | "stats" | "settings">("train");
+  const [activeNav, setActiveNav] = useState<"puzzles" | "games">("puzzles");
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
@@ -256,30 +256,11 @@ export default function TrainingDashboard() {
           >
             Chess Recall
           </span>
-          {/* Streak pill */}
-          <div
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "4px",
-              padding: "3px 9px",
-              borderRadius: "20px",
-              background: "rgba(192,160,96,0.12)",
-              border: "1px solid rgba(192,160,96,0.25)",
-              fontSize: "11px",
-              fontWeight: 700,
-              color: "var(--accent)",
-              letterSpacing: "0.02em",
-            }}
-          >
-            <span>🔥</span>
-            <span>7 day streak</span>
-          </div>
         </div>
 
         {/* Center: Nav */}
         <nav style={{ display: "flex", gap: "2px" }}>
-          {(["train", "puzzles", "games", "stats", "settings"] as const).map((item) => {
+          {(["puzzles", "games"] as const).map((item) => {
             const isActive = activeNav === item;
             return (
               <button
@@ -310,7 +291,7 @@ export default function TrainingDashboard() {
                       "var(--text-muted)";
                 }}
               >
-                {item === "train" ? "Train" : item === "puzzles" ? "Puzzles" : item.charAt(0).toUpperCase() + item.slice(1)}
+                {item.charAt(0).toUpperCase() + item.slice(1)}
               </button>
             );
           })}
@@ -318,25 +299,6 @@ export default function TrainingDashboard() {
 
         {/* Right: actions */}
         <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-          <Button variant="primary" size="md">
-            <svg
-              width="13"
-              height="13"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
-            </svg>
-            Import Games
-          </Button>
-
           {/* Auth controls */}
           {!authLoading && (
             userId ? (
@@ -408,38 +370,65 @@ export default function TrainingDashboard() {
               </button>
             )
           )}
-          {activeNav === "train" && (
-            <button
-              onClick={() => setSidebarOpen((o) => !o)}
-              title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                width: "32px",
-                height: "32px",
-                borderRadius: "6px",
-                border: "1px solid var(--border)",
-                background: sidebarOpen ? "var(--bg-elevated)" : "transparent",
-                color: "var(--text-muted)",
-                cursor: "pointer",
-                flexShrink: 0,
-              }}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                {sidebarOpen
-                  ? <><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="15" y1="3" x2="15" y2="21"/></>
-                  : <><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></>
-                }
-              </svg>
-            </button>
-          )}
         </div>
       </header>
 
       {/* ════════════════════════════════════════
+          Auth gate
+      ════════════════════════════════════════ */}
+      {!authLoading && !userId && (
+        <div
+          style={{
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "16px",
+            padding: "40px 20px",
+          }}
+        >
+          <KnightIcon />
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: "20px", fontWeight: 700, marginBottom: "6px" }}>
+              Sign in to Chess Recall
+            </div>
+            <div style={{ fontSize: "13px", color: "var(--text-muted)", maxWidth: "320px" }}>
+              Your games and puzzles are tied to your account. Sign in to continue.
+            </div>
+          </div>
+          <button
+            onClick={() => setShowAuthModal(true)}
+            style={{
+              padding: "9px 24px",
+              borderRadius: "8px",
+              border: "1px solid rgba(129,182,76,0.4)",
+              background: "rgba(129,182,76,0.12)",
+              color: "#81b64c",
+              fontSize: "14px",
+              fontWeight: 600,
+              cursor: "pointer",
+              fontFamily: "inherit",
+              transition: "background 0.15s, border-color 0.15s",
+            }}
+            onMouseEnter={(e) => {
+              (e.currentTarget as HTMLButtonElement).style.background = "rgba(129,182,76,0.2)";
+              (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(129,182,76,0.6)";
+            }}
+            onMouseLeave={(e) => {
+              (e.currentTarget as HTMLButtonElement).style.background = "rgba(129,182,76,0.12)";
+              (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(129,182,76,0.4)";
+            }}
+          >
+            Sign In
+          </button>
+        </div>
+      )}
+
+      {/* ════════════════════════════════════════
           Main layout
       ════════════════════════════════════════ */}
+      {!authLoading && userId && (
       <main
         style={{
           display: "flex",
@@ -450,9 +439,13 @@ export default function TrainingDashboard() {
       >
         {activeNav === "games" ? (
           <GamesPanel />
-        ) : activeNav === "puzzles" ? (
-          <PuzzleTrainer />
         ) : (
+          <PuzzleTrainer />
+        )}
+      </main>
+      )}
+      {/* ── Old train board section — dead code start ── */}
+      {(false as boolean) && (
           <>
         {/* ── Board section ── */}
         <section
@@ -772,7 +765,6 @@ export default function TrainingDashboard() {
         </aside>
           </>
         )}
-      </main>
     </div>
   );
 }

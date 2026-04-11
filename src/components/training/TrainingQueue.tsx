@@ -48,10 +48,6 @@ export default function TrainingQueue({
     chessCom: "",
   });
   const [accountInput, setAccountInput] = useState("");
-  const [importState, setImportState] = useState<
-    "idle" | "loading" | "success" | "error"
-  >("idle");
-  const [importMsg, setImportMsg] = useState("");
 
   useEffect(() => {
     const accounts = readLinkedAccounts();
@@ -66,81 +62,25 @@ export default function TrainingQueue({
   function linkAccount() {
     const normalized = accountInput.trim().toLowerCase();
     if (!normalized) return;
-
     const next: LinkedAccounts =
       platform === "chess.com"
         ? { ...linkedAccounts, chessCom: normalized }
         : { ...linkedAccounts, lichess: normalized };
-
     setLinkedAccounts(next);
     saveLinkedAccounts(next);
     void syncLinkedAccountsToSupabase(next);
-    setImportMsg(
-      `${platform === "chess.com" ? "Chess.com" : "Lichess"} account linked: ${normalized}`
-    );
-    setImportState("success");
+    setAccountInput(normalized);
   }
 
-  async function handleImport(requestedPlatform = platform) {
-    const storedUsername = getLinkedUsername(linkedAccounts, requestedPlatform);
-    const trimmed = (storedUsername || accountInput).trim().toLowerCase();
-    if (!trimmed) return;
-
-    if (!storedUsername) {
-      const next: LinkedAccounts =
-        requestedPlatform === "chess.com"
-          ? { ...linkedAccounts, chessCom: trimmed }
-          : { ...linkedAccounts, lichess: trimmed };
-      setLinkedAccounts(next);
-      saveLinkedAccounts(next);
-      void syncLinkedAccountsToSupabase(next);
-    }
-
-    setImportState("loading");
-    setImportMsg("");
-    try {
-      const res = await fetch("/api/import", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: trimmed, platform: requestedPlatform }),
-      });
-      const json = await res.json() as {
-        imported?: number;
-        queued?: number;
-        skippedQueue?: number;
-        analyzeLimit?: number;
-        queueUnavailable?: boolean;
-        error?: string;
-      };
-      if (!res.ok) {
-        setImportState("error");
-        setImportMsg(json.error ?? "Sync failed.");
-      } else {
-        let totalsMsg = "";
-        try {
-          const totalsRes = await fetch("/api/import", { method: "GET" });
-          if (totalsRes.ok) {
-            const totals = await totalsRes.json() as { games?: number; puzzles?: number };
-            totalsMsg = ` Total: ${totals.games ?? 0} games, ${totals.puzzles ?? 0} puzzles.`;
-          }
-        } catch {
-          // Ignore totals lookup failures and keep primary import feedback.
-        }
-
-        setImportState("success");
-        const base = `Synced ${json.imported ?? 0} games, ${json.queued ?? 0} queued for analysis.`;
-        const throttleHint = (json.skippedQueue ?? 0) > 0
-          ? ` Deferred ${(json.skippedQueue ?? 0)} games (queue limit ${json.analyzeLimit ?? 0}).`
-          : "";
-        const queueHint = json.queueUnavailable
-          ? " Redis queue offline: games were stored but not all jobs were enqueued."
-          : "";
-        setImportMsg(`${base}${throttleHint}${queueHint}${totalsMsg}`);
-      }
-    } catch {
-      setImportState("error");
-      setImportMsg("Network error while syncing.");
-    }
+  function unlinkAccount(p: "lichess" | "chess.com") {
+    const next: LinkedAccounts =
+      p === "chess.com"
+        ? { ...linkedAccounts, chessCom: "" }
+        : { ...linkedAccounts, lichess: "" };
+    setLinkedAccounts(next);
+    saveLinkedAccounts(next);
+    void syncLinkedAccountsToSupabase(next);
+    if (p === platform) setAccountInput("");
   }
 
   const due = puzzles.filter(
@@ -198,7 +138,7 @@ export default function TrainingQueue({
         </div>
       </div>
 
-      {/* ── Accounts + sync section ── */}
+      {/* ── Accounts section ── */}
       <div
         style={{
           padding: "12px 16px",
@@ -211,10 +151,7 @@ export default function TrainingQueue({
           {(["lichess", "chess.com"] as const).map((p) => (
             <button
               key={p}
-              onClick={() => {
-                setPlatform(p);
-                setImportState("idle");
-              }}
+              onClick={() => setPlatform(p)}
               style={{
                 flex: 1,
                 padding: "4px 8px",
@@ -237,79 +174,53 @@ export default function TrainingQueue({
           ))}
         </div>
 
-        <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
-          <input
-            type="text"
-            placeholder={platform === "lichess" ? "Lichess account" : "Chess.com account"}
-            value={accountInput}
-            onChange={(e) => setAccountInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && linkAccount()}
-            style={{
-              flex: 1,
-              background: "var(--bg-base)",
-              border: "1px solid var(--border)",
-              borderRadius: "5px",
-              padding: "6px 10px",
-              fontSize: "12px",
-              color: "var(--text-primary)",
-              outline: "none",
-              minWidth: 0,
-              fontFamily: "inherit",
-            }}
-          />
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={linkAccount}
-            disabled={!accountInput.trim()}
-          >
-            Link
-          </Button>
-        </div>
-
-        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "6px" }}>
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={() => void handleImport(platform)}
-            disabled={
-              importState === "loading" ||
-              !(getLinkedUsername(linkedAccounts, platform) || accountInput.trim())
-            }
-          >
-            {importState === "loading" ? "…" : `Sync ${platform === "lichess" ? "Lichess" : "Chess.com"}`}
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => {
-              void (async () => {
-                if (linkedAccounts.lichess) await handleImport("lichess");
-                if (linkedAccounts.chessCom) await handleImport("chess.com");
-              })();
-            }}
-            disabled={importState === "loading" || (!linkedAccounts.lichess && !linkedAccounts.chessCom)}
-          >
-            Sync Linked Accounts
-          </Button>
-        </div>
-
-        <div style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "11px", color: "var(--text-muted)" }}>
-          <span>Lichess: {linkedAccounts.lichess || "not linked"}</span>
-          <span>Chess.com: {linkedAccounts.chessCom || "not linked"}</span>
-        </div>
-
-        {/* Status message */}
-        {importMsg && (
-          <div
-            style={{
-              marginTop: "6px",
-              fontSize: "11px",
-              color: importState === "error" ? "var(--red)" : "var(--green)",
-              lineHeight: 1.4,
-            }}
-          >
-            {importMsg}
+        {getLinkedUsername(linkedAccounts, platform) ? (
+          /* Linked state — show username + unlink */
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span style={{
+              flex: 1, fontSize: "12px", fontWeight: 600,
+              color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            }}>
+              {getLinkedUsername(linkedAccounts, platform)}
+            </span>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => unlinkAccount(platform)}
+            >
+              Unlink
+            </Button>
+          </div>
+        ) : (
+          /* Unlinked state — show input + link */
+          <div style={{ display: "flex", gap: "6px" }}>
+            <input
+              type="text"
+              placeholder={platform === "lichess" ? "Lichess username" : "Chess.com username"}
+              value={accountInput}
+              onChange={(e) => setAccountInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && linkAccount()}
+              style={{
+                flex: 1,
+                background: "var(--bg-base)",
+                border: "1px solid var(--border)",
+                borderRadius: "5px",
+                padding: "6px 10px",
+                fontSize: "12px",
+                color: "var(--text-primary)",
+                outline: "none",
+                minWidth: 0,
+                fontFamily: "inherit",
+              }}
+            />
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={linkAccount}
+              disabled={!accountInput.trim()}
+            >
+              Link
+            </Button>
           </div>
         )}
       </div>

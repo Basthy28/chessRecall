@@ -45,7 +45,7 @@ export function saveLinkedAccounts(accounts: LinkedAccounts): void {
 }
 
 /**
- * Persist linked accounts to Supabase user_metadata so they sync across devices.
+ * Persist linked accounts to public.users so they sync across devices.
  * Falls back silently if auth is unavailable.
  */
 export async function syncLinkedAccountsToSupabase(
@@ -55,18 +55,21 @@ export async function syncLinkedAccountsToSupabase(
   try {
     const { createBrowserClient } = await import("@/lib/supabase");
     const supabase = createBrowserClient();
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session) return; // guest — nothing to sync
-    await supabase.auth.updateUser({
-      data: { linkedAccounts: accounts },
-    });
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+    await supabase.from("users").upsert({
+      id: user.id,
+      lichess_username: normalizeUsername(accounts.lichess) || null,
+      chess_com_username: normalizeUsername(accounts.chessCom) || null,
+      last_synced_at: new Date().toISOString(),
+    }, { onConflict: "id" });
   } catch (err) {
     console.warn("[linkedAccounts] Failed to sync to Supabase:", err);
   }
 }
 
 /**
- * Restore linked accounts from Supabase user_metadata into localStorage.
+ * Restore linked accounts from public.users into localStorage.
  * Call this after login if localStorage is empty.
  */
 export async function restoreLinkedAccountsFromSupabase(): Promise<LinkedAccounts | null> {
@@ -77,18 +80,20 @@ export async function restoreLinkedAccountsFromSupabase(): Promise<LinkedAccount
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return null;
 
-    const meta = user.user_metadata as Record<string, unknown> | null;
-    const stored = meta?.linkedAccounts as Partial<LinkedAccounts> | undefined;
-    if (!stored) return null;
+    const { data } = await supabase
+      .from("users")
+      .select("lichess_username, chess_com_username")
+      .eq("id", user.id)
+      .single();
+
+    if (!data) return null;
 
     const accounts: LinkedAccounts = {
-      lichess: normalizeUsername(stored.lichess),
-      chessCom: normalizeUsername(stored.chessCom),
+      lichess: normalizeUsername(data.lichess_username),
+      chessCom: normalizeUsername(data.chess_com_username),
     };
 
-    // Only restore if we have something meaningful
     if (!accounts.lichess && !accounts.chessCom) return null;
-
     return accounts;
   } catch (err) {
     console.warn("[linkedAccounts] Failed to restore from Supabase:", err);

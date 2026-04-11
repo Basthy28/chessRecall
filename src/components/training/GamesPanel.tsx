@@ -1,21 +1,41 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import type { Square } from "chess.js";
 import type { Key } from "chessground/types";
 import Button from "@/components/ui/Button";
 import ChessBoard, { type MoveAnnotationOverlay } from "@/components/board/ChessBoard";
 import MoveTree, { type UnifiedNode } from "./MoveTree";
-import { createBrowserClient } from "@/lib/supabase";
+import { createBrowserClient, getClientAuthHeaders } from "@/lib/supabase";
 import {
   getAllViewerUsernames,
   getLinkedUsername,
   inferPlatformFromGameId,
   readLinkedAccounts,
+  saveLinkedAccounts,
+  syncLinkedAccountsToSupabase,
   usernameMatchesPlayer,
   type LinkedAccounts,
 } from "@/lib/linkedAccounts";
+import { useLiveAnalysis } from "@/hooks/useLiveAnalysis";
+
+const AUTO_SYNC_INTERVAL_MS = 30 * 60 * 1000; // 30 min between auto-syncs
+
+function getLastSyncKey(p: "lichess" | "chess.com", username: string) {
+  return `lastSync_${p}_${username}`;
+}
+function getLastSyncMs(p: "lichess" | "chess.com", username: string): number {
+  try { const v = localStorage.getItem(getLastSyncKey(p, username)); return v ? parseInt(v, 10) : 0; } catch { return 0; }
+}
+function setLastSyncMs(p: "lichess" | "chess.com", username: string) {
+  try { localStorage.setItem(getLastSyncKey(p, username), String(Date.now())); } catch { /**/ }
+}
+import { useGameAnalysis } from "@/hooks/useGameAnalysis";
+import type { DrawShape } from "chessground/draw";
+import { classifyMove, evalWinningChances, getExpectedPointsLoss, isSacrificeMove } from "@/lib/analysis";
+import { lookupOpening, isBookPosition } from "@/lib/ecoBook";
+import type { OpeningInfo } from "@/lib/ecoBook";
 
 type Platform = "lichess" | "chess.com" | "all";
 type GameStatus = "pending" | "processing" | "analyzed" | "failed";
@@ -42,18 +62,9 @@ interface GamesResponse {
     analyzed: number;
     failed: number;
   };
+  nextCursor: string | null;
 }
 
-interface MoveAnnotation {
-  ply: number;
-  move_uci: string;
-  classification: import("@/lib/analysis").MoveClassification;
-  win_before: number;
-  win_after: number;
-  is_miss: boolean;
-  opening_name?: string | null;
-  opening_eco?: string | null;
-}
 
 interface LiveReviewResponse {
   game: {
@@ -70,54 +81,10 @@ interface LiveReviewResponse {
   };
   positions: string[];
   moves: Array<{ ply: number; san: string; from: string; to: string; timeSpentMs: number | null }>;
-  annotations: MoveAnnotation[];
   error?: string;
 }
 
-interface LiveAnalysisResponse {
-  best: AnalysisLine;
-  second: AnalysisLine | null;
-  lines: AnalysisLine[];
-  depth: number;
-  turn: "w" | "b";
-}
-
-
-
-
-interface AnalysisLine {
-  move: string;
-  san: string;
-  score: number;
-  pv: string;
-  pvUci: string[];
-}
-
-
-
-
-
-
-
-
-
-const ANALYSIS_ENGINE_URL = "/stockfish/stockfish-18-single.js";
-const ANALYSIS_MULTI_PV = 3;
-const ANALYSIS_DEBOUNCE_MS = 120;
-const ANALYSIS_MOVETIME_MS = 20_000;
-const ANALYSIS_TIMEOUT_MS = ANALYSIS_MOVETIME_MS + 8_000;
-
-function getEngineThreadCount(): number {
-  const hardware =
-    typeof navigator !== "undefined" && typeof navigator.hardwareConcurrency === "number"
-      ? Math.floor(navigator.hardwareConcurrency)
-      : 8;
-  return Math.max(2, Math.min(24, hardware - 1));
-}
-
-function getEngineHashMb(threads: number): number {
-  return Math.max(128, Math.min(1024, threads * 32));
-}
+// ── Pure utility helpers ────────────────────────────────────────────
 
 function statusColor(status: GameStatus): string {
   if (status === "analyzed") return "var(--green)";
@@ -131,9 +98,7 @@ function formatEval(score: number): string {
     const mateIn = 100_000 - Math.abs(score);
     return `${score > 0 ? "+" : "-"}M${mateIn}`;
   }
-
   if (score === 0) return "0.0";
-
   const pawns = score / 100;
   return pawns > 0 ? `+${pawns.toFixed(2)}` : pawns.toFixed(2);
 }
@@ -154,379 +119,152 @@ function formatClock(totalSeconds: number | null): string {
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
-// Lichess accuracy formula.
-// "cpl" here = win% loss scaled to 0-100, NOT raw centipawns.
-// 103.1668 * e^(-0.04354 * avgLoss) - 3.167 where avgLoss = mean(max(0, win_before-win_after)*100).
-// Examples: avgLoss=2 → ~91%, avgLoss=6 → ~79%, avgLoss=15 → ~42%.
-function computeAccuracy(annotations: MoveAnnotation[]): number | null {
-  if (annotations.length === 0) return null;
-  const totalLoss = annotations.reduce((sum, a) => sum + Math.max(0, (a.win_before - a.win_after) * 100), 0);
-  const avgLoss = totalLoss / annotations.length;
-  return Math.round(Math.max(0, Math.min(100, 103.1668 * Math.exp(-0.04354 * avgLoss) - 3.167)));
-}
+/** Minimum depth before showing live move classification. Prevents premature annotations. */
+const MIN_CLASSIFY_DEPTH = 16;
 
 const CLASSIFICATION_COLOR: Record<string, string> = {
-  brilliant: "#1baca6",
-  great: "#5ca0d3",
-  best: "#81b64c",
-  excellent: "#96bc4b",
-  good: "#96bc4b",
-  inaccuracy: "#ebba34",
-  mistake: "#e8802a",
-  blunder: "#f05149",
-  miss: "#f05149",
-  book: "#b09f87",
+  brilliant: "#1baca6",  // teal  — !!
+  great:     "#5c8fe0",  // blue  — Critical !
+  best:      "#81b64c",  // green — ★
+  excellent: "#96bc4b",  // lime  — 👍
+  good:      "#5cb85c",  // green — ✓  (Okay)
+  inaccuracy:"#e8b84b",  // amber — ?!
+  mistake:   "#e8802a",  // orange — ?
+  blunder:   "#f05149",  // red   — ??
+  miss:      "#f05149",
+  book:      "#b09f87",  // tan   — Theory
 };
 
 const CLASSIFICATION_LABEL: Record<string, string> = {
-  brilliant: "Brilliant !!",
-  great: "Great !",
-  best: "Best",
-  excellent: "Excellent !",
-  good: "Good",
+  brilliant:  "Brilliant !!",
+  great:      "Critical !",
+  best:       "Best",
+  excellent:  "Excellent",
+  good:       "Okay",
   inaccuracy: "Inaccuracy ?!",
-  mistake: "Mistake ?",
-  blunder: "Blunder ??",
-  miss: "Missed win",
-  book: "Book",
+  mistake:    "Mistake ?",
+  blunder:    "Blunder ??",
+  miss:       "Missed win",
+  book:       "Theory",
 };
 
-function parseScore(line: string): number | null {
-  const mateMatch = line.match(/\bscore mate (-?\d+)\b/);
-  if (mateMatch) {
-    const mateIn = parseInt(mateMatch[1], 10);
-    return mateIn > 0 ? 100_000 - mateIn : -100_000 - mateIn;
-  }
+// ── Classification icons (WintrChess style) ──────────────────────────────────
+const CLASSIFICATION_SYMBOL: Record<string, string> = {
+  brilliant: "!!", great: "!", best: "★", excellent: "✦",
+  good: "✓", inaccuracy: "?!", mistake: "?", blunder: "??", book: "♟",
+};
 
-  const cpMatch = line.match(/\bscore cp (-?\d+)\b/);
-  return cpMatch ? parseInt(cpMatch[1], 10) : null;
+function ClassificationIcon({ cls, size = 20 }: { cls: string; size?: number }) {
+  const color = CLASSIFICATION_COLOR[cls] ?? "#888";
+  const symbol = CLASSIFICATION_SYMBOL[cls] ?? "•";
+  return (
+    <div style={{
+      width: size, height: size, borderRadius: "50%",
+      background: color,
+      display: "flex", alignItems: "center", justifyContent: "center",
+      flexShrink: 0,
+    }}>
+      <span style={{
+        fontSize: size * 0.42, fontWeight: 900,
+        color: "#fff", lineHeight: 1, letterSpacing: "-0.02em",
+        fontFamily: "monospace",
+      }}>
+        {symbol}
+      </span>
+    </div>
+  );
 }
 
-function uciToSan(fen: string, uciMove: string): string {
-  const chess = new Chess(fen);
+// ── Player avatar ────────────────────────────────────────────────────────────
+const AVATAR_PALETTE = ["#5c8fe0","#81b64c","#e8802a","#1baca6","#e8b84b","#a56de2","#f05149"];
+function playerAvatarColor(name: string): string {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return AVATAR_PALETTE[h % AVATAR_PALETTE.length];
+}
+
+// In-memory cache: username → avatar URL (or null = no photo)
+const avatarCache = new Map<string, string | null>();
+
+async function fetchAvatarUrl(username: string, platform: "lichess" | "chess.com"): Promise<string | null> {
+  const key = `${platform}:${username.toLowerCase()}`;
+  if (avatarCache.has(key)) return avatarCache.get(key)!;
   try {
-    const from = uciMove.slice(0, 2);
-    const to = uciMove.slice(2, 4);
-    const move =
-      uciMove.length > 4
-        ? chess.move({ from, to, promotion: uciMove[4] })
-        : chess.move({ from, to });
-
-    if (!move) {
-      throw new Error(`Invalid move ${uciMove}`);
+    if (platform === "lichess") {
+      const res = await fetch(`https://lichess.org/api/user/${encodeURIComponent(username)}`, {
+        headers: { Accept: "application/json" },
+      });
+      if (!res.ok) { avatarCache.set(key, null); return null; }
+      const data = await res.json() as { profile?: { image?: string } };
+      const url = data?.profile?.image ?? null;
+      avatarCache.set(key, url);
+      return url;
+    } else {
+      const res = await fetch(`https://api.chess.com/pub/player/${encodeURIComponent(username.toLowerCase())}`);
+      if (!res.ok) { avatarCache.set(key, null); return null; }
+      const data = await res.json() as { avatar?: string };
+      const url = data?.avatar ?? null;
+      avatarCache.set(key, url);
+      return url;
     }
-
-    return move.san;
   } catch {
-    throw new Error(`Invalid move ${uciMove}`);
+    avatarCache.set(key, null);
+    return null;
   }
 }
 
+function PlayerAvatar({
+  name, size = 32, platform,
+}: {
+  name: string; size?: number; platform?: "lichess" | "chess.com";
+}) {
+  const [photoUrl, setPhotoUrl] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!name || !platform) return;
+    const key = `${platform}:${name.toLowerCase()}`;
+    if (avatarCache.has(key)) {
+      setPhotoUrl(avatarCache.get(key) ?? null);
+      return;
+    }
+    void fetchAvatarUrl(name, platform).then(setPhotoUrl);
+  }, [name, platform]);
 
-function normalizeToWhitePerspective(score: number, turn: "w" | "b"): number {
-  return turn === "w" ? score : -score;
+  const bg = playerAvatarColor(name);
+  return (
+    <div style={{
+      width: size, height: size, borderRadius: "50%",
+      background: bg, flexShrink: 0, overflow: "hidden",
+      border: "2px solid rgba(255,255,255,0.12)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+    }}>
+      {photoUrl ? (
+        <img
+          src={photoUrl}
+          alt={name}
+          style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "50%" }}
+          onError={() => setPhotoUrl(null)}
+        />
+      ) : (
+        <span style={{
+          fontWeight: 700, fontSize: size * 0.42,
+          color: "#fff", textTransform: "uppercase", lineHeight: 1,
+        }}>
+          {name.slice(0, 1)}
+        </span>
+      )}
+    </div>
+  );
 }
 
 function evalBarWhiteRatio(score: number): number {
-  if (Math.abs(score) >= 99_000) {
-    return score > 0 ? 1 : 0;
-  }
-
+  if (Math.abs(score) >= 99_000) return score > 0 ? 1 : 0;
   const clamped = Math.max(-800, Math.min(800, score));
   return (clamped + 800) / 1600;
 }
 
-function uciPvToSanPreview(fen: string, pvLine: string, maxPlies = 8): string {
-  const chess = new Chess(fen);
-  const moves = pvLine.trim().split(/\s+/).filter(Boolean);
-  const sanMoves: string[] = [];
+// isSacrificeMove is now imported from @/lib/analysis
 
-  for (let i = 0; i < moves.length && sanMoves.length < maxPlies; i++) {
-    const beforeMoveNumber = chess.moveNumber();
-    const beforeTurn = chess.turn();
-    let move:
-      | ReturnType<typeof chess.move>
-      | null = null;
-    try {
-      const from = moves[i].slice(0, 2);
-      const to = moves[i].slice(2, 4);
-      move =
-        moves[i].length > 4
-          ? chess.move({ from, to, promotion: moves[i][4] })
-          : chess.move({ from, to });
-    } catch {
-      break;
-    }
-
-    if (!move) break;
-
-    sanMoves.push(
-      beforeTurn === "w"
-        ? `${beforeMoveNumber}. ${move.san}`
-        : `${beforeMoveNumber}... ${move.san}`
-    );
-  }
-
-  return sanMoves.join(" ");
-}
-
-function useBrowserLiveAnalysis(fen: string) {
-  const workerRef = useRef<Worker | null>(null);
-  const readyRef = useRef(false);
-  const activeRef = useRef<{
-    id: number;
-    fen: string;
-    turn: "w" | "b";
-    bestDepth: number;
-    pvByIndex: Map<number, AnalysisLine>;
-  } | null>(null);
-  const queuedRef = useRef<{
-    id: number;
-    fen: string;
-    turn: "w" | "b";
-    bestDepth: number;
-    pvByIndex: Map<number, AnalysisLine>;
-  } | null>(null);
-  const requestIdRef = useRef(0);
-  const debounceTimerRef = useRef<number | null>(null);
-  const timeoutTimerRef = useRef<number | null>(null);
-  const [analysis, setAnalysis] = useState<LiveAnalysisResponse | null>(null);
-  const [analysisLoading, setAnalysisLoading] = useState(true);
-  const [analysisError, setAnalysisError] = useState("");
-
-  const clearAnalysisTimeout = useCallback(() => {
-    if (timeoutTimerRef.current !== null) {
-      window.clearTimeout(timeoutTimerRef.current);
-      timeoutTimerRef.current = null;
-    }
-  }, []);
-
-  const publishAnalysis = useCallback((pending: NonNullable<typeof activeRef.current>) => {
-    const best = pending.pvByIndex.get(1);
-    if (!best) return;
-
-    setAnalysis({
-      best,
-      second: pending.pvByIndex.get(2) ?? null,
-      lines: Array.from(pending.pvByIndex.entries())
-        .sort((a, b) => a[0] - b[0])
-        .map((entry) => entry[1]),
-      depth: pending.bestDepth,
-      turn: pending.turn,
-    });
-    setAnalysisLoading(false);
-    setAnalysisError("");
-  }, []);
-
-  const startQueuedAnalysis = useCallback(() => {
-    const worker = workerRef.current;
-    const queued = queuedRef.current;
-    if (!worker || !readyRef.current || !queued || activeRef.current) return;
-
-    queuedRef.current = null;
-    activeRef.current = queued;
-
-    clearAnalysisTimeout();
-    timeoutTimerRef.current = window.setTimeout(() => {
-      if (activeRef.current?.id !== queued.id) return;
-
-      worker.postMessage("stop");
-      setAnalysisError("Analysis timed out. Restarting engine…");
-      setAnalysisLoading(false);
-    }, ANALYSIS_TIMEOUT_MS);
-
-    worker.postMessage("ucinewgame");
-    worker.postMessage(`setoption name MultiPV value ${ANALYSIS_MULTI_PV}`);
-    worker.postMessage(`position fen ${queued.fen}`);
-    worker.postMessage(`go movetime ${ANALYSIS_MOVETIME_MS}`);
-  }, [clearAnalysisTimeout]);
-
-  const bootWorker = useCallback(() => {
-    if (typeof Worker === "undefined") {
-      queueMicrotask(() => {
-        setAnalysis(null);
-        setAnalysisLoading(false);
-        setAnalysisError("Browser workers are not available.");
-      });
-      return;
-    }
-
-    if (workerRef.current) {
-      workerRef.current.terminate();
-      workerRef.current = null;
-    }
-
-    readyRef.current = false;
-    activeRef.current = null;
-    clearAnalysisTimeout();
-
-    const worker = new Worker(ANALYSIS_ENGINE_URL);
-    workerRef.current = worker;
-
-    worker.onmessage = (event: MessageEvent<string>) => {
-      const line = typeof event.data === "string" ? event.data : "";
-      if (!line) return;
-
-      if (!readyRef.current) {
-        if (line === "uciok") {
-          const threads = getEngineThreadCount();
-          const hash = getEngineHashMb(threads);
-          worker.postMessage("setoption name UCI_AnalyseMode value true");
-          worker.postMessage(`setoption name Threads value ${threads}`);
-          worker.postMessage(`setoption name Hash value ${hash}`);
-          worker.postMessage("isready");
-          return;
-        }
-
-        if (line === "readyok") {
-          readyRef.current = true;
-          startQueuedAnalysis();
-        }
-
-        return;
-      }
-
-      const pending = activeRef.current;
-      if (!pending) return;
-
-      if (line.startsWith("info") && line.includes("multipv")) {
-        const depthMatch = line.match(/\bdepth (\d+)\b/);
-        const firstMoveMatch = line.match(/\bpv (\S+)/);
-        const pvLineMatch = line.match(/\bpv (.+)$/);
-        const multipvMatch = line.match(/\bmultipv (\d+)\b/);
-        const depth = depthMatch ? parseInt(depthMatch[1], 10) : 0;
-        const pvIndex = multipvMatch ? parseInt(multipvMatch[1], 10) : 0;
-        const rawScore = parseScore(line);
-
-        if (!firstMoveMatch || !pvLineMatch || !pvIndex || pvIndex > ANALYSIS_MULTI_PV || rawScore === null) return;
-        if (depth < pending.bestDepth) return;
-
-        if (depth > pending.bestDepth) {
-          pending.bestDepth = depth;
-          pending.pvByIndex.clear();
-        }
-
-        try {
-          const pvUci = pvLineMatch[1].trim().split(/\s+/).filter(Boolean);
-          const score = normalizeToWhitePerspective(rawScore, pending.turn);
-          pending.pvByIndex.set(pvIndex, {
-            move: firstMoveMatch[1],
-            san: uciToSan(pending.fen, firstMoveMatch[1]),
-            score,
-            pv: uciPvToSanPreview(pending.fen, pvLineMatch[1]),
-            pvUci,
-          });
-        } catch {
-          return;
-        }
-
-        if (pending.id === requestIdRef.current) {
-          publishAnalysis(pending);
-        }
-
-        return;
-      }
-
-      if (!line.startsWith("bestmove")) return;
-
-      clearAnalysisTimeout();
-
-      const finished = activeRef.current;
-      activeRef.current = null;
-      if (!finished) {
-        startQueuedAnalysis();
-        return;
-      }
-
-      if (finished.id === requestIdRef.current && finished.pvByIndex.get(1)) {
-        publishAnalysis(finished);
-      } else if (!queuedRef.current && finished.id === requestIdRef.current) {
-        setAnalysisLoading(false);
-        setAnalysisError("No live analysis result received.");
-      }
-
-      startQueuedAnalysis();
-    };
-
-    worker.onerror = () => {
-      clearAnalysisTimeout();
-      readyRef.current = false;
-      activeRef.current = null;
-      if (workerRef.current) {
-        workerRef.current.terminate();
-        workerRef.current = null;
-      }
-      setAnalysisLoading(true);
-      setAnalysisError("Analysis engine crashed. Change position to retry.");
-    };
-
-    worker.postMessage("uci");
-  }, [clearAnalysisTimeout, publishAnalysis, startQueuedAnalysis]);
-
-  useEffect(() => {
-    bootWorker();
-
-    return () => {
-      clearAnalysisTimeout();
-      if (debounceTimerRef.current !== null) {
-        window.clearTimeout(debounceTimerRef.current);
-      }
-      if (workerRef.current) {
-        workerRef.current.postMessage("quit");
-        workerRef.current.terminate();
-        workerRef.current = null;
-      }
-      readyRef.current = false;
-      activeRef.current = null;
-      queuedRef.current = null;
-    };
-  }, [bootWorker, clearAnalysisTimeout]);
-
-  useEffect(() => {
-    if (debounceTimerRef.current !== null) {
-      window.clearTimeout(debounceTimerRef.current);
-    }
-
-    queueMicrotask(() => {
-      setAnalysisLoading(true);
-      setAnalysisError("");
-    });
-
-    debounceTimerRef.current = window.setTimeout(() => {
-      const requestId = requestIdRef.current + 1;
-      requestIdRef.current = requestId;
-      queuedRef.current = {
-        id: requestId,
-        fen,
-        turn: new Chess(fen).turn(),
-        bestDepth: 0,
-        pvByIndex: new Map(),
-      };
-
-      const worker = workerRef.current;
-      if (!worker) {
-        bootWorker();
-        return;
-      }
-
-      if (activeRef.current) {
-        worker.postMessage("stop");
-        return;
-      }
-
-      startQueuedAnalysis();
-    }, ANALYSIS_DEBOUNCE_MS);
-
-    return () => {
-      if (debounceTimerRef.current !== null) {
-        window.clearTimeout(debounceTimerRef.current);
-      }
-    };
-  }, [bootWorker, fen, startQueuedAnalysis]);
-
-  return { analysis, analysisLoading, analysisError };
-}
 
 function EvalBar({
   score,
@@ -592,8 +330,8 @@ function EvalBar({
           left: 0,
           right: 0,
           textAlign: "center",
-          fontSize: gameResult ? "10px" : "13px",
-          fontWeight: 800,
+          fontSize: "9px",
+          fontWeight: 700,
           color: labelColor,
           lineHeight: 1.1,
           padding: "0 1px",
@@ -700,148 +438,108 @@ const NavLast = () => (
   </svg>
 );
 
-// ── Classification counts per player ───────────────────────────────
-const REPORT_ROWS: Array<{ key: import("@/lib/analysis").MoveClassification; label: string; symbol: string; color: string }> = [
-  { key: "brilliant", label: "Brilliant", symbol: "!!", color: "#1baca6" },
-  { key: "great",     label: "Great",     symbol: "!",  color: "#5ca0d3" },
-  { key: "best",      label: "Best",      symbol: "★",  color: "#81b64c" },
-  { key: "excellent", label: "Excellent", symbol: "!",  color: "#96bc4b" },
-  { key: "good",      label: "Good",      symbol: "✓",  color: "#96bc4b" },
-  { key: "book",      label: "Book",      symbol: "📖", color: "#b09f87" },
-  { key: "inaccuracy",label: "Inaccuracy",symbol: "?!", color: "#ebba34" },
-  { key: "mistake",   label: "Mistake",   symbol: "?",  color: "#e8802a" },
-  { key: "miss",      label: "Missed win",symbol: "✗",  color: "#f05149" },
-  { key: "blunder",   label: "Blunder",   symbol: "??", color: "#f05149" },
-];
 
-function GameReport({ review, onStartReview, onClose }: {
-  review: LiveReviewResponse;
-  onStartReview: () => void;
-  onClose: () => void;
+// ── Eval graph ─────────────────────────────────────────────────────
+function EvalGraph({
+  positionEvals,
+  moves,
+  currentIndex,
+  onSeek,
+}: {
+  positionEvals: (number | null)[];
+  moves: Array<{ classification: string; ply: number }>;
+  currentIndex: number;
+  onSeek: (index: number) => void;
 }) {
-  const anns = review.annotations ?? [];
-  const whiteAnns = anns.filter(a => a.ply % 2 === 1);
-  const blackAnns = anns.filter(a => a.ply % 2 === 0);
+  const W = 400;
+  const H = 72;
+  const midY = H / 2;
+  const n = positionEvals.length;
+  if (n < 2) return null;
 
-  const whiteAcc = computeAccuracy(whiteAnns);
-  const blackAcc = computeAccuracy(blackAnns);
+  function evalToY(ev: number | null): number {
+    if (ev === null) return midY;
+    if (Math.abs(ev) >= 99_000) return ev > 0 ? 2 : H - 2;
+    const chance = (evalWinningChances(ev) + 1) / 2; // 0–1, 1 = white winning
+    return H - chance * H;                            // Y=0 at top = white winning
+  }
 
-  const countFor = (list: MoveAnnotation[], cls: string) =>
-    list.filter(a => a.classification === cls).length;
+  const xs = positionEvals.map((_, i) => (i / (n - 1)) * W);
+  const ys = positionEvals.map(evalToY);
+  const pts = ys.map((y, i) => `${xs[i].toFixed(1)},${y.toFixed(1)}`).join(" ");
 
-  // Last book move's opening name
-  const openingEntry = [...anns].reverse().find(a => a.classification === "book" && a.opening_name);
-  const openingName = openingEntry?.opening_name ?? null;
-  const openingEco  = openingEntry?.opening_eco  ?? null;
+  // Closed fill paths: white area (above midline = white territory)
+  const whitePolyPts = `0,0 ${pts} ${W},0`;
+  const blackPolyPts = `0,${H} ${pts} ${W},${H}`;
 
-  const hasAnnotations = anns.length > 0;
-  const { whiteRating, blackRating } = review.game;
+  const cursorX = (currentIndex / (n - 1)) * W;
 
-  const accColor = (v: number | null) =>
-    v === null ? "#666" : v >= 90 ? "#81b64c" : v >= 75 ? "#ebba34" : "#e8802a";
+  // Map position index → classification (only notable ones get a dot)
+  const DOT_CLS = new Set(["brilliant", "great", "blunder", "mistake", "inaccuracy"]);
+  const dotsByPos = new Map<number, string>();
+  for (const m of moves) {
+    if (DOT_CLS.has(m.classification)) dotsByPos.set(m.ply, m.classification);
+  }
+
+  function handleClick(e: React.MouseEvent<SVGSVGElement>) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const relX = (e.clientX - rect.left) / rect.width;
+    const idx = Math.round(relX * (n - 1));
+    onSeek(Math.max(0, Math.min(n - 1, idx)));
+  }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, height: "calc(100dvh - 56px)", minHeight: 0, background: "var(--bg-base)", overflow: "hidden" }}>
-      {/* Header */}
-      <div style={{ display: "flex", alignItems: "center", gap: "12px", padding: "8px 16px", borderBottom: "1px solid #3c3a38", background: "#211f1c", flexShrink: 0 }}>
-        <button onClick={onClose} style={{ display: "flex", alignItems: "center", gap: "5px", padding: "5px 10px", borderRadius: "6px", border: "1px solid #3c3a38", background: "transparent", color: "#aaa", fontSize: "12px", cursor: "pointer", fontFamily: "inherit" }}>
-          <NavPrev /> Back
-        </button>
-        <span style={{ fontSize: "13px", fontWeight: 600, color: "#fff" }}>
-          {review.game.white} vs {review.game.black}
-        </span>
-        <span style={{ fontSize: "11px", color: "#666" }}>{new Date(review.game.playedAt).toLocaleDateString()}</span>
-      </div>
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      width="100%"
+      height={H}
+      onClick={handleClick}
+      style={{ cursor: "crosshair", display: "block", userSelect: "none" }}
+      preserveAspectRatio="none"
+    >
+      {/* Background */}
+      <rect x="0" y="0" width={W} height={H} fill="#1a1816" />
 
-      {/* Body */}
-      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-start", padding: "32px 16px", gap: "24px" }}>
+      {/* White territory (above 50%) */}
+      <polygon points={whitePolyPts} fill="rgba(220,200,170,0.14)" />
 
-        {/* Players + accuracy */}
-        <div style={{ display: "flex", alignItems: "flex-start", gap: "48px", justifyContent: "center", width: "100%", maxWidth: "480px" }}>
-          {[
-            { name: review.game.white, rating: whiteRating, acc: whiteAcc, color: "white" as const },
-            { name: review.game.black, rating: blackRating, acc: blackAcc, color: "black" as const },
-          ].map(p => (
-            <div key={p.color} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "8px", flex: 1 }}>
-              {/* Avatar */}
-              <div style={{ width: "56px", height: "56px", borderRadius: "50%", background: p.color === "white" ? "#e8e6e2" : "#2c2b29", border: "3px solid #4a4846", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "24px" }}>
-                {p.color === "white" ? "♔" : "♚"}
-              </div>
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontSize: "13px", fontWeight: 700, color: "#fff", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
-                {p.rating && <div style={{ fontSize: "11px", color: "#888" }}>{p.rating}</div>}
-              </div>
-              {hasAnnotations ? (
-                <div style={{ fontSize: "28px", fontWeight: 900, color: accColor(p.acc) }}>
-                  {p.acc !== null ? `${p.acc}%` : "—"}
-                </div>
-              ) : (
-                <div style={{ fontSize: "12px", color: "#555" }}>Not analyzed</div>
-              )}
-              {hasAnnotations && <div style={{ fontSize: "10px", color: "#666", textTransform: "uppercase", letterSpacing: "0.08em" }}>Accuracy</div>}
-            </div>
-          ))}
-        </div>
+      {/* Black territory (below 50%) */}
+      <polygon points={blackPolyPts} fill="rgba(0,0,0,0.3)" />
 
-        {/* Move counts table */}
-        {hasAnnotations && (
-          <div style={{ width: "100%", maxWidth: "420px", background: "#211f1c", borderRadius: "10px", border: "1px solid #3c3a38", overflow: "hidden" }}>
-            {REPORT_ROWS.map((row, i) => {
-              const wCount = countFor(whiteAnns, row.key);
-              const bCount = countFor(blackAnns, row.key);
-              if (wCount === 0 && bCount === 0) return null;
-              return (
-                <div key={row.key} style={{ display: "flex", alignItems: "center", padding: "8px 16px", borderBottom: i < REPORT_ROWS.length - 1 ? "1px solid #2c2a28" : "none", background: i % 2 === 0 ? "#211f1c" : "#262421" }}>
-                  <div style={{ width: "36px", textAlign: "right", fontSize: "15px", fontWeight: 900, color: "#fff" }}>{wCount}</div>
-                  <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
-                    <span style={{ color: row.color, fontSize: "14px", fontWeight: 800 }}>{row.symbol}</span>
-                    <span style={{ fontSize: "12px", color: "#aaa", fontWeight: 600 }}>{row.label}</span>
-                  </div>
-                  <div style={{ width: "36px", textAlign: "left", fontSize: "15px", fontWeight: 900, color: "#fff" }}>{bCount}</div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+      {/* Center line */}
+      <line x1="0" y1={midY} x2={W} y2={midY} stroke="#444" strokeWidth="0.6" />
 
-        {/* Opening + ratings */}
-        <div style={{ width: "100%", maxWidth: "420px", display: "flex", flexDirection: "column", gap: "8px" }}>
-          {openingName && (
-            <div style={{ background: "#211f1c", borderRadius: "8px", border: "1px solid #3c3a38", padding: "10px 14px" }}>
-              <div style={{ fontSize: "10px", color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: "3px" }}>{openingEco ?? "Opening"}</div>
-              <div style={{ fontSize: "13px", color: "#ccc", fontWeight: 600 }}>{openingName}</div>
-            </div>
-          )}
-          <div style={{ display: "flex", gap: "8px" }}>
-            {[
-              { label: "White Rating", value: whiteRating },
-              { label: "Black Rating", value: blackRating },
-            ].filter(x => x.value).map(x => (
-              <div key={x.label} style={{ flex: 1, background: "#211f1c", borderRadius: "8px", border: "1px solid #3c3a38", padding: "10px 14px", textAlign: "center" }}>
-                <div style={{ fontSize: "10px", color: "#666", textTransform: "uppercase", letterSpacing: "0.08em" }}>{x.label}</div>
-                <div style={{ fontSize: "18px", fontWeight: 800, color: "#fff" }}>{x.value}</div>
-              </div>
-            ))}
-          </div>
-        </div>
+      {/* Eval curve */}
+      <polyline points={pts} fill="none" stroke="#777" strokeWidth="1.2" strokeLinejoin="round" />
 
-        {!hasAnnotations && (
-          <div style={{ color: "#666", fontSize: "13px", textAlign: "center" }}>
-            No analysis data yet — analyze this game with the cluster worker to see stats.
-          </div>
-        )}
+      {/* Classification dots */}
+      {Array.from(dotsByPos.entries()).map(([posIdx, cls]) => {
+        if (posIdx >= n) return null;
+        return (
+          <circle
+            key={posIdx}
+            cx={xs[posIdx].toFixed(1)}
+            cy={ys[posIdx].toFixed(1)}
+            r="3.5"
+            fill={CLASSIFICATION_COLOR[cls] ?? "#888"}
+            stroke="#1a1816"
+            strokeWidth="1"
+          />
+        );
+      })}
 
-        {/* Start Review */}
-        <button
-          onClick={onStartReview}
-          style={{ padding: "12px 48px", borderRadius: "8px", border: "none", background: "#81b64c", color: "#fff", fontSize: "15px", fontWeight: 800, cursor: "pointer", letterSpacing: "0.04em", marginTop: "8px" }}
-        >
-          Start Review
-        </button>
-      </div>
-    </div>
+      {/* Cursor */}
+      <line
+        x1={cursorX.toFixed(1)} y1="0"
+        x2={cursorX.toFixed(1)} y2={H}
+        stroke="rgba(255,255,255,0.55)"
+        strokeWidth="1"
+        strokeDasharray="3,2"
+      />
+    </svg>
   );
 }
+
 
 // ── Full-screen chess.com-style review view ────────────────────────
 function ReviewView({
@@ -874,25 +572,6 @@ function ReviewView({
     return root;
   }, [review]);
 
-  // Build a map from UCI path → classification using stored annotations
-  const nodeClassifications = useMemo(() => {
-    const map: Record<string, import("@/lib/analysis").MoveClassification> = {};
-    for (const ann of review.annotations ?? []) {
-      const plyIdx = ann.ply - 1; // 0-indexed
-      if (plyIdx < 0 || plyIdx >= review.moves.length) continue;
-      const path = review.moves.slice(0, plyIdx + 1).map(m => m.from + m.to).join(",");
-      map[path] = ann.classification;
-    }
-    return map;
-  }, [review.annotations, review.moves]);
-
-  // Accuracy per color using Lichess formula
-  const { whiteAccuracy, blackAccuracy } = useMemo(() => {
-    const anns = review.annotations ?? [];
-    const white = anns.filter(a => a.ply % 2 === 1); // odd ply = white move
-    const black = anns.filter(a => a.ply % 2 === 0); // even ply = black move
-    return { whiteAccuracy: computeAccuracy(white), blackAccuracy: computeAccuracy(black) };
-  }, [review.annotations]);
 
   const [rootNode, setRootNode] = useState<UnifiedNode>(initialTree);
   const [preferredChildren, setPreferredChildren] = useState<Record<string, string>>({});
@@ -907,6 +586,10 @@ function ReviewView({
     }
     return p;
   });
+
+  const seekToPosition = useCallback((idx: number) => {
+    setActivePath(review.moves.slice(0, idx).map(m => m.from + m.to));
+  }, [review.moves]);
 
   const getActiveNode = useCallback(() => {
     let curr = rootNode;
@@ -925,13 +608,149 @@ function ReviewView({
     setReviewIndex(activePath.length);
   }, [activePath.length, setReviewIndex]);
 
-  const { analysis, analysisLoading, analysisError } = useBrowserLiveAnalysis(activeFen);
+  const { lines, depth, isSearching, error } = useLiveAnalysis(activeFen);
+
+  // ── Eval cache: fen → { score, topMove, secondScore } ────────────────────
+  // Continuously updated as engine depth increases. Used for:
+  //   1. prevScore:    eval of parent position, needed to compute point loss
+  //   2. topMove:      engine's best UCI, for played-best detection
+  //   3. secondScore:  second-best line eval, for Critical detection (WintrChess)
+  const evalCacheRef = useRef<Map<string, { score: number; topMove: string; secondScore?: number }>>(new Map());
+  useEffect(() => {
+    if (lines.length > 0 && depth >= 8) {
+      evalCacheRef.current.set(activeFen, {
+        score: lines[0].score,
+        topMove: lines[0].move,
+        secondScore: lines[1]?.score,
+      });
+    }
+  }, [activeFen, lines, depth]);
+
+  // ── Sidebar tab ───────────────────────────────────────────────────────────
+  const [sidebarTab, setSidebarTab] = useState<"engine" | "report">("engine");
+
+  // ── Background full-game analysis ────────────────────────────────────────
+  const gameAnalysis = useGameAnalysis(review.positions, review.moves);
+
+  // ── Opening: track last known book position as user navigates ────────────
+  const [currentOpening, setCurrentOpening] = useState<OpeningInfo | null>(
+    () => lookupOpening(review.positions[0]) ?? null
+  );
+  useEffect(() => {
+    const opening = lookupOpening(activeFen);
+    if (opening) setCurrentOpening(opening);
+  }, [activeFen]);
+
+  // ── Live classification (WASM-driven, no worker needed) ─────────────────────
+  //
+  // Classification order (matches WintrChess classify.ts):
+  //   1. Forced  — only 1 legal move available → "best" (no annotation)
+  //   2. Theory  — current FEN is in the ECO opening book → "book"
+  //   3. Played best move — engine cached topMove === played UCI → "best"
+  //   4. Point loss delta — full centipawn threshold table
+  //
+  // We wait for MIN_CLASSIFY_DEPTH to avoid shallow-search instability.
+  const liveClassification = useMemo((): import("@/lib/analysis").MoveClassification | null => {
+    if (activePath.length === 0) return null;
+    if (depth < MIN_CLASSIFY_DEPTH) return null;
+
+    // Walk to the parent node
+    let parentNode = rootNode;
+    for (const uci of activePath.slice(0, -1)) {
+      const next = parentNode.children.find(c => c.uci === uci);
+      if (!next) return null;
+      parentNode = next;
+    }
+    const parentFen = parentNode.fen;
+    const playedUci = activePath[activePath.length - 1];
+
+    // 1. Forced move (only 1 legal move) — no meaningful annotation
+    try {
+      const parentBoard = new Chess(parentFen);
+      if (parentBoard.moves().length <= 1) return "best";
+    } catch { /* ignore */ }
+
+    // 2. Theory — position reached is in the opening book
+    if (isBookPosition(activeFen)) return "book";
+
+    // 3. Played-best short-circuit (WintrChess pattern):
+    //    If the played UCI matches the engine's cached best move from the parent
+    //    position, skip the eval-delta computation and classify as best or critical.
+    const parentCache = evalCacheRef.current.get(parentFen);
+    if (parentCache && parentCache.topMove === playedUci) {
+      // Critical detection (WintrChess): best move played AND second-best
+      // alternative loses ≥ 10% win-probability, position is not trivially won.
+      if (
+        parentCache.secondScore !== undefined &&
+        playedUci.length <= 4  // no promotions
+      ) {
+        try {
+          const parentBoard = new Chess(parentFen);
+          if (!parentBoard.isCheck()) {  // not a forced escape
+            const turnBefore = parentBoard.turn();
+            const secondLoss = getExpectedPointsLoss(parentCache.score, parentCache.secondScore, turnBefore);
+            if (secondLoss >= 0.1) return "great"; // Critical
+          }
+        } catch { /* ignore */ }
+      }
+      return "best";
+    }
+
+    // 4. Point-loss classification — requires both evals
+    const prevScore = parentCache?.score;
+    const currScore = lines.length > 0 ? lines[0].score : evalCacheRef.current.get(activeFen)?.score;
+    if (prevScore === undefined || currScore === undefined) return null;
+
+    try {
+      const chess = new Chess(parentFen);
+      const turnBefore = chess.turn();
+      return classifyMove(prevScore, currScore, turnBefore);
+    } catch { return null; }
+  }, [activePath, rootNode, lines, activeFen, depth]);
+
+  // ── Live brilliant detection ─────────────────────────────────────────────────
+  // A move is Brilliant when: it classifies as "best" AND it's a sacrifice AND
+  // the engine has only ONE clearly-good option (≥50cp gap to 2nd-best line).
+  const isLiveBrilliant = useMemo((): boolean => {
+    if (liveClassification !== "best") return false;
+    if (activePath.length === 0) return false;
+    const lastUci = activePath[activePath.length - 1];
+    if (lastUci.length > 4) return false; // no promotions
+
+    // Sacrifice check (client-side, same logic as the worker)
+    let parentFen = rootNode.fen;
+    let parentNode = rootNode;
+    for (const uci of activePath.slice(0, -1)) {
+      const next = parentNode.children.find(c => c.uci === uci);
+      if (!next) return false;
+      parentNode = next;
+    }
+    parentFen = parentNode.fen;
+    if (!isSacrificeMove(parentFen, lastUci)) return false;
+
+    // Gap check: the engine must have had only one good option (lines[1] much worse)
+    if (lines.length < 2) return false;
+    const gap = lines[0].score - lines[1].score;
+    return gap >= 50;
+  }, [liveClassification, activePath, rootNode, lines]);
+
+
   const boardBoxRef = useRef<HTMLDivElement | null>(null);
   const boardSlotRef = useRef<HTMLDivElement | null>(null);
   const [boardHeight, setBoardHeight] = useState<number | null>(null);
   const [boardSlotSize, setBoardSlotSize] = useState<{ width: number; height: number } | null>(null);
   const [promotionPending, setPromotionPending] = useState<{ orig: Key; dest: Key; color: "w" | "b" } | null>(null);
-  
+
+  // Engine best-move arrows: subtle colours only, top 2 lines
+  const engineShapes = useMemo((): DrawShape[] => {
+    if (lines.length === 0 || depth < 4) return [];
+    return lines.slice(0, 2).map((line, i) => ({
+      orig: line.move.slice(0, 2) as Key,
+      dest: line.move.slice(2, 4) as Key,
+      brush: i === 0 ? "paleBlue" : "paleGrey",
+    }));
+  }, [lines, depth]);
+
   const isCompact = windowWidth < 1100;
   const boardSize = useMemo(() => {
     if (!boardSlotSize) return null;
@@ -1162,24 +981,30 @@ function ReviewView({
     return null;
   }, [activeFen]);
 
-  // Board annotation: show the classification badge on the destination square of the last move
+  // Board annotation: live WASM classification only — wait for stable depth
   const boardAnnotation = useMemo((): MoveAnnotationOverlay | undefined => {
     if (activePath.length === 0) return undefined;
-    const pathKey = activePath.join(",");
-    const cls = nodeClassifications[pathKey];
-    if (!cls || cls === "book" || cls === "best" || cls === "good" || cls === "excellent") return undefined;
+    // Don't show annotation while searching at shallow depth
+    if (isSearching && depth < MIN_CLASSIFY_DEPTH) return undefined;
+
+    const cls: string = (isLiveBrilliant ? "brilliant" : liveClassification)
+      ?? "";
+
+    if (!cls || cls === "book" || cls === "best" || cls === "good") return undefined;
+
     const lastUci = activePath[activePath.length - 1];
     const destSquare = lastUci.slice(2, 4) as Key;
     const SYMBOLS: Record<string, string> = {
-      brilliant: "!!", great: "!", inaccuracy: "?!", mistake: "?", blunder: "??", miss: "✗",
+      brilliant: "!!", great: "!", excellent: "!", inaccuracy: "?!", mistake: "?", blunder: "??", miss: "✗",
     };
     const symbol = SYMBOLS[cls];
     if (!symbol) return undefined;
     return { square: destSquare, symbol, color: CLASSIFICATION_COLOR[cls] ?? "#999" };
-  }, [activePath, nodeClassifications]);
+  }, [activePath, liveClassification, isLiveBrilliant, depth, isSearching]);
+
 
   const resultLabel = review.game.result === "win" ? "1-0" : review.game.result === "loss" ? "0-1" : "½-½";
-  const whiteEval = analysis?.best.score ?? 0;
+  const whiteEval = lines[0]?.score ?? 0;
   const viewerColor = review.game.playerColor ?? null;
   // Clock reflects time remaining at the CURRENT position (up to activePath.length mainline moves).
   // For branch moves (ply > review.moves.length) we just freeze at the last known clock.
@@ -1274,8 +1099,14 @@ function ReviewView({
           <NavPrev /> Back
         </button>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0 }}>
+          <PlayerAvatar name={review.game.white} size={22} platform={inferPlatformFromGameId(review.game.id)} />
           <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {review.game.white} vs {review.game.black}
+            {review.game.white}
+          </span>
+          <span style={{ fontSize: "11px", color: "var(--text-muted)", flexShrink: 0 }}>vs</span>
+          <PlayerAvatar name={review.game.black} size={22} platform={inferPlatformFromGameId(review.game.id)} />
+          <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {review.game.black}
           </span>
           <span style={{
             padding: "2px 8px",
@@ -1291,6 +1122,25 @@ function ReviewView({
             {new Date(review.game.playedAt).toLocaleDateString()}
           </span>
         </div>
+        {currentOpening && (
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", marginLeft: "auto", flexShrink: 0 }}>
+            <span style={{
+              padding: "2px 8px",
+              borderRadius: "4px",
+              background: "rgba(176,159,135,0.15)",
+              border: "1px solid rgba(176,159,135,0.3)",
+              fontSize: "11px",
+              fontWeight: 600,
+              color: "#b09f87",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              maxWidth: "280px",
+            }}>
+              {currentOpening.eco} · {currentOpening.name}
+            </span>
+          </div>
+        )}
       </div>
 
       <div style={{ display: "flex", flexDirection: isCompact ? "column" : "row", flex: 1, height: "100%", minHeight: 0, overflow: "visible" }}>
@@ -1446,6 +1296,7 @@ function ReviewView({
                     onMove={handleBoardMove}
                     showCoordinates
                     annotation={boardAnnotation}
+                    shapes={engineShapes}
                   />
                 </div>
                 {bottomBoardProfile && (
@@ -1458,6 +1309,17 @@ function ReviewView({
           </div>
         </div>
 
+        {/* ── Right panel — analysis sidebar ─────────────────────────────── */}
+        <style>{`
+          @keyframes shimmer {
+            0%   { background-position: -200% 0; }
+            100% { background-position:  200% 0; }
+          }
+          @keyframes cgPulse {
+            0%,100% { opacity: 1; }
+            50%      { opacity: 0.3; }
+          }
+        `}</style>
         <div style={{
           width: isCompact ? "100%" : "380px",
           flexShrink: 0,
@@ -1472,179 +1334,325 @@ function ReviewView({
           color: "#fff",
           alignSelf: isCompact ? "stretch" : "center",
         }}>
-          <div style={{ display: 'flex', borderBottom: '1px solid #3c3a38', background: '#211f1c', flexShrink: 0 }}>
-            {['Analysis', 'New Game', 'Games', 'Players'].map((tab, i) => (
-              <button key={tab} style={{
-                flex: 1, padding: '12px 0', fontSize: '13px', fontWeight: 600,
-                color: i === 0 ? '#fff' : '#999',
-                borderBottom: i === 0 ? '3px solid #81b64c' : '3px solid transparent',
-                background: 'transparent', border: 'none', cursor: 'pointer',
-              }}>
-                {tab}
-              </button>
-            ))}
-          </div>
 
-          <div style={{ display: 'flex', borderBottom: '1px solid #3c3a38', flexShrink: 0 }}>
-            {['Moves', 'Info', 'Openings'].map((tab, i) => (
-              <button key={tab} style={{
-                flex: 1, padding: '10px 0', fontSize: '12px', fontWeight: 600,
-                color: i === 0 ? '#fff' : '#999',
-                background: 'transparent', border: 'none', cursor: 'pointer',
-              }}>
-                {tab}
-              </button>
-            ))}
-          </div>
-
-          {/* Player names + accuracy */}
-          <div style={{ padding: "10px 12px", borderBottom: "1px solid #3c3a38", flexShrink: 0, display: "grid", gap: "6px" }}>
-            {(
-              orientation === "white"
-                ? [
-                    { side: "top", color: "black" as const, name: review.game.black, accuracy: blackAccuracy },
-                    { side: "bottom", color: "white" as const, name: review.game.white, accuracy: whiteAccuracy },
-                  ]
-                : [
-                    { side: "top", color: "white" as const, name: review.game.white, accuracy: whiteAccuracy },
-                    { side: "bottom", color: "black" as const, name: review.game.black, accuracy: blackAccuracy },
-                  ]
-            ).map((player) => (
-              <div
-                key={`${player.side}-${player.color}`}
-                style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px" }}
-              >
-                <span style={{ fontSize: "12px", fontWeight: 800, color: "#fff", display: "inline-flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
-                  <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: player.color === "white" ? "#e8e6e2" : "#111", border: "1px solid rgba(255,255,255,0.18)", flexShrink: 0 }} />
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{player.name}</span>
-                </span>
-                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  {player.accuracy !== null && (
-                    <span style={{ fontSize: "12px", fontWeight: 700, color: player.accuracy >= 90 ? "#81b64c" : player.accuracy >= 75 ? "#ebba34" : "#e8802a" }}>
-                      {player.accuracy}%
-                    </span>
-                  )}
-                  {viewerColor === player.color && (
-                    <span style={{ padding: "2px 6px", borderRadius: "999px", background: "#3c3a38", fontSize: "11px", fontWeight: 800 }}>
-                      You
-                    </span>
-                  )}
-                </div>
+          {/* Sidebar header: tab switcher + engine status */}
+          <div style={{ background: "#211f1c", borderBottom: "1px solid #3c3a38", flexShrink: 0 }}>
+            {/* Tabs */}
+            <div style={{ display: "flex", borderBottom: "1px solid #3c3a38" }}>
+              {(["engine", "report"] as const).map(tab => (
+                <button
+                  key={tab}
+                  onClick={() => setSidebarTab(tab)}
+                  style={{
+                    flex: 1, padding: "7px 0",
+                    background: sidebarTab === tab ? "#262421" : "transparent",
+                    border: "none",
+                    borderBottom: sidebarTab === tab ? "2px solid #81b64c" : "2px solid transparent",
+                    color: sidebarTab === tab ? "#fff" : "#666",
+                    fontSize: "11px", fontWeight: 700, cursor: "pointer",
+                    fontFamily: "inherit", letterSpacing: "0.06em", textTransform: "uppercase",
+                    transition: "color 150ms ease",
+                  }}
+                >
+                  {tab === "engine" ? "Engine" : "Report"}
+                </button>
+              ))}
+            </div>
+            {/* Engine status row (always visible for depth feedback) */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <span style={{
+                  width: "7px", height: "7px", borderRadius: "50%",
+                  background: isSearching ? "#81b64c" : "#444",
+                  animation: isSearching ? "cgPulse 1.4s ease-in-out infinite" : "none",
+                  flexShrink: 0, transition: "background 300ms ease",
+                }} />
+                <span style={{ fontSize: "11px", fontWeight: 700, color: "#aaa", letterSpacing: "0.06em" }}>SF18</span>
               </div>
-            ))}
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                {gameAnalysis.isAnalyzing && (
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    <div style={{ width: "60px", height: "4px", borderRadius: "2px", background: "#333", overflow: "hidden" }}>
+                      <div style={{
+                        height: "100%", width: `${gameAnalysis.progress}%`,
+                        background: "#5ca0d3", borderRadius: "2px",
+                        transition: "width 300ms ease",
+                      }} />
+                    </div>
+                    <span style={{ fontSize: "10px", color: "#5ca0d3", fontVariantNumeric: "tabular-nums" }}>
+                      {gameAnalysis.progress}%
+                    </span>
+                  </div>
+                )}
+                <span style={{ fontSize: "11px", color: depth > 0 ? "#81b64c" : "#555", fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>
+                  {depth > 0 ? `d${depth}` : isSearching ? "…" : "—"}
+                </span>
+              </div>
+            </div>
           </div>
 
-          {/* Current move classification badge */}
-          {(() => {
-            if (activePath.length === 0) return null;
-            const pathKey = activePath.join(",");
-            const cls = nodeClassifications[pathKey];
-            if (!cls || cls === "book") return null;
-            const color = CLASSIFICATION_COLOR[cls] ?? "#999";
-            const label = CLASSIFICATION_LABEL[cls] ?? cls;
+          {/* Classified move card — live WASM classification */}
+          {sidebarTab === "engine" && (() => {
+            if (activePath.length === 0 || gameOverResult) return null;
+
+            const rawCls = liveClassification ?? null;
+            const cls: string = isLiveBrilliant ? "brilliant" : (rawCls ?? "");
+            const color = cls ? (CLASSIFICATION_COLOR[cls] ?? "#999") : null;
+            const label = cls ? (CLASSIFICATION_LABEL[cls] ?? cls) : null;
+            const bestSan = lines[0]?.san ?? null;
+            const lastMoveSan = activeNode.san;
+            const showBestWas = cls && !["best","brilliant","great","book","none","excellent","good"].includes(cls) && bestSan;
+
+            // Show loading skeleton while engine hasn't reached the minimum classify depth
+            const isLoading = isSearching && depth < MIN_CLASSIFY_DEPTH;
+
             return (
-              <div style={{ padding: "6px 12px", borderBottom: "1px solid #3c3a38", flexShrink: 0, display: "flex", alignItems: "center", gap: "8px" }}>
-                <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: color, flexShrink: 0 }} />
-                <span style={{ fontSize: "13px", fontWeight: 700, color }}>{label}</span>
+              <div style={{
+                padding: "8px 12px", background: "#2a2826", borderBottom: "1px solid #3c3a38", flexShrink: 0, minHeight: "48px",
+              }}>
+                {isLoading ? (
+                  <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                    <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: "linear-gradient(90deg, #2c2b29 25%, #3d3b38 50%, #2c2b29 75%)", backgroundSize: "200% 100%", animation: "shimmer 1.5s infinite", flexShrink: 0 }} />
+                    <div style={{ flex: 1, height: "14px", borderRadius: "4px", background: "linear-gradient(90deg, #2c2b29 25%, #3d3b38 50%, #2c2b29 75%)", backgroundSize: "200% 100%", animation: "shimmer 1.5s infinite 0.1s" }} />
+                  </div>
+                ) : cls && color && label ? (
+                  <div>
+                    <div style={{ display: "flex", alignItems: "center", gap: "7px", marginBottom: showBestWas ? "3px" : 0 }}>
+                      <span style={{ background: color, borderRadius: "50%", width: "8px", height: "8px", flexShrink: 0 }} />
+                      <span style={{ fontSize: "13px", fontWeight: 700, color }}>
+                        {lastMoveSan}
+                      </span>
+                      <span style={{ fontSize: "12px", color: "#888", fontWeight: 400 }}>is {label}</span>
+                    </div>
+                    {showBestWas && (
+                      <div style={{ fontSize: "12px", color: "#666", paddingLeft: "15px" }}>
+                        Best was <span style={{ color: "#81b64c", fontWeight: 700 }}>{bestSan}</span>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: "12px", color: "#555", lineHeight: 1.5 }}>
+                    {activePath.length > 0 ? "Analysing…" : "Navigate moves to see classifications"}
+                  </div>
+                )}
               </div>
             );
           })()}
 
-          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 12px', fontSize: '11px', color: '#999', alignItems: 'center', flexShrink: 0 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-              <span style={{ color: '#fff', fontWeight: 'bold' }}>✓ Analysis</span>
-            </div>
-            <div>
-              {analysis?.depth ? `depth ${analysis.depth}` : "..."} | SF18
-            </div>
-          </div>
 
-          <div style={{ display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
-            {analysisError ? (
-              <div style={{ padding: '8px 12px', fontSize: '12px', color: '#ff6666' }}>{analysisError}</div>
-            ) : gameOverResult ? (
-              <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
-                <div style={{ fontSize: '22px', fontWeight: 900, color: '#fff', letterSpacing: '0.04em' }}>{gameOverResult}</div>
-                <div style={{ fontSize: '12px', color: '#999' }}>
-                  {gameOverResult === '½-½'
-                    ? 'Draw'
-                    : gameOverResult === '1-0'
-                    ? `${review.game.white} wins`
-                    : `${review.game.black} wins`
-                  }
+          {/* Engine lines area — engine tab only */}
+          {sidebarTab === "engine" && <div style={{ flexShrink: 0, borderBottom: "1px solid #3c3a38" }}>
+            {gameOverResult ? (
+              <div style={{ padding: "12px", textAlign: "center" }}>
+                <div style={{ fontSize: "22px", fontWeight: 900, color: "#fff", letterSpacing: "0.04em" }}>{gameOverResult}</div>
+                <div style={{ fontSize: "12px", color: "#999", marginTop: "4px" }}>
+                  {gameOverResult === "½-½" ? "Draw" : gameOverResult === "1-0" ? `${review.game.white} wins` : `${review.game.black} wins`}
                 </div>
               </div>
-            ) : analysisLoading && !analysis ? (
-              <div style={{ padding: '8px 12px', fontSize: '12px', color: '#999' }}>Analysing...</div>
-            ) : analysis ? (
-              analysis.lines.map((line, idx) => (
-                <div key={idx} style={{ 
-                  display: 'flex', alignItems: 'center', gap: '8px', 
-                  padding: '4px 12px', 
-                  background: idx % 2 === 0 ? '#2c2b29' : '#262421',
-                  cursor: 'pointer'
-                }} onClick={() => applyBranchSequence(line.pvUci.length > 0 ? line.pvUci : [line.move])}>
-                  <div style={{ 
-                    background: line.score >= 0 ? '#fff' : '#333', 
-                    color: line.score >= 0 ? '#000' : '#fff', 
-                    padding: '2px 6px', 
-                    borderRadius: '4px', 
-                    fontSize: '11px', 
-                    fontWeight: 700,
-                    minWidth: '38px',
-                    textAlign: 'center'
-                  }}>
-                    {formatEval(line.score)}
+            ) : error ? (
+              <div style={{ padding: "8px 12px", fontSize: "12px", color: "#ff6666" }}>{error}</div>
+            ) : (
+              (isSearching && depth < 6 ? [null, null, null] as (null)[] : lines.slice(0, 3)).map((line, idx) =>
+                line ? (
+                  <div
+                    key={idx}
+                    onClick={() => applyBranchSequence(line.pvUci.length > 0 ? line.pvUci : [line.move])}
+                    style={{
+                      display: "flex", alignItems: "center", gap: "8px", padding: "7px 10px",
+                      background: idx === 0 ? "rgba(129,182,76,0.07)" : "transparent",
+                      borderBottom: idx < 2 ? "1px solid rgba(255,255,255,0.04)" : "none",
+                      cursor: "pointer",
+                    }}
+                    onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.background = idx === 0 ? "rgba(129,182,76,0.13)" : "rgba(255,255,255,0.04)"; }}
+                    onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.background = idx === 0 ? "rgba(129,182,76,0.07)" : "transparent"; }}
+                  >
+                    {/* Score badge — Centichess style */}
+                    <div style={{
+                      background: line.score >= 0 ? "#ececea" : "#1a1917",
+                      color: line.score >= 0 ? "#111" : "#ccc",
+                      padding: "2px 6px", borderRadius: "4px",
+                      fontSize: "11px", fontWeight: 800,
+                      minWidth: "44px", textAlign: "center", flexShrink: 0,
+                      border: "1px solid rgba(255,255,255,0.07)",
+                    }}>
+                      {formatEval(line.score)}
+                    </div>
+                    <div style={{ overflow: "hidden", flex: 1, minWidth: 0, display: "flex", alignItems: "baseline", gap: "5px" }}>
+                      <span style={{ fontWeight: 800, fontSize: "13px", color: idx === 0 ? "#fff" : "#ccc", flexShrink: 0 }}>
+                        {line.san}
+                      </span>
+                      <span style={{ fontSize: "11px", color: "#555", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {line.pv.split(" ").slice(1).join(" ")}
+                      </span>
+                    </div>
                   </div>
-                  <div style={{ 
-                    color: '#ccc', 
-                    fontSize: '12px', 
-                    whiteSpace: 'nowrap', 
-                    overflow: 'hidden', 
-                    textOverflow: 'ellipsis',
-                    flex: 1
+                ) : (
+                  /* Skeleton shimmer line (Chesskit style) */
+                  <div key={idx} style={{
+                    display: "flex", alignItems: "center", gap: "8px", padding: "7px 10px",
+                    borderBottom: idx < 2 ? "1px solid rgba(255,255,255,0.04)" : "none",
                   }}>
-                    <span style={{ fontWeight: 'bold', color: '#fff', marginRight: '4px' }}>{line.san}</span>
-                    {line.pv.split(' ').slice(1).join(' ')}
+                    <div style={{
+                      width: "44px", height: "22px", borderRadius: "4px", flexShrink: 0,
+                      background: "linear-gradient(90deg, #2c2b29 25%, #3d3b38 50%, #2c2b29 75%)",
+                      backgroundSize: "200% 100%", animation: "shimmer 1.5s infinite",
+                    }} />
+                    <div style={{
+                      flex: 1, height: "14px", borderRadius: "4px",
+                      background: "linear-gradient(90deg, #2c2b29 25%, #3d3b38 50%, #2c2b29 75%)",
+                      backgroundSize: "200% 100%", animation: "shimmer 1.5s infinite 0.2s",
+                    }} />
+                  </div>
+                )
+              )
+            )}
+          </div>}
+
+          {/* Report tab — accuracy + move breakdown */}
+          {sidebarTab === "report" && (
+            <div style={{ flexShrink: 0, borderBottom: "1px solid #3c3a38", overflowY: "auto", maxHeight: "320px" }}>
+              {gameAnalysis.isAnalyzing ? (
+                <div style={{ padding: "14px 12px" }}>
+                  {/* Live-building eval graph during analysis */}
+                  {gameAnalysis.positionEvals.length > 1 && (
+                    <div style={{ marginBottom: "10px", borderRadius: "6px", overflow: "hidden", border: "1px solid #333" }}>
+                      <EvalGraph
+                        positionEvals={gameAnalysis.positionEvals}
+                        moves={gameAnalysis.moves}
+                        currentIndex={reviewIndex}
+                        onSeek={seekToPosition}
+                      />
+                    </div>
+                  )}
+                  <div style={{ fontSize: "11px", color: "#888", marginBottom: "8px", display: "flex", justifyContent: "space-between" }}>
+                    <span>Analysing game…</span>
+                    <span style={{ color: "#5ca0d3", fontVariantNumeric: "tabular-nums" }}>{gameAnalysis.progress}%</span>
+                  </div>
+                  <div style={{ height: "6px", borderRadius: "3px", background: "#333", overflow: "hidden" }}>
+                    <div style={{
+                      height: "100%", width: `${gameAnalysis.progress}%`,
+                      background: "linear-gradient(90deg, #5ca0d3, #81b64c)",
+                      borderRadius: "3px", transition: "width 300ms ease",
+                    }} />
+                  </div>
+                  <div style={{ fontSize: "10px", color: "#555", marginTop: "8px" }}>
+                    Evaluating {gameAnalysis.progress < 100 ? "positions" : "done"} — {review.positions.length} total
                   </div>
                 </div>
-              ))
-            ) : (
-              <div style={{ padding: '8px 12px', fontSize: '12px', color: '#999' }}>No analysis available.</div>
-            )}
+              ) : gameAnalysis.stats ? (
+                <div style={{ padding: "10px 12px" }}>
+                  {/* Eval graph */}
+                  <div style={{ marginBottom: "10px", borderRadius: "6px", overflow: "hidden", border: "1px solid #333" }}>
+                    <EvalGraph
+                      positionEvals={gameAnalysis.positionEvals}
+                      moves={gameAnalysis.moves}
+                      currentIndex={reviewIndex}
+                      onSeek={seekToPosition}
+                    />
+                  </div>
+                  {/* Accuracy cards */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", marginBottom: "12px" }}>
+                    {([
+                      { color: "white", name: review.game.white, acc: gameAnalysis.stats.whiteAccuracy, elo: gameAnalysis.stats.estimatedWhiteElo },
+                      { color: "black", name: review.game.black, acc: gameAnalysis.stats.blackAccuracy, elo: gameAnalysis.stats.estimatedBlackElo },
+                    ] as const).map(({ color, name, acc, elo }) => (
+                      <div key={color} style={{
+                        padding: "10px 8px", background: "#2a2826",
+                        borderRadius: "6px", border: "1px solid #3c3a38", textAlign: "center",
+                      }}>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "6px", marginBottom: "6px" }}>
+                          <PlayerAvatar name={name} size={24} platform={inferPlatformFromGameId(review.game.id)} />
+                          <span style={{ fontSize: "11px", color: "#aaa", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                            {name}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: "21px", fontWeight: 900, color: "#fff", fontVariantNumeric: "tabular-nums" }}>
+                          {acc.toFixed(1)}%
+                        </div>
+                        {elo && (
+                          <div style={{ fontSize: "10px", color: "#666", marginTop: "2px" }}>~{elo} Elo</div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  {/* Breakdown table */}
+                  <div style={{ fontSize: "10px", color: "#555", marginBottom: "5px", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                    Move Breakdown
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: "0 10px", alignItems: "center" }}>
+                    <div style={{ fontSize: "10px", color: "#444", paddingBottom: "3px" }} />
+                    <div style={{ fontSize: "10px", color: "#555", textAlign: "center", paddingBottom: "3px" }}>⬜</div>
+                    <div style={{ fontSize: "10px", color: "#555", textAlign: "center", paddingBottom: "3px" }}>⬛</div>
+                    {gameAnalysis.stats.breakdown.map(({ classification, white, black }) => {
+                      const clsColor = CLASSIFICATION_COLOR[classification] ?? "#999";
+                      const clsLabel = CLASSIFICATION_LABEL[classification] ?? classification;
+                      return (
+                        <Fragment key={classification}>
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px", padding: "3px 0" }}>
+                            <ClassificationIcon cls={classification} size={16} />
+                            <span style={{ fontSize: "11px", color: "#aaa" }}>{clsLabel}</span>
+                          </div>
+                          <div style={{ fontSize: "12px", fontWeight: 700, color: white > 0 ? clsColor : "#333", textAlign: "center" }}>{white}</div>
+                          <div style={{ fontSize: "12px", fontWeight: 700, color: black > 0 ? clsColor : "#333", textAlign: "center" }}>{black}</div>
+                        </Fragment>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div style={{ padding: "16px 12px", fontSize: "12px", color: "#555", textAlign: "center" }}>
+                  Analysis unavailable.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Move tree */}
+          <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "10px 0", display: "flex", flexDirection: "column" }}>
+            <div style={{ fontWeight: 700, fontSize: "10px", marginBottom: "4px", color: "#444", paddingLeft: "12px", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+              Moves
+            </div>
+            <MoveTree rootNode={rootNode} activePath={activePath} onSelectPath={handleSelectPath} />
           </div>
 
-          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px 0', display: 'flex', flexDirection: 'column' }}>
-            <div style={{ fontWeight: 'bold', fontSize: '12px', marginBottom: '4px', color: '#999', paddingLeft: '12px' }}>
-              Starting Position
-            </div>
-            {/* Replaced MoveList with MoveTree */}
-           <MoveTree rootNode={rootNode} activePath={activePath} onSelectPath={handleSelectPath} nodeClassifications={nodeClassifications} />
-          </div>
-
-          <div style={{ padding: '12px', background: '#211f1c', display: 'flex', justifyContent: 'center', flexShrink: 0 }}>
-            <div style={{ display: 'flex', gap: '4px' }}>
-                {[
-                  { icon: <NavFirst />, action: () => { setActivePath([]); }, disabled: reviewIndex === 0 },
-                  { icon: <NavPrev />, action: goLeft, disabled: reviewIndex === 0 },
-                  { icon: <NavNext />, action: goRight, disabled: activeNode.children.length === 0 },
-                  { icon: <NavLast />, action: () => {}, disabled: activeNode.children.length === 0 },
-                ].map((btn, i) => (
-                  <button key={i} onClick={btn.action} disabled={btn.disabled} style={{
-                    background: '#3c3a38', color: '#fff', border: 'none', padding: '8px 12px', borderRadius: '4px',
-                    opacity: btn.disabled ? 0.5 : 1, cursor: btn.disabled ? 'default' : 'pointer', fontWeight: 'bold',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center'
-                  }}>
-                    {btn.icon}
-                  </button>
-                ))}
-            </div>
+          {/* Nav buttons */}
+          <div style={{ padding: "10px 12px", background: "#211f1c", display: "flex", justifyContent: "center", gap: "4px", flexShrink: 0, borderTop: "1px solid #3c3a38" }}>
+            {[
+              { icon: <NavFirst />, action: () => setActivePath([]),  disabled: reviewIndex === 0 },
+              { icon: <NavPrev />,  action: goLeft,                    disabled: reviewIndex === 0 },
+              { icon: <NavNext />,  action: goRight,                   disabled: activeNode.children.length === 0 },
+              { icon: <NavLast />,  action: () => {
+                setActivePath(prev => {
+                  const np = [...prev];
+                  let curr = rootNode;
+                  for (const uci of np) { const next = curr.children.find(c => c.uci === uci); if (!next) return prev; curr = next; }
+                  while (curr.children.length > 0) {
+                    const prefStr = np.join(",");
+                    let nextUci = curr.children[0].uci;
+                    const pref = preferredChildren[prefStr];
+                    if (pref && curr.children.some(c => c.uci === pref)) nextUci = pref;
+                    np.push(nextUci); const next = curr.children.find(c => c.uci === nextUci); if (!next) break; curr = next;
+                  }
+                  return np;
+                });
+              }, disabled: activeNode.children.length === 0 },
+            ].map((btn, i) => (
+              <button key={i} onClick={btn.action} disabled={btn.disabled} style={{
+                background: "#3c3a38", color: "#fff", border: "none", padding: "8px 16px", borderRadius: "4px",
+                opacity: btn.disabled ? 0.35 : 1, cursor: btn.disabled ? "default" : "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center", transition: "opacity 150ms ease",
+              }}>
+                {btn.icon}
+              </button>
+            ))}
           </div>
         </div>
       </div>
     </div>
   );
 }
+
+
 
 // ── Main component ─────────────────────────────────────────────────
 export default function GamesPanel() {
@@ -1653,6 +1661,12 @@ export default function GamesPanel() {
     lichess: "",
     chessCom: "",
   });
+  // Account linking UI state
+  const [linkInputs, setLinkInputs] = useState({ lichess: "", chessCom: "" });
+  // Auto-sync status
+  const [syncingPlatforms, setSyncingPlatforms] = useState<Set<string>>(new Set());
+  const [lastSynced, setLastSynced] = useState<Record<string, number>>({});
+
   const [games, setGames] = useState<GameRow[]>([]);
   const [stats, setStats] = useState<GamesResponse["stats"]>({
     total: 0, pending: 0, processing: 0, analyzed: 0, failed: 0,
@@ -1661,6 +1675,8 @@ export default function GamesPanel() {
   const [loading, setLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [message, setMessage] = useState("");
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [report, setReport] = useState<LiveReviewResponse | null>(null);  // game report / stats
   const [review, setReview] = useState<LiveReviewResponse | null>(null);  // board review
@@ -1668,9 +1684,10 @@ export default function GamesPanel() {
 
   useEffect(() => {
     const refreshLinkedAccounts = () => {
-      setLinkedAccounts(readLinkedAccounts());
+      const accounts = readLinkedAccounts();
+      setLinkedAccounts(accounts);
+      setLinkInputs({ lichess: accounts.lichess, chessCom: accounts.chessCom });
     };
-
     refreshLinkedAccounts();
     window.addEventListener("focus", refreshLinkedAccounts);
     window.addEventListener("storage", refreshLinkedAccounts);
@@ -1680,6 +1697,27 @@ export default function GamesPanel() {
     };
   }, []);
 
+  function linkAccount(p: "lichess" | "chess.com") {
+    const val = (p === "lichess" ? linkInputs.lichess : linkInputs.chessCom).trim().toLowerCase();
+    if (!val) return;
+    const next: LinkedAccounts = p === "chess.com"
+      ? { ...linkedAccounts, chessCom: val }
+      : { ...linkedAccounts, lichess: val };
+    setLinkedAccounts(next);
+    saveLinkedAccounts(next);
+    void syncLinkedAccountsToSupabase(next);
+  }
+
+  function unlinkAccount(p: "lichess" | "chess.com") {
+    const next: LinkedAccounts = p === "chess.com"
+      ? { ...linkedAccounts, chessCom: "" }
+      : { ...linkedAccounts, lichess: "" };
+    setLinkedAccounts(next);
+    saveLinkedAccounts(next);
+    void syncLinkedAccountsToSupabase(next);
+    setLinkInputs(prev => p === "chess.com" ? { ...prev, chessCom: "" } : { ...prev, lichess: "" });
+  }
+
   const loadGames = useCallback(async (options?: { silent?: boolean }) => {
     const silent = options?.silent ?? false;
     if (!silent) {
@@ -1688,8 +1726,8 @@ export default function GamesPanel() {
     }
 
     try {
-      const params = new URLSearchParams({ platform, limit: "300" });
-      const res = await fetch(`/api/games?${params.toString()}`);
+      const params = new URLSearchParams({ platform });
+      const res = await fetch(`/api/games?${params.toString()}`, { headers: await getClientAuthHeaders() });
       const json = (await res.json()) as GamesResponse & { error?: string };
 
       if (!res.ok) {
@@ -1698,6 +1736,7 @@ export default function GamesPanel() {
       }
 
       setGames(json.games ?? []);
+      setNextCursor(json.nextCursor ?? null);
       setStats((prev) => json.stats ?? prev);
       const ids = new Set((json.games ?? []).map((g) => g.id));
       setSelectedGameId((prev) => (prev && ids.has(prev) ? prev : (json.games?.[0]?.id ?? null)));
@@ -1708,9 +1747,62 @@ export default function GamesPanel() {
     }
   }, [platform]);
 
+  const loadMoreGames = useCallback(async () => {
+    if (!nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const params = new URLSearchParams({ platform, cursor: nextCursor });
+      const res = await fetch(`/api/games?${params.toString()}`, { headers: await getClientAuthHeaders() });
+      const json = (await res.json()) as GamesResponse & { error?: string };
+      if (!res.ok) return;
+      setGames(prev => {
+        const existingIds = new Set(prev.map(g => g.id));
+        const newGames = (json.games ?? []).filter(g => !existingIds.has(g.id));
+        return [...prev, ...newGames];
+      });
+      setNextCursor(json.nextCursor ?? null);
+    } catch { /**/ } finally {
+      setLoadingMore(false);
+    }
+  }, [platform, nextCursor, loadingMore]);
+
   useEffect(() => {
     void loadGames();
   }, [loadGames]);
+
+  // ── Auto-sync: silently fetch new games when account is linked ──────────────
+  const autoSync = useCallback(async (accounts: LinkedAccounts) => {
+    const platforms: Array<"lichess" | "chess.com"> = ["lichess", "chess.com"];
+    for (const p of platforms) {
+      const username = getLinkedUsername(accounts, p);
+      if (!username) continue;
+      const elapsed = Date.now() - getLastSyncMs(p, username);
+      if (elapsed < AUTO_SYNC_INTERVAL_MS) continue;
+
+      setSyncingPlatforms(prev => new Set(prev).add(p));
+      try {
+        const res = await fetch("/api/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
+          body: JSON.stringify({ username, platform: p }),
+        });
+        if (res.ok) {
+          setLastSyncMs(p, username);
+          setLastSynced(prev => ({ ...prev, [`${p}_${username}`]: Date.now() }));
+          void loadGames({ silent: true });
+        }
+      } catch { /**/ } finally {
+        setSyncingPlatforms(prev => { const s = new Set(prev); s.delete(p); return s; });
+      }
+    }
+  }, [loadGames]);
+
+  // Trigger auto-sync on mount and whenever linked accounts change
+  useEffect(() => {
+    void autoSync(linkedAccounts);
+    const timer = setInterval(() => void autoSync(linkedAccounts), AUTO_SYNC_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [linkedAccounts, autoSync]);
 
   const selectedGame = useMemo(
     () => games.find((g) => g.id === selectedGameId) ?? null,
@@ -1780,7 +1872,7 @@ export default function GamesPanel() {
     try {
       const res = await fetch("/api/analyze", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
         body: JSON.stringify({
           gameIds: [selectedGameId],
           platform,
@@ -1819,7 +1911,7 @@ export default function GamesPanel() {
     try {
       const res = await fetch("/api/analyze", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
         body: JSON.stringify({
           gameIds: stuckIds,
           viewerUsernames,
@@ -1850,14 +1942,15 @@ export default function GamesPanel() {
     try {
       const res = await fetch("/api/live-review", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
         body: JSON.stringify({ gameId, viewerUsernames }),
       });
       const json = (await res.json()) as LiveReviewResponse;
       if (!res.ok) {
         setMessage(json.error ?? "Could not open live review for this game.");
       } else {
-        setReport(json);  // show report/stats first
+        // Go directly into the review board — no intermediate report screen
+        setReview(json);
         setReviewIndex(0);
       }
     } catch {
@@ -1879,20 +1972,69 @@ export default function GamesPanel() {
     );
   }
 
-  // ── Report mode: accuracy & classification summary ────────────────────
-  if (report) {
-    return (
-      <GameReport
-        review={report}
-        onStartReview={() => setReview(report)}
-        onClose={() => setReport(null)}
-      />
-    );
-  }
-
   // ── Games list ─────────────────────────────────────────────────
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, padding: "16px 20px", gap: "10px" }}>
+
+      {/* ── Accounts section ── */}
+      <div style={{
+        display: "flex", gap: "10px", flexWrap: "wrap", flexShrink: 0,
+        padding: "10px 14px", borderRadius: "8px",
+        background: "var(--bg-surface)", border: "1px solid var(--border-subtle)",
+        alignItems: "center",
+      }}>
+        {(["lichess", "chess.com"] as const).map((p) => {
+          const linked = getLinkedUsername(linkedAccounts, p);
+          const isSyncing = syncingPlatforms.has(p);
+          const lastSync = linked ? lastSynced[`${p}_${linked}`] ?? getLastSyncMs(p, linked) : 0;
+          const minAgo = lastSync ? Math.floor((Date.now() - lastSync) / 60000) : null;
+          return (
+            <div key={p} style={{ display: "flex", alignItems: "center", gap: "8px", flex: "1 1 200px" }}>
+              <span style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.06em", flexShrink: 0, width: "62px" }}>
+                {p === "lichess" ? "Lichess" : "Chess.com"}
+              </span>
+              {linked ? (
+                <>
+                  <span style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+                    {linked}
+                  </span>
+                  {isSyncing ? (
+                    <span style={{ fontSize: "10px", color: "var(--accent)", flexShrink: 0 }}>syncing…</span>
+                  ) : minAgo !== null ? (
+                    <span style={{ fontSize: "10px", color: "var(--text-muted)", flexShrink: 0 }}>
+                      {minAgo < 1 ? "just now" : minAgo < 60 ? `${minAgo}m ago` : `${Math.floor(minAgo / 60)}h ago`}
+                    </span>
+                  ) : null}
+                  <button
+                    onClick={() => unlinkAccount(p)}
+                    style={{ fontSize: "11px", color: "var(--text-muted)", background: "none", border: "1px solid var(--border)", borderRadius: "4px", padding: "2px 8px", cursor: "pointer", fontFamily: "inherit", flexShrink: 0 }}
+                  >
+                    Unlink
+                  </button>
+                </>
+              ) : (
+                <>
+                  <input
+                    type="text"
+                    placeholder={`${p === "lichess" ? "Lichess" : "Chess.com"} username`}
+                    value={p === "lichess" ? linkInputs.lichess : linkInputs.chessCom}
+                    onChange={(e) => setLinkInputs(prev => p === "lichess" ? { ...prev, lichess: e.target.value } : { ...prev, chessCom: e.target.value })}
+                    onKeyDown={(e) => e.key === "Enter" && linkAccount(p)}
+                    style={{ flex: 1, minWidth: 0, background: "var(--bg-base)", border: "1px solid var(--border)", borderRadius: "5px", padding: "5px 9px", fontSize: "12px", color: "var(--text-primary)", outline: "none", fontFamily: "inherit" }}
+                  />
+                  <button
+                    onClick={() => linkAccount(p)}
+                    disabled={!(p === "lichess" ? linkInputs.lichess : linkInputs.chessCom).trim()}
+                    style={{ fontSize: "11px", fontWeight: 600, color: "var(--accent)", background: "var(--accent-dim)", border: "1px solid rgba(129,182,76,0.4)", borderRadius: "5px", padding: "5px 10px", cursor: "pointer", fontFamily: "inherit", flexShrink: 0, opacity: !(p === "lichess" ? linkInputs.lichess : linkInputs.chessCom).trim() ? 0.4 : 1 }}
+                  >
+                    Link
+                  </button>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
 
       {/* Filters + actions */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap", flexShrink: 0 }}>
@@ -1940,19 +2082,12 @@ export default function GamesPanel() {
 
       {/* Stats + message */}
       <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", fontSize: "11px", color: "var(--text-muted)", flexShrink: 0 }}>
-        <span>
-          Linked: <b style={{ color: "var(--text-secondary)" }}>
-            {linkedAccounts.lichess ? `L ${linkedAccounts.lichess}` : "L -"}
-            {" · "}
-            {linkedAccounts.chessCom ? `C ${linkedAccounts.chessCom}` : "C -"}
-          </b>
-        </span>
         <span>Total: <b style={{ color: "var(--text-secondary)" }}>{stats.total}</b></span>
-        <span>Pending: <b style={{ color: "var(--orange)" }}>{stats.pending}</b></span>
+        {stats.pending > 0 && <span>Pending: <b style={{ color: "var(--orange)" }}>{stats.pending}</b></span>}
         {stats.processing > 0 && <span>Processing: <b style={{ color: "var(--blue)" }}>{stats.processing}</b></span>}
         <span>Analyzed: <b style={{ color: "var(--green)" }}>{stats.analyzed}</b></span>
         {stats.failed > 0 && <span>Failed: <b style={{ color: "var(--red)" }}>{stats.failed}</b></span>}
-        {hasRunningAnalysis && <span>Auto-refreshing while analysis runs</span>}
+        {hasRunningAnalysis && <span style={{ color: "var(--accent)" }}>· auto-refreshing</span>}
       </div>
       {message && <div style={{ fontSize: "12px", color: "var(--text-secondary)", flexShrink: 0 }}>{message}</div>}
 
@@ -2040,7 +2175,25 @@ export default function GamesPanel() {
 
           {games.length === 0 && !loading && (
             <div style={{ padding: "32px", color: "var(--text-muted)", textAlign: "center", fontSize: "13px" }}>
-              No games found. Link account(s) and sync to get started.
+              No games found. Link your account above to get started.
+            </div>
+          )}
+
+          {/* Load more */}
+          {nextCursor && (
+            <div style={{ padding: "10px 14px", textAlign: "center" }}>
+              <button
+                onClick={() => void loadMoreGames()}
+                disabled={loadingMore}
+                style={{
+                  padding: "6px 18px", borderRadius: "6px",
+                  border: "1px solid var(--border)", background: "transparent",
+                  color: "var(--text-muted)", fontSize: "12px", cursor: "pointer",
+                  fontFamily: "inherit", opacity: loadingMore ? 0.5 : 1,
+                }}
+              >
+                {loadingMore ? "Loading…" : `Load more (${stats.total - games.length} remaining)`}
+              </button>
             </div>
           )}
         </div>

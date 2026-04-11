@@ -1,8 +1,6 @@
 import { Chess } from "chess.js";
-import { createServerClient } from "@/lib/supabase";
-
-const PLACEHOLDER_USER_ID = "00000000-0000-0000-0000-000000000001";
-
+import { createServerClient, getUserFromRequest } from "@/lib/supabase";
+import { decodePgn } from "@/lib/pgnCodec";
 
 function normalizeName(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -32,23 +30,18 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Database not configured." }, { status: 503 });
   }
 
-  // Resolve userId: use authenticated session user, fall back to placeholder for guests.
-  const { data: { user: sessionUser } } = await supabase.auth.getUser();
-  const userId = sessionUser?.id ?? PLACEHOLDER_USER_ID;
+  const sessionUser = await getUserFromRequest(request);
+  if (!sessionUser) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const userId = sessionUser.id;
 
-  const [{ data, error }, { data: annotations }] = await Promise.all([
-    supabase
-      .from("games")
-      .select("id, pgn, white_username, black_username, white_rating, black_rating, time_control, played_at, result, status")
-      .eq("id", gameId)
-      .eq("user_id", userId)
-      .single(),
-    supabase
-      .from("move_annotations")
-      .select("ply, move_uci, classification, win_before, win_after, is_miss, opening_name, opening_eco")
-      .eq("game_id", gameId)
-      .order("ply", { ascending: true }),
-  ]);
+  const { data, error } = await supabase
+    .from("games")
+    .select("id, pgn, white_username, black_username, white_rating, black_rating, time_control, played_at, result, status")
+    .eq("id", gameId)
+    .eq("user_id", userId)
+    .single();
 
   if (error || !data) {
     return Response.json({ error: "Game not found." }, { status: 404 });
@@ -56,7 +49,7 @@ export async function POST(request: Request): Promise<Response> {
 
   const chess = new Chess();
   try {
-    chess.loadPgn(data.pgn, { strict: false });
+    chess.loadPgn(decodePgn(data.pgn), { strict: false });
   } catch {
     return Response.json({ error: "Could not parse PGN for this game." }, { status: 422 });
   }
@@ -137,6 +130,5 @@ export async function POST(request: Request): Promise<Response> {
     },
     positions,
     moves,
-    annotations: annotations ?? [],
   });
 }

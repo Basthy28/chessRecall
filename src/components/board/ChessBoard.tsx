@@ -6,6 +6,7 @@ import { Chessground } from "chessground";
 import type { Api } from "chessground/api";
 import type { Config } from "chessground/config";
 import type { Color, Key } from "chessground/types";
+import type { DrawShape } from "chessground/draw";
 
 export interface MoveAnnotationOverlay {
   square: Key;   // destination square of the annotated move
@@ -23,6 +24,8 @@ interface ChessBoardProps {
   className?: string;
   showCoordinates?: boolean;
   annotation?: MoveAnnotationOverlay;
+  /** Engine best-move arrows rendered via Chessground drawable API */
+  shapes?: DrawShape[];
 }
 
 function getLegalDests(fen: string): Map<Key, Key[]> {
@@ -91,6 +94,7 @@ export default function ChessBoard({
   className = "",
   showCoordinates = false,
   annotation,
+  shapes,
 }: ChessBoardProps) {
   const innerRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<Api | null>(null);
@@ -132,6 +136,11 @@ export default function ChessBoard({
       premovable: { enabled: false },
       draggable: { enabled: interactive },
       selectable: { enabled: interactive },
+      drawable: {
+        enabled: true,          // allows shift+drag user arrows
+        eraseOnClick: false,
+        autoShapes: shapes ?? [],
+      },
       events: {
         move: (orig, dest) => onMoveRef.current?.(orig, dest),
       },
@@ -202,6 +211,14 @@ export default function ChessBoard({
       },
     });
   }, [fen, orientation, lastMove, interactive, allowAnyColorMoves]);
+
+  // ── Sync engine arrow shapes ─────────────────────────────────────────
+  useEffect(() => {
+    if (!apiRef.current) return;
+    apiRef.current.set({
+      drawable: { autoShapes: shapes ?? [] },
+    });
+  }, [shapes]);
 
   return (
     <div

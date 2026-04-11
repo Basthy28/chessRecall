@@ -3,12 +3,24 @@
 import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { Chess } from "chess.js";
 import type { Key } from "chessground/types";
+import type { DrawShape } from "chessground/draw";
 import ChessBoard from "@/components/board/ChessBoard";
 import { createBrowserClient } from "@/lib/supabase";
 import type { Puzzle } from "@/types";
+import type { MoveAnnotationOverlay } from "@/components/board/ChessBoard";
+import { useLiveAnalysis } from "@/hooks/useLiveAnalysis";
+import { classifyMove } from "@/lib/analysis";
+import { useAuth } from "@/hooks/useAuth";
 
-// ── Constants ────────────────────────────────────────────────────────────────
-const PLACEHOLDER_USER_ID = "00000000-0000-0000-0000-000000000001";
+// Helper: format centipawns as +1.23 / -0.45 / M3
+function formatEvalPt(score: number): string {
+  if (Math.abs(score) >= 90_000) {
+    const m = 100_000 - Math.abs(score);
+    return `${score > 0 ? "+" : "-"}M${m}`;
+  }
+  const val = score / 100;
+  return `${score > 0 ? "+" : ""}${val.toFixed(2)}`;
+}
 
 // SRS intervals in milliseconds
 const SRS_INTERVALS = {
@@ -139,6 +151,7 @@ function NoPuzzlesState() {
 
 // ── Main Component ────────────────────────────────────────────────────────────
 export default function PuzzleTrainer() {
+  const { userId } = useAuth();
   const [puzzles, setPuzzles] = useState<Puzzle[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [state, setState] = useState<PuzzleState>("solving");
@@ -160,6 +173,10 @@ export default function PuzzleTrainer() {
 
   // ── Fetch due puzzles ─────────────────────────────────────────────────────
   useEffect(() => {
+    if (!userId) {
+      setLoading(false);
+      return;
+    }
     async function fetchPuzzles() {
       setLoading(true);
       setError(null);
@@ -169,7 +186,7 @@ export default function PuzzleTrainer() {
         const { data, error: sbError } = await supabase
           .from("puzzles")
           .select("*")
-          .eq("user_id", PLACEHOLDER_USER_ID)
+          .eq("user_id", userId)
           .or(`srs_due_at.is.null,srs_due_at.lte.${now}`)
           .order("srs_due_at", { ascending: true, nullsFirst: true })
           .limit(20);
@@ -184,8 +201,8 @@ export default function PuzzleTrainer() {
       }
     }
 
-    fetchPuzzles();
-  }, []);
+    void fetchPuzzles();
+  }, [userId]);
 
   // ── Reset board when puzzle changes ──────────────────────────────────────
   const currentPuzzle = puzzles[currentIndex] ?? null;
@@ -278,7 +295,7 @@ export default function PuzzleTrainer() {
 
   // ── Handle user move ──────────────────────────────────────────────────────
   const handleMove = useCallback((orig: Key, dest: Key) => {
-    if (!currentPuzzle || state !== "solving") return;
+    if (!currentPuzzle) return;
 
     // Must be at the latest ply to play
     if (viewPly !== playedMoves.length) {
@@ -304,6 +321,22 @@ export default function PuzzleTrainer() {
       targetLine = [currentPuzzle.solution_move];
     }
 
+    // ── If we are already done solving, allow free play
+    if (state !== "solving") {
+      try {
+        const chess = new Chess(displayFen);
+        const m = chess.move({ from: orig, to: dest, promotion: "q" });
+        if (m) {
+          const actualUci = `${m.from}${m.to}${m.promotion ? m.promotion : ""}`;
+          const newPlayed = [...playedMoves, actualUci];
+          setPlayedMoves(newPlayed);
+          setViewPly(newPlayed.length);
+        }
+      } catch { /* ignore illegal free moves */ }
+      return;
+    }
+
+    // ── Solving logic
     const expectedMove = targetLine[playedMoves.length];
     
     // Use startsWith to elegantly handle cases where the puzzle expects a promotion (e.g. "e7e8q") 
@@ -387,7 +420,99 @@ export default function PuzzleTrainer() {
     }, 600);
   }, [currentPuzzle]);
 
+  // ── Explore Engine Lines (Post-solution) ──────────────────────────────────
+  const handleApplyEngineLine = useCallback((uciMoves: string[]) => {
+    if (state !== "rating" && state !== "correct") return;
+    setPlayedMoves(prev => {
+      // Create new state that concatenates the engine moves.
+      const np = [...prev, ...uciMoves];
+      setViewPly(np.length);
+      return np;
+    });
+  }, [state]);
+
+
   // ── Render ────────────────────────────────────────────────────────────────
+  const isSolving = state === "solving";
+  const isWrong = state === "wrong";
+  const isCorrect = state === "correct" || state === "rating";
+  const isRating = state === "rating";
+
+  // Compute the FEN at the end of the played solution (for live analysis)
+  const solutionFen = useMemo(() => {
+    if (!currentPuzzle || playedMoves.length === 0) return currentPuzzle?.fen ?? "";
+    let f = currentPuzzle.fen;
+    for (const uci of playedMoves) {
+      const nf = applyUciMove(f, uci);
+      if (nf) f = nf;
+    }
+    return f;
+  }, [currentPuzzle, playedMoves]);
+
+  // Live analysis: only active after the puzzle is solved
+  const { lines: engineLines, depth: engineDepth, isSearching: engineSearching } = useLiveAnalysis(
+    displayFen,
+    isRating || state === "correct" // Run engine as soon as solved to populate cache
+  );
+
+  // ── Eval cache: fen → score (white POV) ───────────────────────────────────
+  const evalCacheRef = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    if (engineLines.length > 0 && engineDepth >= 8) {
+      evalCacheRef.current.set(displayFen, engineLines[0].score);
+    }
+  }, [displayFen, engineLines, engineDepth]);
+
+  // ── Board Annotation (WintrChess style !!, ?, etc.) ───────────────────────
+  const boardAnnotation = useMemo((): MoveAnnotationOverlay | undefined => {
+    if (viewPly === 0 || playedMoves.length === 0 || !playedMoves[viewPly - 1]) return undefined;
+    const lastUci = playedMoves[viewPly - 1];
+
+    let parentFen = baseFen;
+    for (let i = 0; i < viewPly - 1; i++) {
+        const u = playedMoves[i];
+        if (!u) break;
+        const next = applyUciMove(parentFen, u);
+        if (next) parentFen = next;
+    }
+
+    const prevScore = evalCacheRef.current.get(parentFen);
+    const currScore = engineLines.length > 0 ? engineLines[0].score : evalCacheRef.current.get(displayFen);
+    
+    if (prevScore === undefined || currScore === undefined) return undefined;
+
+    let cls: import("@/lib/analysis").MoveClassification | null = null;
+    try {
+      const chess = new Chess(parentFen);
+      const turnBefore = chess.turn();
+      const isSacrifice = false; // Could implement sacrifice check here
+      cls = classifyMove(prevScore, currScore, turnBefore, isSacrifice);
+    } catch { return undefined; }
+
+    if (!cls || cls === "book" || cls === "best" || cls === "good" || cls === "excellent") return undefined;
+
+    const destSquare = lastUci.slice(2, 4) as Key;
+    const SYMBOLS: Record<string, string> = { brilliant: "!!", great: "!", inaccuracy: "?!", mistake: "?", blunder: "??", miss: "?" };
+    const symbol = SYMBOLS[cls];
+    if (!symbol) return undefined;
+    
+    const CLASSIFICATION_COLOR: Record<string, string> = {
+      brilliant: "#1baca6", great: "#5c8bb0", inaccuracy: "#f6b43d", mistake: "#ee6b23", blunder: "#fa412d", miss: "#ff7769",
+    };
+
+    return { square: destSquare, symbol, color: CLASSIFICATION_COLOR[cls] ?? "#999" };
+  }, [displayFen, engineLines, viewPly, playedMoves, baseFen]);
+
+  // Engine arrows on the board post-solution
+  const engineShapes = useMemo((): DrawShape[] => {
+    if (!isRating || engineLines.length === 0 || engineDepth < 4) return [];
+    return engineLines.slice(0, 3).map((line, i) => ({
+      orig: line.move.slice(0, 2) as Key,
+      dest: line.move.slice(2, 4) as Key,
+      brush: i === 0 ? "green" : i === 1 ? "paleBlue" : "paleGrey",
+    }));
+  }, [isRating, engineLines, engineDepth]);
+
   if (loading) {
     return (
       <div
@@ -493,13 +618,8 @@ export default function PuzzleTrainer() {
     );
   }
 
-  const isSolving = state === "solving";
-  const isWrong = state === "wrong";
-  const isCorrect = state === "correct" || state === "rating";
-  const isRating = state === "rating";
-
-  // Board is interactive only while solving
-  const boardInteractive = isSolving;
+  // Board is interactive while solving, or after puzzle is solved (for free play)
+  const boardInteractive = state === "solving" || state === "rating";
 
   return (
     <div
@@ -687,6 +807,8 @@ export default function PuzzleTrainer() {
             onMove={handleMove}
             lastMove={displayLastMove}
             showCoordinates
+            shapes={isRating ? engineShapes : []}
+            annotation={boardAnnotation}
           />
         </div>
 
@@ -840,28 +962,83 @@ export default function PuzzleTrainer() {
             </div>
           )}
 
-          {/* Rating phase: SRS buttons */}
-          {isRating && (
+
+        </div>
+      </section>
+
+      {/* ── Sidebar: Right analysis + puzzle queue ── */}
+      <aside
+        style={{
+          width: "380px",
+          flexShrink: 0,
+          display: "flex",
+          flexDirection: "column",
+          borderLeft: "1px solid #3c3a38",
+          background: "#262421",
+          overflow: "hidden",
+          color: "#ffffff"
+        }}
+      >
+        {isRating && (
+          <div style={{ display: "flex", flexDirection: "column", padding: "16px", gap: "16px", borderBottom: "1px solid #3c3a38" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", paddingBottom: "8px", borderBottom: "1px solid #3c3a38" }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#bbb" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+              </svg>
+              <span style={{ fontSize: "14px", fontWeight: 700, color: "#fff" }}>Live Analysis</span>
+            </div>
+
+            <div style={{ background: "#1a1917", border: "1px solid #3c3a38", borderRadius: "8px", overflow: "hidden", display: "flex", flexDirection: "column" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 12px", borderBottom: "1px solid #3c3a38", background: "rgba(0,0,0,0.15)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                  <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: engineSearching ? "#81b64c" : "#444", animation: engineSearching ? "cgPulse 1.4s ease-in-out infinite" : "none" }} />
+                  <span style={{ fontSize: "11px", fontWeight: 700, color: "#aaa", letterSpacing: "0.06em" }}>SF18</span>
+                </div>
+                <span style={{ fontSize: "11px", color: engineDepth > 0 ? "#81b64c" : "#555", fontVariantNumeric: "tabular-nums" }}>
+                  {engineDepth > 0 ? `depth ${engineDepth}` : "loading…"}
+                </span>
+              </div>
+              
+              <div style={{ display: "flex", flexDirection: "column" }}>
+                {(engineSearching && engineDepth < 6 ? [null, null, null] as (null)[] : engineLines.slice(0, 3)).map((line, idx) =>
+                  line ? (
+                    <div
+                      key={idx}
+                      onClick={() => handleApplyEngineLine(line.pvUci.length > 0 ? line.pvUci : [line.move])}
+                      style={{
+                        display: "flex", alignItems: "center", gap: "8px", padding: "8px 12px",
+                        background: idx === 0 ? "rgba(129,182,76,0.07)" : "transparent",
+                        borderBottom: idx < 2 ? "1px solid #3c3a38" : "none",
+                        cursor: "pointer", transition: "background 0.15s ease",
+                      }}
+                      onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.background = idx === 0 ? "rgba(129,182,76,0.13)" : "rgba(255,255,255,0.04)"; }}
+                      onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.background = idx === 0 ? "rgba(129,182,76,0.07)" : "transparent"; }}
+                    >
+                      <div style={{ background: line.score >= 0 ? "#ececea" : "#1a1917", color: line.score >= 0 ? "#111" : "#ccc", padding: "2px 6px", borderRadius: "4px", fontSize: "12px", fontWeight: 800, minWidth: "48px", textAlign: "center", flexShrink: 0, border: "1px solid rgba(255,255,255,0.07)" }}>
+                        {formatEvalPt(line.score)}
+                      </div>
+                      <div style={{ overflow: "hidden", flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: "1px" }}>
+                        <span style={{ fontWeight: 800, fontSize: "13px", color: idx === 0 ? "#fff" : "#ccc" }}>{line.san}</span>
+                        <span style={{ fontSize: "11px", color: "#666", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          {line.pv.split(" ").slice(1).join(" ")}
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div key={idx} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 12px", borderBottom: idx < 2 ? "1px solid #3c3a38" : "none" }}>
+                      <div style={{ width: "48px", height: "20px", borderRadius: "4px", background: "linear-gradient(90deg, #2c2b29 25%, #3a3836 50%, #2c2b29 75%)", backgroundSize: "200% 100%", animation: "shimmer 1.5s infinite", flexShrink: 0 }} />
+                      <div style={{ flex: 1, height: "12px", borderRadius: "3px", background: "linear-gradient(90deg, #2c2b29 25%, #3a3836 50%, #2c2b29 75%)", backgroundSize: "200% 100%", animation: "shimmer 1.5s infinite 0.2s" }} />
+                    </div>
+                  )
+                )}
+              </div>
+            </div>
+
             <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-              <div
-                style={{
-                  fontSize: "11px",
-                  fontWeight: 700,
-                  letterSpacing: "0.07em",
-                  textTransform: "uppercase",
-                  color: "var(--text-muted)",
-                  textAlign: "center",
-                }}
-              >
+              <div style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: "#8b8987", textAlign: "center" }}>
                 How was this puzzle?
               </div>
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr 1fr 1fr",
-                  gap: "6px",
-                }}
-              >
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "6px" }}>
                 {SRS_BUTTONS.map((btn, i) => (
                   <button
                     key={btn.key}
@@ -869,58 +1046,26 @@ export default function PuzzleTrainer() {
                     onMouseLeave={() => setHoveredSrs(null)}
                     onClick={() => handleSrsRating(btn.key)}
                     style={{
-                      display: "flex",
-                      flexDirection: "column",
-                      alignItems: "center",
-                      padding: "9px 8px 8px",
-                      borderRadius: "7px",
+                      display: "flex", flexDirection: "column", alignItems: "center",
+                      padding: "10px 8px", borderRadius: "8px",
                       background: hoveredSrs === i ? btn.hoverBg : btn.bg,
                       border: `1px solid ${btn.border}`,
-                      color: btn.color,
-                      cursor: "pointer",
-                      fontFamily: "inherit",
-                      transition: "background var(--transition-fast)",
-                      gap: "2px",
+                      color: btn.color, cursor: "pointer", fontFamily: "inherit",
+                      transition: "background var(--transition-fast), transform 0.1s", gap: "3px",
                     }}
+                    onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.96)"; }}
+                    onMouseUp={(e) => { e.currentTarget.style.transform = "scale(1)"; }}
                   >
-                    <span style={{ fontSize: "13px", fontWeight: 700, lineHeight: 1.2 }}>
-                      {btn.label}
-                    </span>
-                    <span style={{ fontSize: "10px", opacity: 0.65 }}>
-                      {btn.interval} [{btn.shortcut}]
-                    </span>
+                    <span style={{ fontSize: "14px", fontWeight: 700 }}>{btn.label}</span>
+                    <span style={{ fontSize: "10px", opacity: 0.65 }}>{btn.interval} [{btn.shortcut}]</span>
                   </button>
                 ))}
               </div>
             </div>
-          )}
-        </div>
-      </section>
+          </div>
+        )}
 
-      {/* ── Sidebar: puzzle queue ── */}
-      <aside
-        style={{
-          width: "240px",
-          minWidth: "240px",
-          flexShrink: 0,
-          display: "flex",
-          flexDirection: "column",
-          borderLeft: "1px solid var(--border-subtle)",
-          overflowY: "auto",
-          background: "var(--bg-surface)",
-        }}
-      >
-        <div
-          style={{
-            padding: "12px 14px 8px",
-            borderBottom: "1px solid var(--border-subtle)",
-            fontSize: "11px",
-            fontWeight: 700,
-            letterSpacing: "0.07em",
-            textTransform: "uppercase",
-            color: "var(--text-muted)",
-          }}
-        >
+        <div style={{ padding: "12px 14px 8px", borderBottom: "1px solid #3c3a38", fontSize: "11px", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: "#8b8987" }}>
           Due Today — {puzzles.length} puzzle{puzzles.length === 1 ? "" : "s"}
         </div>
         <div style={{ flex: 1, overflowY: "auto" }}>
@@ -939,36 +1084,24 @@ export default function PuzzleTrainer() {
                   alignItems: "center",
                   gap: "10px",
                   padding: "9px 14px",
-                  background: isCurrent ? "var(--bg-elevated)" : "transparent",
-                  color: isDone ? "var(--text-muted)" : "var(--text-primary)",
+                  background: isCurrent ? "rgba(255,255,255,0.05)" : "transparent",
+                  color: isDone ? "#8b8987" : "#e8e6e2",
                   cursor: "pointer",
                   fontFamily: "inherit",
                   textAlign: "left",
                   border: "none",
-                  borderBottom: "1px solid var(--border-subtle)",
+                  borderBottom: "1px solid #3c3a38",
                   transition: "background var(--transition-fast)",
                 }}
                 onMouseEnter={(e) => {
-                  if (!isCurrent) (e.currentTarget as HTMLButtonElement).style.background = "var(--bg-hover)";
+                  if (!isCurrent) (e.currentTarget as HTMLButtonElement).style.background = "rgba(255,255,255,0.03)";
                 }}
                 onMouseLeave={(e) => {
                   if (!isCurrent) (e.currentTarget as HTMLButtonElement).style.background = "transparent";
                 }}
               >
                 {/* Status dot */}
-                <div
-                  style={{
-                    width: "8px",
-                    height: "8px",
-                    borderRadius: "50%",
-                    flexShrink: 0,
-                    background: isDone
-                      ? "var(--green)"
-                      : isCurrent
-                      ? "var(--accent)"
-                      : "var(--border)",
-                  }}
-                />
+                <div style={{ width: "8px", height: "8px", borderRadius: "50%", flexShrink: 0, background: isDone ? "var(--green)" : isCurrent ? "var(--accent)" : "#5a5856" }} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: "12px", fontWeight: isCurrent ? 600 : 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     Move {puzzle.move_number}
@@ -976,7 +1109,7 @@ export default function PuzzleTrainer() {
                       <span style={{ marginLeft: "5px", fontSize: "10px", color: "var(--accent)" }}>★</span>
                     )}
                   </div>
-                  <div style={{ fontSize: "11px", color: "var(--text-muted)", textTransform: "capitalize" }}>
+                  <div style={{ fontSize: "11px", color: "#8b8987", textTransform: "capitalize" }}>
                     {phaseLabel(puzzle.phase)} · {puzzle.player_color}
                   </div>
                 </div>

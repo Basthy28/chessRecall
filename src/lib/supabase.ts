@@ -26,10 +26,42 @@ export function createServerClient() {
   return createClient(url, key);
 }
 
+/**
+ * Server-side: extract the bearer token from the Authorization header and
+ * validate it via the service-role client. Returns the Supabase User or null.
+ *
+ * Why this instead of auth.getUser() with no args: the service-role client has
+ * no session context — it can only validate a JWT that the browser passes in.
+ */
+export async function getUserFromRequest(request: Request) {
+  const authHeader = request.headers.get("Authorization");
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) return null;
+  try {
+    const supabase = createServerClient();
+    const { data: { user } } = await supabase.auth.getUser(token);
+    return user ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // Browser/client-side client (uses anon key)
 export function createBrowserClient() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
   if (!url || !key) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
   return createClient(url, key);
+}
+
+/**
+ * Browser-side: returns { Authorization: "Bearer <token>" } ready to spread
+ * into fetch headers. Returns {} if there is no active session.
+ */
+export async function getClientAuthHeaders(): Promise<Record<string, string>> {
+  if (typeof window === "undefined") return {};
+  const supabase = createBrowserClient();
+  const { data: { session } } = await supabase.auth.getSession();
+  const token = session?.access_token;
+  return token ? { Authorization: `Bearer ${token}` } : {};
 }

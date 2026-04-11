@@ -8,13 +8,12 @@
  * GET → returns { games: number, puzzles: number } counts for the placeholder userId.
  */
 
-import { createServerClient } from "@/lib/supabase";
+import { createServerClient, getUserFromRequest } from "@/lib/supabase";
 import { fetchUserGames, convertLichessGameToDbGame } from "@/lib/lichess";
 import { fetchChessComGames, convertChessComGameToDbGame } from "@/lib/chessdotcom";
 import { enqueueGameAnalysis, isRedisQueueAvailable } from "@/lib/queue";
+import { encodePgn } from "@/lib/pgnCodec";
 import type { AnalyzeGameJobData, Game } from "@/types";
-
-const PLACEHOLDER_USER_ID = "00000000-0000-0000-0000-000000000001";
 
 const USERNAME_REGEX = /^[a-zA-Z0-9_-]{1,25}$/;
 
@@ -86,9 +85,11 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  // Resolve userId: use authenticated session user, fall back to placeholder for guests.
-  const { data: { user: sessionUser } } = await supabase.auth.getUser();
-  const userId = sessionUser?.id ?? PLACEHOLDER_USER_ID;
+  const sessionUser = await getUserFromRequest(request);
+  if (!sessionUser) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const userId = sessionUser.id;
 
   // ── Fetch games from the chosen platform ───────────────────────────
   let gameRows: Omit<Game, "id" | "created_at">[] = [];
@@ -185,6 +186,10 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ imported: 0, queued: 0, username, platform, fullSync });
   }
 
+  // Compress PGN before storing — strips headers (already in columns) + gzip.
+  // Legacy rows without the "gz2:" prefix are decoded transparently at read time.
+  gameRows = gameRows.map((g) => ({ ...g, pgn: encodePgn(g.pgn) }));
+
   let imported = 0;
   let queued = 0;
 
@@ -204,8 +209,9 @@ export async function POST(request: Request): Promise<Response> {
     }>);
 
   if (upsertResult.error || !upsertResult.data) {
-    console.error("[import] Supabase bulk upsert error:", upsertResult.error);
-    return Response.json({ error: "Failed to store imported games." }, { status: 500 });
+    const msg = upsertResult.error?.message ?? "no data returned";
+    console.error("[import] Supabase bulk upsert error:", msg);
+    return Response.json({ error: `Failed to store imported games: ${msg}` }, { status: 500 });
   }
 
   imported = upsertResult.data.length;
@@ -284,11 +290,14 @@ export async function POST(request: Request): Promise<Response> {
 
 // ── GET /api/import ──────────────────────────────────────────────────
 
-export async function GET(): Promise<Response> {
+export async function GET(request: Request): Promise<Response> {
   try {
     const supabase = createServerClient();
-    const { data: { user: sessionUser } } = await supabase.auth.getUser();
-    const userId = sessionUser?.id ?? PLACEHOLDER_USER_ID;
+    const sessionUser = await getUserFromRequest(request);
+    if (!sessionUser) {
+      return Response.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    const userId = sessionUser.id;
 
     const { count: gamesCount, error: gamesError } = await supabase
       .from("games")

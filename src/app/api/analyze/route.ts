@@ -1,8 +1,6 @@
-import { createServerClient } from "@/lib/supabase";
+import { createServerClient, getUserFromRequest } from "@/lib/supabase";
 import { enqueueGameAnalysis, isRedisQueueAvailable } from "@/lib/queue";
 import type { AnalyzeGameJobData } from "@/types";
-
-const PLACEHOLDER_USER_ID = "00000000-0000-0000-0000-000000000001";
 
 const ENQUEUE_TIMEOUT_MS = 8000;
 const ENQUEUE_CONCURRENCY = 20;
@@ -71,9 +69,11 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Database not configured." }, { status: 503 });
   }
 
-  // Resolve userId: use authenticated session user, fall back to placeholder for guests.
-  const { data: { user: sessionUser } } = await supabase.auth.getUser();
-  const userId = sessionUser?.id ?? PLACEHOLDER_USER_ID;
+  const sessionUser = await getUserFromRequest(request);
+  if (!sessionUser) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const userId = sessionUser.id;
 
   const queueAvailable = await isRedisQueueAvailable(5000);
   if (!queueAvailable) {

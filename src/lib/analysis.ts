@@ -1,3 +1,6 @@
+import { Chess } from "chess.js";
+import type { Square } from "chess.js";
+
 export type MoveClassification =
   | "blunder"
   | "mistake"
@@ -12,108 +15,178 @@ export type MoveClassification =
   | "none";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Win-probability formula — matches Lichess source exactly:
-//   ui/lib/src/ceval/winningChances.ts :: rawWinningChances
-//
-// Maps cp (side-to-move perspective, clamped to [-1000, 1000]) to
-// a winning-chances value in the range (-1 … +1):
-//   cp = 0    → 0.00 (equal)
-//   cp = +800 → ~0.89 (clearly winning)
-//   cp = -800 → ~-0.89 (clearly losing)
-//
-// To get a win-probability in [0, 1]: (rawChances + 1) / 2
+// Win-probability formula — matches WintrChess / Lichess source exactly.
+// gradient = 0.0035 (WintrChess uses 0.0035, Lichess uses 0.00368208 — we
+// follow WintrChess for consistency with their classification thresholds).
 // ─────────────────────────────────────────────────────────────────────────────
-const MULTIPLIER = -0.00368208;
 
-function rawWinningChances(cp: number): number {
-  return 2 / (1 + Math.exp(MULTIPLIER * cp)) - 1;
-}
-
-function cpWinningChances(cp: number): number {
-  return rawWinningChances(Math.min(Math.max(-1000, cp), 1000));
-}
-
-/** Lichess mate evaluation: smooth curve instead of ±Infinity */
-function mateWinningChances(mate: number): number {
-  const cp = (21 - Math.min(10, Math.abs(mate))) * 100;
-  return rawWinningChances(cp * (mate > 0 ? 1 : -1));
-}
-
-/** Returns winning chances in (-1, +1) for a given score (white's POV) */
-export function evalWinningChances(score: number, isMate = false): number {
-  if (isMate) return mateWinningChances(score);
-  return cpWinningChances(score);
+/** Returns winning chances in [0, 1] for a given white-POV centipawn score. */
+export function getExpectedPoints(cp: number): number {
+  if (Math.abs(cp) >= 90_000) return cp > 0 ? 1 : 0;
+  return 1 / (1 + Math.exp(-0.0035 * cp));
 }
 
 /**
- * Lichess `povDiff` — difference in winning chances from a player's POV.
- * Matches: `(povChances(color, bestEval) - povChances(color, playedEval)) / 2`
- *
- * Returns a value in (-1, +1); positive = player did worse than best move.
- *
- * @param bestScore  Engine's best-move eval (white's POV, centipawns)
- * @param playedScore  Eval after the played move (white's POV, centipawns)
- * @param turn  The color of the player who moved
+ * Expected point loss for a move, from the moving player's perspective.
+ * Both scores are white's POV centipawns. Returns a value in [0, 1].
  */
-export function povDiff(
-  bestScore: number,
-  playedScore: number,
-  turn: "w" | "b"
+export function getExpectedPointsLoss(
+  prevScore: number,
+  currScore: number,
+  turnBefore: "w" | "b",
 ): number {
-  const wBest = cpWinningChances(bestScore);
-  const wPlayed = cpWinningChances(playedScore);
-  // toPov: flip sign for black
-  const povBest = turn === "w" ? wBest : -wBest;
-  const povPlayed = turn === "w" ? wPlayed : -wPlayed;
-  return (povBest - povPlayed) / 2;
+  const winBefore = getExpectedPoints(prevScore);
+  const winAfter  = getExpectedPoints(currScore);
+  if (turnBefore === "w") return Math.max(0, winBefore - winAfter);
+  return Math.max(0, winAfter - winBefore);
+}
+
+/** Returns winning chances in (-1, +1) for use in the eval graph. */
+export function evalWinningChances(score: number): number {
+  if (Math.abs(score) >= 90_000) return score > 0 ? 1 : -1;
+  return 2 * getExpectedPoints(score) - 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sacrifice detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PIECE_VALUES: Record<string, number> = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 99 };
+
+/**
+ * Returns true when the move constitutes a material sacrifice:
+ *  - Not a promotion
+ *  - After the move the piece is under attack
+ *  - Net material given up (piece value > captured piece value)
+ *  - At least one attacker has lower or equal piece value (true threat)
+ */
+export function isSacrificeMove(fenBefore: string, uciMove: string): boolean {
+  try {
+    if (uciMove.length > 4) return false; // no promotions
+    const chess = new Chess(fenBefore);
+    const from = uciMove.slice(0, 2) as Square;
+    const to   = uciMove.slice(2, 4) as Square;
+
+    const movingPiece = chess.get(from);
+    if (!movingPiece || movingPiece.type === "p" || movingPiece.type === "k") return false;
+
+    const capturedPiece  = chess.get(to);
+    const movingValue    = PIECE_VALUES[movingPiece.type] ?? 0;
+    const capturedValue  = capturedPiece ? (PIECE_VALUES[capturedPiece.type] ?? 0) : 0;
+
+    // Only a sacrifice if we give up more material than we capture
+    if (movingValue <= capturedValue) return false;
+
+    chess.move({ from, to });
+    const after = new Chess(chess.fen());
+    const opponentColor = movingPiece.color === "w" ? "b" : "w";
+    const attackers = after.attackers(to, opponentColor);
+
+    if (attackers.length === 0) return false;
+
+    // At least one attacker of equal or lower value (a real threat)
+    return attackers.some(sq => {
+      const attacker = after.get(sq as Square);
+      return attacker && (PIECE_VALUES[attacker.type] ?? 99) <= movingValue;
+    });
+  } catch {
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Move classification — WintrChess exact algorithm
+// Source: wintrchess/shared/src/lib/reporter/classification/
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MATE_THRESHOLD = 90_000;
+
+function isMate(score: number): boolean {
+  return Math.abs(score) >= MATE_THRESHOLD;
 }
 
 /**
  * Classify a single move.
  *
- * NOTE: prevScore and currentScore are BOTH from White's perspective (absolute).
- * The function internally converts to the player's POV.
- *
- * Thresholds from Lichess Advice.scala (winning-probability drop after /2):
- *   ≥ 0.3  → blunder
- *   ≥ 0.2  → mistake
- *   ≥ 0.1  → inaccuracy
- *   ≥ 0.05 → good  (acceptable)
- *   ≥ 0.02 → excellent
- *   else   → best
+ * @param prevScore      White-POV eval BEFORE the move (cp or mate-encoded)
+ * @param currentScore   White-POV eval AFTER the move
+ * @param turnBefore     Who made the move
+ * @param isSacrifice    Whether the move sacrifices material (see isSacrificeMove)
+ * @param legalMoveCount Legal moves available before this move; ≤1 → forced
  */
 export function classifyMove(
-  prevScore: number,   // eval BEFORE move (white POV, cp)
-  currentScore: number, // eval AFTER  move (white POV, cp)
-  turnBefore: "w" | "b"
+  prevScore: number,
+  currentScore: number,
+  turnBefore: "w" | "b",
+  isSacrifice = false,
+  legalMoveCount?: number,
 ): MoveClassification {
-  const isMateScore = (s: number) => Math.abs(s) >= 90_000;
+  // Forced move (only one legal option) — classify as best regardless of eval
+  if (legalMoveCount !== undefined && legalMoveCount <= 1) return "best";
 
-  // Mate-to-mate: no change in outcome → classify as "none"
-  if (isMateScore(prevScore) && isMateScore(currentScore)) {
-    if (prevScore > 0 === currentScore > 0) return "none"; // same-side mate
-    // Switched from winning-mate to losing-mate → treat as very large drop (blunder)
+  const sign          = turnBefore === "w" ? 1 : -1;
+  const prevWinning   = prevScore    * sign > 0;
+  const currWinning   = currentScore * sign > 0;
+  const prevMate      = isMate(prevScore);
+  const currMate      = isMate(currentScore);
+
+  // ── Mate → Mate ────────────────────────────────────────────────────────────
+  if (prevMate && currMate) {
+    // Was mating, now being mated — catastrophic
+    if (prevWinning && !currWinning) {
+      const mateIn = 100_000 - Math.abs(currentScore);
+      return mateIn > 3 ? "mistake" : "blunder";
+    }
+    // Measure mate distance change (negative = improved, positive = worsened)
+    const mateLoss = (prevScore - currentScore) * sign;
+    if (mateLoss < 0) return "best";
+    if (mateLoss < 2) return "excellent";
+    if (mateLoss < 7) return "good";
+    return "inaccuracy";
   }
 
-  // Missed forced mate: had forced win, lost it
-  if (isMateScore(prevScore) && !isMateScore(currentScore)) {
-    const hadMateForPlayer =
-      (turnBefore === "w" && prevScore > 0) ||
-      (turnBefore === "b" && prevScore < 0);
-    if (hadMateForPlayer) return "miss";
+  // ── Mate → Centipawn (had a forced mate, played a non-mate move) ───────────
+  if (prevMate && !currMate) {
+    const currSubjective = currentScore * sign;
+    if (prevWinning) {
+      // Missed the win
+      if (currSubjective >= 800) return "excellent";
+      if (currSubjective >= 400) return "good";
+      if (currSubjective >= 200) return "inaccuracy";
+      if (currSubjective >= 0)   return "mistake";
+      return "blunder";
+    }
+    // Was losing to mate, escaped to centipawn eval — excellent escape
+    return currSubjective >= 0 ? "best" : "excellent";
   }
 
-  const diff = povDiff(prevScore, currentScore, turnBefore);
+  // ── Centipawn → Mate (found or walked into a mate) ────────────────────────
+  if (!prevMate && currMate) {
+    if (currWinning) return "best"; // found a winning mate
+    const mateIn = 100_000 - Math.abs(currentScore);
+    if (mateIn <= 2) return "blunder";
+    if (mateIn <= 5) return "mistake";
+    return "inaccuracy";
+  }
 
-  if (diff >= 0.3) return "blunder";
-  if (diff >= 0.2) return "mistake";
-  if (diff >= 0.1) return "inaccuracy";
-  if (diff >= 0.05) return "good";
-  if (diff >= 0.02) return "excellent";
-  return "best";
+  // ── Centipawn → Centipawn (standard case) ─────────────────────────────────
+  const pointLoss = getExpectedPointsLoss(prevScore, currentScore, turnBefore);
+
+  let base: MoveClassification;
+  if      (pointLoss < 0.01)  base = "best";
+  else if (pointLoss < 0.045) base = "excellent";
+  else if (pointLoss < 0.08)  base = "good";
+  else if (pointLoss < 0.12)  base = "inaccuracy";
+  else if (pointLoss < 0.22)  base = "mistake";
+  else                         base = "blunder";
+
+  // Brilliant: best/excellent AND a genuine material sacrifice
+  if (isSacrifice && (base === "best" || base === "excellent")) return "brilliant";
+
+  return base;
 }
 
-/** Legacy shim — kept for any callers that still use the old 0-100 scale */
+/** Legacy shim */
 export function calculateWinProbability(cp: number): number {
-  return (cpWinningChances(cp) + 1) / 2 * 100;
+  return getExpectedPoints(cp) * 100;
 }

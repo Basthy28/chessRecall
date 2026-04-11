@@ -58,8 +58,10 @@ import type {
   PuzzlePhase,
 } from "@/types";
 import { DEFAULT_VALIDATOR_CONFIG } from "@/types";
+import { classifyMove, getExpectedPoints, isSacrificeMove } from "@/lib/analysis";
 import { createServerClient } from "@/lib/supabase";
 import { ANALYZE_QUEUE_NAME } from "@/lib/constants";
+import { decodePgn } from "@/lib/pgnCodec";
 
 // ── Stockfish engine type ───────────────────────────────────────────
 interface StockfishEngine {
@@ -94,8 +96,12 @@ interface EvalResult {
 // ENGINE_MODE=native  → spawn the system `stockfish` binary (5-10x faster, use on cluster)
 // ENGINE_MODE=wasm    → use npm WASM package (default, works anywhere)
 const ENGINE_MODE = (process.env.ENGINE_MODE ?? "wasm") as "native" | "wasm";
-const STOCKFISH_THREADS = Math.max(1, Number(process.env.STOCKFISH_THREADS ?? "1"));
-const STOCKFISH_HASH_MB = Math.max(64, Number(process.env.STOCKFISH_HASH_MB ?? "256"));
+// Default to 3 threads (4 OCPU A1 Flex — leave 1 for OS / Node process).
+// Override via env: STOCKFISH_THREADS=N
+const STOCKFISH_THREADS = Math.max(1, Number(process.env.STOCKFISH_THREADS ?? "3"));
+// Default to 8 GB hash (machine has 24 GB; large hash cuts transposition misses dramatically).
+// Override via env: STOCKFISH_HASH_MB=N
+const STOCKFISH_HASH_MB = Math.max(64, Number(process.env.STOCKFISH_HASH_MB ?? "8192"));
 const STOCKFISH_PATH = process.env.STOCKFISH_PATH ?? "/usr/games/stockfish";
 // Use movetime (ms) when > 0, otherwise fall back to depth. Defaulting to 1000ms gives much deeper endgame analysis.
 const STOCKFISH_MOVETIME_MS = Number(process.env.STOCKFISH_MOVETIME_MS ?? "1000");
@@ -158,40 +164,7 @@ async function updateGameStatus(gameId: string, status: GameStatus): Promise<voi
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Win-percentage formula from Lichess (ui/analyse/src/util.ts)
-// Maps centipawns (side-to-move perspective) → win probability 0..1
-// cp = 0   → 0.50 (even)
-// cp = +800 → ~0.945 (clearly winning)
-// cp = -800 → ~0.055 (clearly losing)
-// ─────────────────────────────────────────────────────────────────────────────
-function winChances(cp: number): number {
-  const bounded = Math.max(Math.min(cp, 1000), -1000);
-  return 1 / (1 + Math.exp(-0.00368208 * bounded));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Classify a single move using Lichess win% delta thresholds.
-// Matches Lichess Advice.scala and src/lib/analysis.ts exactly.
-//
-//   delta < 0.02 → best       (within noise of engine's top choice)
-//   delta < 0.05 → excellent
-//   delta < 0.10 → good
-//   delta < 0.20 → inaccuracy
-//   delta < 0.30 → mistake
-//   delta ≥ 0.30 → blunder
-// ─────────────────────────────────────────────────────────────────────────────
-function classifyMove(winBest: number, winAfter: number): MoveClassification {
-  const delta = winBest - winAfter;
-  if (delta < 0.02) return "best";
-  if (delta < 0.05) return "excellent";
-  if (delta < 0.10) return "good";
-  if (delta < 0.20) return "inaccuracy";
-  if (delta < 0.30) return "mistake";
-  return "blunder";
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
+// functions winChances and classifyMove have been removed and imported from @/lib/analysis.
 // Convert a UCI PV sequence to SAN, stopping at the first illegal move.
 // ─────────────────────────────────────────────────────────────────────────────
 function pvToSan(fen: string, pvUci: string[]): string[] {
@@ -280,49 +253,6 @@ async function validatePuzzleLine(
   return validUci;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Classify a single move, handling mate scores correctly.
-//
-// Pure win% delta works for most positions but breaks when the player is
-// already losing: going from -300cp to "opponent mate-in-1" only produces a
-// delta of ~0.22 (mistake) even though the move is catastrophic.
-//
-// Special-case rules:
-//   - If opponent has a forced mating sequence after our move  → always blunder
-//   - If we had a forced mating sequence but didn't play the best move → always blunder
-//   - Otherwise use standard Lichess win% delta thresholds
-// ─────────────────────────────────────────────────────────────────────────────
-function classifyMoveWithMates(
-  evalBeforeScore: number,   // side-to-move score before our move (from eval best)
-  evalAfterScore: number,    // side-to-move score after our move (from opponent's eval, will be negated)
-  playedBest: boolean,
-): MoveClassification {
-  const MATE_THRESHOLD = 90_000;
-
-  // Were we already getting mated before this move? (engine reports negative mate score)
-  // If so, any move we play will still leave opponent with forced mate — not our fault.
-  const alreadyGettingMated = evalBeforeScore < -MATE_THRESHOLD;
-
-  // Opponent has forced mate after our move — only a blunder if we weren't already lost
-  if (evalAfterScore > MATE_THRESHOLD && !alreadyGettingMated) return "blunder";
-
-  // We had a forced mating sequence but didn't take it
-  if (evalBeforeScore > MATE_THRESHOLD && !playedBest) return "blunder";
-
-  const winBest = winChances(evalBeforeScore);
-  const winAfter = winChances(-evalAfterScore);
-  return classifyMove(winBest, winAfter);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Miss detection: player had a clearly winning shot (winBest > 65%) but
-// chose a move that didn't capitalise (missed >25% win%). Their position
-// after the move is still not losing (winAfter > 30%) — so it's not a
-// blunder, just a missed opportunity.
-// ─────────────────────────────────────────────────────────────────────────────
-function isMissedWin(winBest: number, winAfter: number): boolean {
-  return winBest > 0.65 && (winBest - winAfter) > 0.25 && winAfter > 0.30;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Spawn the system `stockfish` binary as a child process.
@@ -563,7 +493,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
 
     try {
       // ── Step 1: Parse PGN ────────────────────────────────────────────────
-      const positions = parsePgn(pgn);
+      const positions = parsePgn(decodePgn(pgn));
       const moveCount = positions.length - 1; // last entry is the sentinel
       console.log(`[worker] ${moveCount} moves to evaluate for game ${gameId}`);
 
@@ -616,28 +546,28 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
 
         if (!evalBefore || !evalAfter || !pos.movePlayed) continue;
 
-        // winBest / winAfter — standard win% from side-to-move perspective
-        const winBest = winChances(evalBefore.best.score);
-        const winAfter = winChances(-evalAfter.best.score);
+        // Convert scores to White's POV for classifyMove
+        const prevScoreWhite = pos.turn === "w" ? evalBefore.best.score : -evalBefore.best.score;
+        const turnAfter = pos.turn === "w" ? "b" : "w";
+        const currentScoreWhite = turnAfter === "w" ? evalAfter.best.score : -evalAfter.best.score;
 
-        const playedBest = pos.movePlayed === evalBefore.best.move;
+        const uciMove = pos.movePlayed;
+        const legalMoveCount = (() => { try { return new Chess(pos.fen).moves().length; } catch { return undefined; } })();
+        const sacrifice = (legalMoveCount !== 1 && uciMove)
+          ? isSacrificeMove(pos.fen, uciMove)
+          : false;
+        const baseClass = classifyMove(prevScoreWhite, currentScoreWhite, pos.turn, sacrifice, legalMoveCount);
 
-        // Classify with mate-aware logic (avoids under-classifying blunders when
-        // the player is already losing and gives the opponent a forced mate).
-        const baseClass = classifyMoveWithMates(
-          evalBefore.best.score,
-          evalAfter.best.score,
-          playedBest,
-        );
-        const miss = isMissedWin(winBest, winAfter) && baseClass !== "blunder";
+        // Calculate expected points for db puzzle (winBest / winAfter drops)
+        const winBest = getExpectedPoints(evalBefore.best.score); // From the worker pov, evalBefore is side-to-move!
+        const winAfter = getExpectedPoints(-evalAfter.best.score);
 
         // ── Step 5: Create SRS puzzles (player turns only) ───────────────
         if (pos.turn !== playerTurn) continue;
 
         const isBlunder = baseClass === "blunder";
-        const isPuzzleMiss = miss;
 
-        if (!isBlunder && !isPuzzleMiss) continue;
+        if (!isBlunder) continue;
 
         // Skip puzzles from already-hopeless positions.
         // If the player had < 15% win chance before the move, the game was
@@ -685,6 +615,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           solution_line_uci: validPvLine,
           solution_line_san: solutionLineSan,
           is_brilliant: false,
+
           eval_before: Math.round(winBest * 10000),
           eval_after: Math.round(winAfter * 10000),
           eval_best: evalBefore.best.score,
@@ -743,7 +674,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
   },
   {
     connection: redisConnection,
-    concurrency: 1,        // Singleton Stockfish engine
+    concurrency: 3,        // 3 parallel jobs on a 4-CPU machine
     lockDuration: 10 * 60 * 1000,
     maxStalledCount: 3,
   }
