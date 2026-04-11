@@ -12,10 +12,13 @@ COPY src ./src
 COPY public ./public
 
 # Install deps
-RUN npm install --omit=dev
+RUN npm install
+
+# Build app for production
+RUN npm run build
 
 # Expose port
 EXPOSE 3000
 
-# Start app in dev mode (faster)
-CMD ["npm", "run", "dev"]
+# Start production server
+CMD ["npm", "start"]
