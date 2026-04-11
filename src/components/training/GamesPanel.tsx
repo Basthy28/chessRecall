@@ -7,7 +7,7 @@ import type { Key } from "chessground/types";
 import Button from "@/components/ui/Button";
 import ChessBoard, { type MoveAnnotationOverlay } from "@/components/board/ChessBoard";
 import MoveTree, { type UnifiedNode } from "./MoveTree";
-import { createBrowserClient, getClientAuthHeaders } from "@/lib/supabase";
+import { getClientAuthHeaders } from "@/lib/supabase";
 import {
   getAllViewerUsernames,
   getLinkedUsername,
@@ -1817,48 +1817,15 @@ export default function GamesPanel() {
     [linkedAccounts]
   );
 
-  // Realtime subscription — patches game status in-place from the event payload.
-  // No API call needed for status-only changes; full reload only when a game
-  // transitions to "analyzed" (so annotations/puzzles counts are fresh).
+  // Poll while there are running jobs. Local storage mode has no Postgres realtime.
   useEffect(() => {
     if (!hasRunningAnalysis || review) return;
-
-    // Debounce full reloads so rapid bursts (many games finishing at once) collapse.
-    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
-    const scheduleReload = () => {
-      if (reloadTimer) clearTimeout(reloadTimer);
-      reloadTimer = setTimeout(() => { void loadGames({ silent: true }); }, 1500);
-    };
-
-    const supabase = createBrowserClient();
-    const channel = supabase
-      .channel("games-status")
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "games" },
-        (payload: { new: Partial<GameRow> }) => {
-          const updated = payload.new;
-          if (!updated.id || !updated.status) return;
-
-          // Optimistically patch the status in local state — no fetch needed.
-          setGames((prev) =>
-            prev.map((g) =>
-              g.id === updated.id ? { ...g, status: updated.status as GameStatus } : g
-            )
-          );
-
-          // When a game finishes analysis we want fresh stats/counts, but debounce
-          // so a batch of completions only triggers one reload.
-          if (updated.status === "analyzed" || updated.status === "failed") {
-            scheduleReload();
-          }
-        }
-      )
-      .subscribe();
+    const timer = setInterval(() => {
+      void loadGames({ silent: true });
+    }, 4000);
 
     return () => {
-      if (reloadTimer) clearTimeout(reloadTimer);
-      void supabase.removeChannel(channel);
+      clearInterval(timer);
     };
   }, [hasRunningAnalysis, loadGames, review]);
 

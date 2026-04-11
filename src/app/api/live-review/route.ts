@@ -1,5 +1,6 @@
 import { Chess } from "chess.js";
-import { createServerClient, getUserFromRequest } from "@/lib/supabase";
+import { getGameByIdForUser } from "@/lib/localDb";
+import { getUserFromRequest } from "@/lib/supabase";
 import { decodePgn } from "@/lib/pgnCodec";
 
 function normalizeName(value: unknown): string {
@@ -23,33 +24,21 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Missing gameId" }, { status: 400 });
   }
 
-  let supabase: ReturnType<typeof createServerClient>;
-  try {
-    supabase = createServerClient();
-  } catch {
-    return Response.json({ error: "Database not configured." }, { status: 503 });
-  }
-
   const sessionUser = await getUserFromRequest(request);
   if (!sessionUser) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
   const userId = sessionUser.id;
 
-  const { data, error } = await supabase
-    .from("games")
-    .select("id, pgn, white_username, black_username, white_rating, black_rating, time_control, played_at, result, status")
-    .eq("id", gameId)
-    .eq("user_id", userId)
-    .single();
-
-  if (error || !data) {
+  const data = await getGameByIdForUser(gameId, userId);
+  if (!data) {
     return Response.json({ error: "Game not found." }, { status: 404 });
   }
 
   const chess = new Chess();
+  const decodedPgn = decodePgn(data.pgn);
   try {
-    chess.loadPgn(decodePgn(data.pgn), { strict: false });
+    chess.loadPgn(decodedPgn, { strict: false });
   } catch {
     return Response.json({ error: "Could not parse PGN for this game." }, { status: 422 });
   }
@@ -61,7 +50,7 @@ export async function POST(request: Request): Promise<Response> {
   const clkTimes: number[] = []; // seconds remaining after each ply
   let m: RegExpExecArray | null;
   // chess.js doesn't expose comments in verbose history, so parse raw PGN
-  const pgnText: string = data.pgn ?? "";
+  const pgnText: string = decodedPgn;
   clkRegex.lastIndex = 0;
   while ((m = clkRegex.exec(pgnText)) !== null) {
     const h = parseInt(m[1], 10);

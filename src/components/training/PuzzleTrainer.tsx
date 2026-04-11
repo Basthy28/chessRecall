@@ -5,7 +5,7 @@ import { Chess } from "chess.js";
 import type { Key } from "chessground/types";
 import type { DrawShape } from "chessground/draw";
 import ChessBoard from "@/components/board/ChessBoard";
-import { createBrowserClient } from "@/lib/supabase";
+import { getClientAuthHeaders } from "@/lib/supabase";
 import type { Puzzle } from "@/types";
 import type { MoveAnnotationOverlay } from "@/components/board/ChessBoard";
 import { useLiveAnalysis } from "@/hooks/useLiveAnalysis";
@@ -22,14 +22,7 @@ function formatEvalPt(score: number): string {
   return `${score > 0 ? "+" : ""}${val.toFixed(2)}`;
 }
 
-// SRS intervals in milliseconds
-const SRS_INTERVALS = {
-  hard: 10 * 60 * 1000,          // 10 minutes
-  good: 24 * 60 * 60 * 1000,     // 1 day
-  easy: 4 * 24 * 60 * 60 * 1000, // 4 days
-} as const;
-
-type SrsChoice = keyof typeof SRS_INTERVALS;
+type SrsChoice = "hard" | "good" | "easy";
 type PuzzleState = "solving" | "wrong" | "correct" | "rating";
 
 // ── SRS button config ────────────────────────────────────────────────────────
@@ -181,18 +174,17 @@ export default function PuzzleTrainer() {
       setLoading(true);
       setError(null);
       try {
-        const supabase = createBrowserClient();
-        const now = new Date().toISOString();
-        const { data, error: sbError } = await supabase
-          .from("puzzles")
-          .select("*")
-          .eq("user_id", userId)
-          .or(`srs_due_at.is.null,srs_due_at.lte.${now}`)
-          .order("srs_due_at", { ascending: true, nullsFirst: true })
-          .limit(20);
-
-        if (sbError) throw sbError;
-        setPuzzles((data as Puzzle[]) ?? []);
+        const res = await fetch("/api/puzzles?limit=20", {
+          headers: {
+            ...(await getClientAuthHeaders()),
+          },
+        });
+        if (!res.ok) {
+          const payload = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(payload.error ?? "Failed to load puzzles");
+        }
+        const payload = (await res.json()) as { puzzles?: Puzzle[] };
+        setPuzzles(payload.puzzles ?? []);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
@@ -245,28 +237,22 @@ export default function PuzzleTrainer() {
   const handleSrsRating = useCallback(async (choice: SrsChoice) => {
     if (!currentPuzzle) return;
 
-    const dueAt = new Date(Date.now() + SRS_INTERVALS[choice]).toISOString();
-    const isCorrect = state === "rating"; // always correct if rating panel is shown after solving
-
     try {
-      const supabase = createBrowserClient();
-      await supabase
-        .from("puzzles")
-        .update({
-          times_seen: (currentPuzzle.times_seen ?? 0) + 1,
-          times_correct: (currentPuzzle.times_correct ?? 0) + (isCorrect ? 1 : 0),
-          srs_ease: 2.5,
-          srs_due_at: dueAt,
-          last_reviewed_at: new Date().toISOString(),
-        })
-        .eq("id", currentPuzzle.id);
+      await fetch("/api/puzzles", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          ...(await getClientAuthHeaders()),
+        },
+        body: JSON.stringify({ puzzleId: currentPuzzle.id, choice }),
+      });
     } catch {
       // Silently fail — puzzle still advances
     }
 
     // Move to next puzzle
     setCurrentIndex((prev) => prev + 1);
-  }, [currentPuzzle, state]);
+  }, [currentPuzzle]);
 
   // ── Keyboard shortcuts for SRS rating & history review ─────────────────────
   useEffect(() => {

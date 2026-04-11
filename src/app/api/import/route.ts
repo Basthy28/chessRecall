@@ -2,13 +2,21 @@
  * /api/import — Game import endpoint
  *
  * POST { username: string, platform: "lichess" | "chess.com" }
- *   → fetches games, upserts to Supabase, enqueues for analysis.
+ *   → fetches games, upserts to local storage, enqueues for analysis.
  *   → returns { imported: number, queued: number, username: string, platform: string }
  *
  * GET → returns { games: number, puzzles: number } counts for the placeholder userId.
  */
 
-import { createServerClient, getUserFromRequest } from "@/lib/supabase";
+import {
+  countChessComGamesForUserAndName,
+  countGamesByUser,
+  countPuzzlesByUser,
+  latestPlayedAtForChessComUser,
+  updateGameStatusByIds,
+  upsertGames,
+} from "@/lib/localDb";
+import { getUserFromRequest } from "@/lib/supabase";
 import { fetchUserGames, convertLichessGameToDbGame } from "@/lib/lichess";
 import { fetchChessComGames, convertChessComGameToDbGame } from "@/lib/chessdotcom";
 import { enqueueGameAnalysis, isRedisQueueAvailable } from "@/lib/queue";
@@ -73,18 +81,6 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  // ── Supabase client — created early for incremental sync lookups ──────────
-  let supabase: ReturnType<typeof createServerClient>;
-  try {
-    supabase = createServerClient();
-  } catch (err) {
-    console.error("[import] Supabase config error:", err);
-    return Response.json(
-      { error: "Database not configured. Add NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to .env.local" },
-      { status: 503 }
-    );
-  }
-
   const sessionUser = await getUserFromRequest(request);
   if (!sessionUser) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
@@ -106,43 +102,8 @@ export async function POST(request: Request): Promise<Response> {
 
       if (!fullSync) {
         const normalizedUsername = username.toLowerCase();
-        const existingCountResult = await (supabase
-          .from("games")
-          .select("id", { count: "exact", head: true })
-          .eq("user_id", userId)
-          .like("lichess_game_id", "cc_%")
-          .or(
-            `white_username.ilike.${normalizedUsername},black_username.ilike.${normalizedUsername}`
-          ) as unknown as Promise<{
-            count: number | null;
-            error: { message: string } | null;
-          }>);
-
-        if (existingCountResult.error) {
-          console.error("[import] Failed to count existing Chess.com games:", existingCountResult.error);
-        }
-
-        const existingCount = existingCountResult.count ?? 0;
-
-        const latestResult = await (supabase
-          .from("games")
-          .select("played_at")
-          .eq("user_id", userId)
-          .like("lichess_game_id", "cc_%")
-          .or(
-            `white_username.ilike.${normalizedUsername},black_username.ilike.${normalizedUsername}`
-          )
-          .order("played_at", { ascending: false })
-          .limit(1) as unknown as Promise<{
-            data: Array<{ played_at: string }> | null;
-            error: { message: string } | null;
-          }>);
-
-        if (latestResult.error) {
-          console.error("[import] Failed to read latest Chess.com sync point:", latestResult.error);
-        }
-
-        const latestPlayedAt = latestResult.data?.[0]?.played_at;
+        const existingCount = await countChessComGamesForUserAndName(userId, normalizedUsername);
+        const latestPlayedAt = await latestPlayedAtForChessComUser(userId, normalizedUsername);
         const candidateSinceUnix = latestPlayedAt
           ? Math.floor(new Date(latestPlayedAt).getTime() / 1000)
           : undefined;
@@ -194,30 +155,11 @@ export async function POST(request: Request): Promise<Response> {
   let queued = 0;
 
   // ── Bulk upsert for speed ─────────────────────────────────────────
-  const upsertResult = await (supabase
-    .from("games")
-    .upsert(gameRows, { onConflict: "lichess_game_id" })
-    .select("id, white_username, black_username, pgn, played_at") as unknown as Promise<{
-      data: Array<{
-        id: string;
-        white_username: string;
-        black_username: string;
-        pgn: string;
-        played_at: string;
-      }> | null;
-      error: { message: string } | null;
-    }>);
-
-  if (upsertResult.error || !upsertResult.data) {
-    const msg = upsertResult.error?.message ?? "no data returned";
-    console.error("[import] Supabase bulk upsert error:", msg);
-    return Response.json({ error: `Failed to store imported games: ${msg}` }, { status: 500 });
-  }
-
-  imported = upsertResult.data.length;
+  const upserted = await upsertGames(gameRows);
+  imported = upserted.length;
 
   // Analyze recent games first to keep local runs manageable.
-  const enqueueCandidates = [...upsertResult.data]
+  const enqueueCandidates = [...upserted]
     .sort((a, b) => b.played_at.localeCompare(a.played_at))
     .slice(0, analyzeLimit);
   const skippedQueue = Math.max(0, imported - enqueueCandidates.length);
@@ -265,13 +207,7 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     if (queuedIds.length > 0) {
-      const { error: statusError } = await supabase
-        .from("games")
-        .update({ status: "processing" })
-        .in("id", queuedIds);
-      if (statusError) {
-        console.error("[import] Failed to set processing status:", statusError.message);
-      }
+      await updateGameStatusByIds(queuedIds, "processing");
     }
   }
 
@@ -292,32 +228,16 @@ export async function POST(request: Request): Promise<Response> {
 
 export async function GET(request: Request): Promise<Response> {
   try {
-    const supabase = createServerClient();
     const sessionUser = await getUserFromRequest(request);
     if (!sessionUser) {
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     }
     const userId = sessionUser.id;
 
-    const { count: gamesCount, error: gamesError } = await supabase
-      .from("games")
-      .select("*", { count: "exact", head: true })
-      .eq("user_id", userId);
-
-    if (gamesError) {
-      return Response.json({ error: "Failed to query games" }, { status: 500 });
-    }
-
-    const { count: puzzlesCount, error: puzzlesError } = await supabase
-      .from("puzzles")
-      .select("*", { count: "exact", head: true })
-      .eq("user_id", userId);
-
-    if (puzzlesError) {
-      return Response.json({ error: "Failed to query puzzles" }, { status: 500 });
-    }
-
-    return Response.json({ games: gamesCount ?? 0, puzzles: puzzlesCount ?? 0 });
+    return Response.json({
+      games: await countGamesByUser(userId),
+      puzzles: await countPuzzlesByUser(userId),
+    });
   } catch (err) {
     console.error("[import] GET error:", err);
     return Response.json({ error: "Internal server error" }, { status: 500 });

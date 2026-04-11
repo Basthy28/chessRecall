@@ -20,6 +20,7 @@
     "chessground": "^9.2.1",
     "ioredis": "^5.10.1",
     "next": "16.2.2",
+    "pg": "^8.16.3",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "stockfish": "^18.0.7"
@@ -27,6 +28,7 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
+    "@types/pg": "^8.15.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",

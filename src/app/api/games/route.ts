@@ -1,17 +1,11 @@
-import { createServerClient, getUserFromRequest } from "@/lib/supabase";
+import { countGamesByUser, listGamesPage } from "@/lib/localDb";
+import { getUserFromRequest } from "@/lib/supabase";
 
 const PAGE_SIZE = 100;
 
 type Platform = "lichess" | "chess.com" | "all";
 
 export async function GET(request: Request): Promise<Response> {
-  let supabase: ReturnType<typeof createServerClient>;
-  try {
-    supabase = createServerClient();
-  } catch {
-    return Response.json({ error: "Database not configured." }, { status: 503 });
-  }
-
   const sessionUser = await getUserFromRequest(request);
   if (!sessionUser) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
@@ -29,42 +23,25 @@ export async function GET(request: Request): Promise<Response> {
   // First page: no cursor. Subsequent pages: cursor = played_at of last item.
   const cursorPlayedAt = url.searchParams.get("cursor") ?? null;
 
-  const cols = "id, lichess_game_id, white_username, black_username, white_rating, black_rating, played_at, time_control, result, status";
+  const games = (await listGamesPage({
+    userId,
+    platform,
+    cursorPlayedAt,
+    limit: PAGE_SIZE,
+  })).map((g) => ({
+    id: g.id,
+    lichess_game_id: g.lichess_game_id,
+    white_username: g.white_username,
+    black_username: g.black_username,
+    white_rating: g.white_rating,
+    black_rating: g.black_rating,
+    played_at: g.played_at,
+    time_control: g.time_control,
+    result: g.result,
+    status: g.status,
+  }));
 
-  let query = supabase
-    .from("games")
-    .select(cols)
-    .eq("user_id", userId)
-    .order("played_at", { ascending: false })
-    .order("id", { ascending: false })          // stable tiebreaker
-    .limit(PAGE_SIZE);
-
-  if (cursorPlayedAt) {
-    // Fetch rows strictly older than the cursor timestamp.
-    query = query.lt("played_at", cursorPlayedAt);
-  }
-
-  if (platform === "chess.com") {
-    query = query.like("lichess_game_id", "cc_%");
-  } else if (platform === "lichess") {
-    query = query.not("lichess_game_id", "like", "cc_%");
-  }
-
-  // Run page query + total count in parallel.
-  const [{ data, error }, { count: totalCount }] = await Promise.all([
-    query,
-    supabase
-      .from("games")
-      .select("*", { count: "exact", head: true })
-      .eq("user_id", userId),
-  ]);
-
-  if (error) {
-    console.error("[games] fetch error:", error);
-    return Response.json({ error: "Failed to load games." }, { status: 500 });
-  }
-
-  const games = data ?? [];
+  const totalCount = await countGamesByUser(userId);
   const nextCursor = games.length === PAGE_SIZE
     ? games[games.length - 1].played_at
     : null;

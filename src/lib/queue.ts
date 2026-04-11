@@ -10,21 +10,43 @@ import IORedis from "ioredis";
 import type { AnalyzeGameJobData, AnalyzeGameJobResult } from "@/types";
 import { ANALYZE_QUEUE_NAME } from "@/lib/constants";
 
+function createRedisClient(options: {
+  connectTimeout: number;
+  maxRetriesPerRequest: number | null;
+}): IORedis {
+  const redisUrl = process.env.REDIS_URL?.trim();
+  const tls = process.env.REDIS_TLS === "true" ? {} : undefined;
+
+  if (redisUrl) {
+    return new IORedis(redisUrl, {
+      lazyConnect: true,
+      enableOfflineQueue: false,
+      connectTimeout: options.connectTimeout,
+      maxRetriesPerRequest: options.maxRetriesPerRequest,
+      retryStrategy: (times) => (times > 2 ? null : Math.min(times * 250, 1000)),
+      ...(tls ? { tls } : {}),
+    });
+  }
+
+  return new IORedis({
+    host: process.env.REDIS_HOST ?? "127.0.0.1",
+    port: Number(process.env.REDIS_PORT ?? 6379),
+    password: process.env.REDIS_PASSWORD,
+    lazyConnect: true,
+    enableOfflineQueue: false,
+    connectTimeout: options.connectTimeout,
+    maxRetriesPerRequest: options.maxRetriesPerRequest,
+    retryStrategy: (times) => (times > 2 ? null : Math.min(times * 250, 1000)),
+    ...(tls ? { tls } : {}),
+  });
+}
+
 // Singleton Redis connection for the Next.js server process
 let _redis: IORedis | null = null;
 
 function getRedis(): IORedis {
   if (!_redis) {
-    _redis = new IORedis({
-      host: process.env.REDIS_HOST ?? "127.0.0.1",
-      port: Number(process.env.REDIS_PORT ?? 6379),
-      password: process.env.REDIS_PASSWORD,
-      lazyConnect: true,
-      enableOfflineQueue: false,
-      connectTimeout: 8000,
-      maxRetriesPerRequest: null,
-      retryStrategy: (times) => (times > 2 ? null : Math.min(times * 250, 1000)),
-    });
+    _redis = createRedisClient({ connectTimeout: 8000, maxRetriesPerRequest: null });
 
     // Avoid noisy ECONNREFUSED flooding when Redis is intentionally down in local dev.
     _redis.on("error", () => {
@@ -57,16 +79,7 @@ export async function enqueueGameAnalysis(data: AnalyzeGameJobData): Promise<str
 }
 
 export async function isRedisQueueAvailable(timeoutMs: number = 5000): Promise<boolean> {
-  const probe = new IORedis({
-    host: process.env.REDIS_HOST ?? "127.0.0.1",
-    port: Number(process.env.REDIS_PORT ?? 6379),
-    password: process.env.REDIS_PASSWORD,
-    lazyConnect: true,
-    enableOfflineQueue: false,
-    connectTimeout: timeoutMs,
-    maxRetriesPerRequest: 1,
-    retryStrategy: () => null,
-  });
+  const probe = createRedisClient({ connectTimeout: timeoutMs, maxRetriesPerRequest: 1 });
 
   try {
     await probe.connect();

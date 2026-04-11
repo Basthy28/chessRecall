@@ -59,8 +59,8 @@ import type {
 } from "@/types";
 import { DEFAULT_VALIDATOR_CONFIG } from "@/types";
 import { classifyMove, getExpectedPoints, isSacrificeMove } from "@/lib/analysis";
-import { createServerClient } from "@/lib/supabase";
 import { ANALYZE_QUEUE_NAME } from "@/lib/constants";
+import { insertPuzzle, updateGameStatus } from "@/lib/localDb";
 import { decodePgn } from "@/lib/pgnCodec";
 
 // ── Stockfish engine type ───────────────────────────────────────────
@@ -142,25 +142,33 @@ function lookupEco(fen: string): EcoEntry | null {
 let _sharedEngine: StockfishEngine | null = null;
 
 // ── Redis connection ────────────────────────────────────────────────
-const redisConnection = new IORedis({
-  host: process.env.REDIS_HOST ?? "127.0.0.1",
-  port: Number(process.env.REDIS_PORT ?? 6379),
-  password: process.env.REDIS_PASSWORD,
-  maxRetriesPerRequest: null, // required by BullMQ
-});
+function createWorkerRedis(): IORedis {
+  const redisUrl = process.env.REDIS_URL?.trim();
+  const tls = process.env.REDIS_TLS === "true" ? {} : undefined;
 
-let supabase: ReturnType<typeof createServerClient> | null = null;
-try {
-  supabase = createServerClient();
-} catch {
-  console.warn("[worker] Supabase not configured; DB writes disabled.");
+  if (redisUrl) {
+    return new IORedis(redisUrl, {
+      maxRetriesPerRequest: null, // required by BullMQ
+      ...(tls ? { tls } : {}),
+    });
+  }
+
+  return new IORedis({
+    host: process.env.REDIS_HOST ?? "127.0.0.1",
+    port: Number(process.env.REDIS_PORT ?? 6379),
+    password: process.env.REDIS_PASSWORD,
+    maxRetriesPerRequest: null, // required by BullMQ
+    ...(tls ? { tls } : {}),
+  });
 }
 
-async function updateGameStatus(gameId: string, status: GameStatus): Promise<void> {
-  if (!supabase) return;
-  const { error } = await supabase.from("games").update({ status }).eq("id", gameId);
-  if (error) {
-    console.error(`[worker] failed to set game ${gameId} status=${status}:`, error.message);
+const redisConnection = createWorkerRedis();
+
+async function setGameStatus(gameId: string, status: GameStatus): Promise<void> {
+  try {
+    await updateGameStatus(gameId, status);
+  } catch (err) {
+    console.error(`[worker] failed to set game ${gameId} status=${status}:`, err);
   }
 }
 
@@ -634,27 +642,21 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
 
         puzzlesFound++;
 
-        if (!supabase) {
-          console.warn("[worker] No Supabase — skipping puzzle insert");
-          puzzlesValidated++;
-          continue;
-        }
-
-        const { error: insertError } = await supabase.from("puzzles").insert(puzzle);
-        if (insertError) {
-          console.error(
-            `[worker] Puzzle insert failed at ply ${i + 1}:`,
-            insertError.message
-          );
-        } else {
+        try {
+          await insertPuzzle(puzzle);
           puzzlesValidated++;
           console.log(
             `[worker] ${isBlunder ? "Blunder" : "Miss"} puzzle at ply ${i + 1} (drop=${evalDrop})`
           );
+        } catch (insertErr) {
+          console.error(
+            `[worker] Puzzle insert failed at ply ${i + 1}:`,
+            insertErr
+          );
         }
       }
 
-      await updateGameStatus(gameId, "analyzed");
+      await setGameStatus(gameId, "analyzed");
       await job.updateProgress(100);
 
       console.log(
@@ -665,7 +667,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
       return { gameId, puzzlesFound, puzzlesValidated };
 
     } catch (err) {
-      await updateGameStatus(gameId, "failed");
+      await setGameStatus(gameId, "failed");
       throw err;
     } finally {
       // Do NOT destroy the engine — singleton reused across all jobs.
@@ -689,7 +691,7 @@ worker.on("completed", (job, result: AnalyzeGameJobResult) => {
 });
 
 worker.on("failed", (job, err) => {
-  if (job?.data?.gameId) void updateGameStatus(job.data.gameId, "failed");
+  if (job?.data?.gameId) void setGameStatus(job.data.gameId, "failed");
   console.error(`[worker] ✗ Job ${job?.id} failed:`, err.message);
 });
 

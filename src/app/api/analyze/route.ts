@@ -1,4 +1,5 @@
-import { createServerClient, getUserFromRequest } from "@/lib/supabase";
+import { listAnalyzableGames, updateGameStatusByIds } from "@/lib/localDb";
+import { getUserFromRequest } from "@/lib/supabase";
 import { enqueueGameAnalysis, isRedisQueueAvailable } from "@/lib/queue";
 import type { AnalyzeGameJobData } from "@/types";
 
@@ -60,14 +61,6 @@ export async function POST(request: Request): Promise<Response> {
   const gameIds = Array.isArray(raw.gameIds)
     ? raw.gameIds.filter((id): id is string => typeof id === "string" && id.length > 0)
     : [];
-  const hasExplicitSelection = gameIds.length > 0;
-
-  let supabase: ReturnType<typeof createServerClient>;
-  try {
-    supabase = createServerClient();
-  } catch {
-    return Response.json({ error: "Database not configured." }, { status: 503 });
-  }
 
   const sessionUser = await getUserFromRequest(request);
   if (!sessionUser) {
@@ -86,41 +79,13 @@ export async function POST(request: Request): Promise<Response> {
     });
   }
 
-  let query = supabase
-    .from("games")
-    .select("id, user_id, pgn, white_username, black_username, status, played_at, lichess_game_id")
-    .eq("user_id", userId)
-    .order("played_at", { ascending: false })
-    .limit(limit);
-
-  if (gameIds.length > 0) {
-    // Explicit selection: allow re-queuing any status (including stuck "processing" jobs)
-    query = query.in("id", gameIds);
-  } else {
-    query = query.in("status", ["pending", "failed"]);
-  }
-
-  // When game IDs are explicitly selected from UI, enqueue exactly those rows.
-  // Platform/username filtering only applies to backlog mode.
-  if (!hasExplicitSelection) {
-    if (platform === "chess.com") {
-      query = query.like("lichess_game_id", "cc_%");
-    } else {
-      query = query.not("lichess_game_id", "like", "cc_%");
-    }
-
-    if (username) {
-      query = query.or(`white_username.ilike.${username},black_username.ilike.${username}`);
-    }
-  }
-
-  const { data, error } = await query;
-  if (error) {
-    console.error("[analyze] failed to fetch backlog:", error);
-    return Response.json({ error: "Failed to fetch analyzable games." }, { status: 500 });
-  }
-
-  const rows = data ?? [];
+  const rows = await listAnalyzableGames({
+    userId,
+    platform,
+    limit,
+    username,
+    gameIds,
+  });
   if (rows.length === 0) {
     return Response.json({
       selected: 0,
@@ -159,13 +124,7 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   if (queuedIds.length > 0) {
-    const { error: updateError } = await supabase
-      .from("games")
-      .update({ status: "processing" })
-      .in("id", queuedIds);
-    if (updateError) {
-      console.error("[analyze] failed to set processing status:", updateError);
-    }
+    await updateGameStatusByIds(queuedIds, "processing");
   }
 
   if (failures > 0) {
