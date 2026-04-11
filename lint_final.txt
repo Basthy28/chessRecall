@@ -1,8 +1,0 @@
-
-C:\Users\sebas\Documents\chessRecall\chess-recall-app\src\components\training\GamesPanel.tsx
-  657:9   warning  'total' is assigned a value but never used     @typescript-eslint/no-unused-vars
-  788:16  error    'np' is never reassigned. Use 'const' instead  prefer-const
-
-✖ 2 problems (1 error, 1 warning)
-  1 error and 0 warnings potentially fixable with the `--fix` option.
-
