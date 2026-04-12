@@ -1,15 +1,12 @@
-import path from "path";
 import { createRequire } from "module";
 import { Chess } from "chess.js";
 
 export const runtime = "nodejs";
 
 // stockfish is excluded from the Next.js bundle via serverExternalPackages,
-// so createRequire works here and resolves to the CJS entry point correctly.
+// so Node resolves it at runtime — no path gymnastics needed.
 const _require = createRequire(import.meta.url);
-const initEngine = _require(
-  path.join(process.cwd(), "node_modules", "stockfish", "index.js")
-) as (
+const initEngine = _require("stockfish") as (
   enginePath?: string | null
 ) => Promise<StockfishEngine>;
 
