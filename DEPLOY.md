@@ -46,7 +46,7 @@ xxx            chessrecall-worker       Up
 xxx            chessrecall-app          Up
 ```
 
-Open browser: `http://chessrecall.qzz.io:3000`
+Open browser: `https://chessrecall.qzz.io`
 
 Should see login page. ✅
 
@@ -54,7 +54,7 @@ Should see login page. ✅
 
 ### Step 2: Test & Use
 
-1. **Browser:** Go to `http://chessrecall.qzz.io:3000`
+1. **Browser:** Go to `https://chessrecall.qzz.io`
 2. **See login page** - it works! ✅
 3. **Log in** with Supabase account
 4. **Import a game** from Lichess/Chess.com
@@ -120,10 +120,10 @@ docker compose up -d --build
 
 ## Add a Domain (Later)
 
-When you want `https://chessrecall.com` instead of `http://chessrecall.qzz.io:3000`:
+When you want `https://chessrecall.com` instead of `https://chessrecall.qzz.io`:
 
 1. Buy domain (~€5/year at GoDaddy/Namecheap)
-2. Point DNS to `chessrecall.qzz.io`
+2. Point DNS to your server public IP
 3. Add Nginx reverse proxy with SSL (Let's Encrypt free)
    
 This is a separate setup - ask me when you need it.
@@ -134,7 +134,7 @@ This is a separate setup - ask me when you need it.
 
 | Problem | Fix |
 |---------|-----|
-| Browser can't reach `http://chessrecall.qzz.io:3000` | Check `docker compose ps` - all 4 containers up? |
+| Browser can't reach `https://chessrecall.qzz.io` | Check `docker compose ps` - all 4 containers up? |
 | Worker not processing jobs | Check `docker compose logs worker` for errors |
 | Login page spins forever | Check Supabase keys are correct |
 | App can't connect to Postgres | Check password matches in docker-compose.yml |
@@ -144,7 +144,7 @@ This is a separate setup - ask me when you need it.
 ## Architecture
 
 ```
-Oracle (chessrecall.qzz.io)
+Oracle (your-server)
 ┌──────────────────────────────────────┐
 │ Docker Compose (private network)     │
 ├──────────────────────────────────────┤
@@ -154,7 +154,7 @@ Oracle (chessrecall.qzz.io)
 │ └─ Next.js App (port 3000)           │
 └──────────────────────────────────────┘
          ↓
-    http://chessrecall.qzz.io:3000
+   https://chessrecall.qzz.io
     (only thing exposed to internet)
 ```
 
