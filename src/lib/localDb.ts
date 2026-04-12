@@ -223,6 +223,23 @@ export async function countGamesByUserForPlatform(userId: string, platform: Plat
   return Number(rows[0]?.count ?? 0);
 }
 
+export async function countGamesByUserForPlatformAndStatus(
+  userId: string,
+  platform: Platform,
+  status: GameStatus
+): Promise<number> {
+  await ensureSchema();
+  const pool = getPool();
+  const where: string[] = ["g.user_id = $1", platformPredicate(platform), "g.status = $2"];
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS count
+     FROM games g
+     WHERE ${where.join(" AND ")}`,
+    [userId, status]
+  );
+  return Number(rows[0]?.count ?? 0);
+}
+
 export async function countPuzzlesByUser(userId: string): Promise<number> {
   await ensureSchema();
   const pool = getPool();

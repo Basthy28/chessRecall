@@ -1,4 +1,8 @@
-import { countGamesByUserForPlatform, listGamesPage } from "@/lib/localDb";
+import {
+  countGamesByUserForPlatform,
+  countGamesByUserForPlatformAndStatus,
+  listGamesPage,
+} from "@/lib/localDb";
 import { getUserFromRequest } from "@/lib/supabase";
 
 const PAGE_SIZE = 100;
@@ -46,12 +50,19 @@ export async function GET(request: Request): Promise<Response> {
     ? `${games[games.length - 1].played_at}|${games[games.length - 1].id}`
     : null;
 
+  const [pending, processing, analyzed, failed] = await Promise.all([
+    countGamesByUserForPlatformAndStatus(userId, platform, "pending"),
+    countGamesByUserForPlatformAndStatus(userId, platform, "processing"),
+    countGamesByUserForPlatformAndStatus(userId, platform, "analyzed"),
+    countGamesByUserForPlatformAndStatus(userId, platform, "failed"),
+  ]);
+
   const stats = {
     total: totalCount ?? 0,
-    pending: games.filter((g) => g.status === "pending").length,
-    processing: games.filter((g) => g.status === "processing").length,
-    analyzed: games.filter((g) => g.status === "analyzed").length,
-    failed: games.filter((g) => g.status === "failed").length,
+    pending,
+    processing,
+    analyzed,
+    failed,
   };
 
   return Response.json({ games, stats, platform, nextCursor });

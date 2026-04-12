@@ -1897,6 +1897,10 @@ export default function GamesPanel() {
 
   async function queueSelectedGame() {
     if (!selectedGameId || !selectedGame) { setMessage("Select a game first."); return; }
+    if (selectedGame.status === "analyzed") {
+      setMessage("This game is already analyzed.");
+      return;
+    }
     const selectedPlatform = inferPlatformFromGameId(selectedGame.lichess_game_id);
     const selectedUsername = getLinkedUsername(linkedAccounts, selectedPlatform);
 
@@ -2155,7 +2159,7 @@ export default function GamesPanel() {
         </div>
 
         <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-          <Button variant="secondary" size="sm" onClick={() => void queueSelectedGame()} disabled={actionLoading || !selectedGameId}>
+          <Button variant="secondary" size="sm" onClick={() => void queueSelectedGame()} disabled={actionLoading || !selectedGameId || selectedGame?.status === "analyzed"}>
             {actionLoading ? "…" : selectedGame?.status === "processing" ? "Re-queue (stuck)" : "Queue Analysis"}
           </Button>
           {stats.processing > 0 && (

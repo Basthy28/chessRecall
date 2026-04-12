@@ -92,6 +92,22 @@ export async function POST(request: Request): Promise<Response> {
     gameIds,
     order,
   });
+
+  if (gameIds.length > 0 && rows.some((row) => row.status === "analyzed")) {
+    return Response.json(
+      {
+        error: "Selected game is already analyzed.",
+        selected: rows.length,
+        queued: 0,
+        queueUnavailable: false,
+        platform,
+        limit,
+        order,
+      },
+      { status: 409 }
+    );
+  }
+
   if (rows.length === 0) {
     return Response.json({
       selected: 0,
