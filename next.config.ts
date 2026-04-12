@@ -2,6 +2,8 @@ import type { NextConfig } from "next";
 import path from "path";
 
 const nextConfig: NextConfig = {
+  // Exclude native/CJS-only packages from server bundle so require() works normally.
+  serverExternalPackages: ["stockfish"],
   turbopack: {
     // Pin the root so Turbopack doesn't walk up to a parent lockfile
     root: path.resolve(__dirname),

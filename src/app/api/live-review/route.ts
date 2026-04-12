@@ -107,6 +107,7 @@ export async function POST(request: Request): Promise<Response> {
   return Response.json({
     game: {
       id: data.id,
+      lichessGameId: data.lichess_game_id,
       white: data.white_username,
       black: data.black_username,
       whiteRating: data.white_rating,

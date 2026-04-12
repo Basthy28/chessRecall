@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import ChessBoard from "@/components/board/ChessBoard";
 import TrainingQueue from "@/components/training/TrainingQueue";
 import GamesPanel from "@/components/training/GamesPanel";
@@ -186,6 +186,20 @@ export default function TrainingDashboard() {
   const [activeNav, setActiveNav] = useState<"puzzles" | "games">("puzzles");
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [chessComAvatar, setChessComAvatar] = useState<string | null>(null);
+
+  // Fetch chess.com avatar from linked account
+  useEffect(() => {
+    const accounts = readLinkedAccounts();
+    if (!accounts.chessCom) return;
+    const username = accounts.chessCom;
+    fetch(`https://api.chess.com/pub/player/${encodeURIComponent(username)}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data: { avatar?: string } | null) => {
+        if (data?.avatar) setChessComAvatar(data.avatar);
+      })
+      .catch(() => undefined);
+  }, [userId]);
 
   const handleAuthSuccess = useCallback(async (newUserId: string) => {
     setShowAuthModal(false);
@@ -303,6 +317,15 @@ export default function TrainingDashboard() {
           {!authLoading && (
             userId ? (
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                {chessComAvatar && (
+                  <img
+                    src={chessComAvatar}
+                    alt="avatar"
+                    width={28}
+                    height={28}
+                    style={{ borderRadius: "50%", border: "1px solid var(--border)", flexShrink: 0, objectFit: "cover" }}
+                  />
+                )}
                 <span
                   title={userEmail ?? userId}
                   style={{

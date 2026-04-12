@@ -173,8 +173,8 @@ export async function upsertGames(rows: Array<Omit<Game, "id" | "created_at">>):
           black_rating = EXCLUDED.black_rating,
           result = EXCLUDED.result,
           played_at = EXCLUDED.played_at,
-          time_control = EXCLUDED.time_control,
-          status = EXCLUDED.status
+          time_control = EXCLUDED.time_control
+          -- status intentionally omitted: preserves analyzed/processing/failed state on re-sync
          RETURNING *`,
         [
           row.user_id,
@@ -221,6 +221,27 @@ export async function countGamesByUserForPlatform(userId: string, platform: Plat
     [userId]
   );
   return Number(rows[0]?.count ?? 0);
+}
+
+export async function countGamesByStatusForPlatform(
+  userId: string,
+  platform: Platform
+): Promise<{ pending: number; processing: number; analyzed: number; failed: number }> {
+  await ensureSchema();
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT status, count(*)::int AS count
+     FROM games g
+     WHERE g.user_id = $1 AND ${platformPredicate(platform)}
+     GROUP BY status`,
+    [userId]
+  );
+  const out = { pending: 0, processing: 0, analyzed: 0, failed: 0 };
+  for (const row of rows) {
+    const s = String(row.status) as keyof typeof out;
+    if (s in out) out[s] = Number(row.count ?? 0);
+  }
+  return out;
 }
 
 export async function countPuzzlesByUser(userId: string): Promise<number> {
@@ -410,6 +431,22 @@ export async function insertPuzzle(row: Omit<Puzzle, "id" | "created_at">): Prom
   return mapPuzzle(rows[0] as Record<string, unknown>);
 }
 
+export async function resetPuzzleSrsForUser(userId: string): Promise<number> {
+  await ensureSchema();
+  const pool = getPool();
+  const { rowCount } = await pool.query(
+    `UPDATE puzzles
+     SET srs_due_at = NULL,
+         srs_ease = 2.5,
+         times_seen = 0,
+         times_correct = 0,
+         last_reviewed_at = NULL
+     WHERE user_id = $1`,
+    [userId]
+  );
+  return rowCount ?? 0;
+}
+
 export async function listDuePuzzlesForUser(userId: string, limit: number, nowIso: string): Promise<Puzzle[]> {
   await ensureSchema();
   const pool = getPool();
@@ -425,26 +462,63 @@ export async function listDuePuzzlesForUser(userId: string, limit: number, nowIs
   return rows.map((row) => mapPuzzle(row as Record<string, unknown>));
 }
 
+// Interval at which a puzzle is considered "mastered" and stops appearing.
+const RETIRE_INTERVAL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+
 export async function applyPuzzleSrsRating(userId: string, puzzleId: string, choice: SrsChoice): Promise<boolean> {
   await ensureSchema();
   const pool = getPool();
 
-  const intervalMs: Record<SrsChoice, number> = {
-    hard: 10 * 60 * 1000,
-    good: 24 * 60 * 60 * 1000,
-    easy: 4 * 24 * 60 * 60 * 1000,
-  };
+  // Fetch current puzzle state to compute SM-2 style next interval.
+  const { rows: puzzleRows } = await pool.query(
+    `SELECT srs_ease, srs_due_at, last_reviewed_at FROM puzzles WHERE id = $1 AND user_id = $2`,
+    [puzzleId, userId]
+  );
+  if (!puzzleRows.length) return false;
 
-  const dueAt = new Date(Date.now() + intervalMs[choice]).toISOString();
+  const p = puzzleRows[0] as Record<string, unknown>;
+  const ease = Math.max(1.3, Math.min(3.0, Number(p.srs_ease ?? 2.5)));
+
+  // Current interval: time between last review and when it was scheduled next.
+  // Falls back to 0 for unseen puzzles so minimums below kick in.
+  let currentIntervalMs = 0;
+  if (p.srs_due_at && p.last_reviewed_at) {
+    currentIntervalMs = Math.max(0,
+      new Date(String(p.srs_due_at)).getTime() - new Date(String(p.last_reviewed_at)).getTime()
+    );
+  }
+
+  let nextIntervalMs: number;
+  let nextEase = ease;
+
+  switch (choice) {
+    case "hard":
+      nextIntervalMs = Math.max(10 * 60 * 1000, currentIntervalMs * 0.6);
+      nextEase = Math.max(1.3, ease - 0.15);
+      break;
+    case "good":
+      nextIntervalMs = Math.max(24 * 60 * 60 * 1000, currentIntervalMs * ease);
+      break;
+    case "easy":
+      nextIntervalMs = Math.max(4 * 24 * 60 * 60 * 1000, currentIntervalMs * ease * 1.3);
+      nextEase = Math.min(3.0, ease + 0.1);
+      break;
+  }
+
+  // Graduation: if the next interval would exceed 90 days the puzzle is mastered.
+  // Set srs_due_at exactly 90 days from now — it will resurface rarely as a refresher,
+  // but since listDuePuzzlesForUser orders by srs_due_at ASC, it will never crowd out active puzzles.
+  const dueAt = new Date(Date.now() + Math.min(nextIntervalMs, RETIRE_INTERVAL_MS)).toISOString();
+
   const { rowCount } = await pool.query(
     `UPDATE puzzles
      SET times_seen = times_seen + 1,
          times_correct = times_correct + 1,
-         srs_ease = 2.5,
-         srs_due_at = $1,
+         srs_ease = $1,
+         srs_due_at = $2,
          last_reviewed_at = now()
-     WHERE id = $2 AND user_id = $3`,
-    [dueAt, puzzleId, userId]
+     WHERE id = $3 AND user_id = $4`,
+    [nextEase.toFixed(4), dueAt, puzzleId, userId]
   );
 
   return (rowCount ?? 0) > 0;

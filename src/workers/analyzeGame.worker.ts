@@ -62,6 +62,7 @@ import { classifyMove, getExpectedPoints, isSacrificeMove } from "@/lib/analysis
 import { ANALYZE_QUEUE_NAME } from "@/lib/constants";
 import { insertPuzzle, updateGameStatus } from "@/lib/localDb";
 import { decodePgn } from "@/lib/pgnCodec";
+import { startAutoSync } from "./autoSync.worker";
 
 // ── Stockfish engine type ───────────────────────────────────────────
 interface StockfishEngine {
@@ -698,5 +699,8 @@ worker.on("failed", (job, err) => {
 worker.on("error", (err) => {
   console.error("[worker] Redis/BullMQ error:", err.message);
 });
+
+// ── Auto-sync: import new games for all users on a 1h cadence ─────────────
+startAutoSync();
 
 console.log(`[worker] Started — listening on queue "${ANALYZE_QUEUE_NAME}"`);

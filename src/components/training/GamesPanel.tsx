@@ -80,6 +80,7 @@ interface ImportResponse {
 interface LiveReviewResponse {
   game: {
     id: string;
+    lichessGameId?: string;
     white: string;
     black: string;
     whiteRating: number | null;
@@ -1110,12 +1111,12 @@ function ReviewView({
           <NavPrev /> Back
         </button>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0 }}>
-          <PlayerAvatar name={review.game.white} size={22} platform={inferPlatformFromGameId(review.game.id)} />
+          <PlayerAvatar name={review.game.white} size={22} platform={inferPlatformFromGameId(review.game.lichessGameId ?? review.game.id)} />
           <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {review.game.white}
           </span>
           <span style={{ fontSize: "11px", color: "var(--text-muted)", flexShrink: 0 }}>vs</span>
-          <PlayerAvatar name={review.game.black} size={22} platform={inferPlatformFromGameId(review.game.id)} />
+          <PlayerAvatar name={review.game.black} size={22} platform={inferPlatformFromGameId(review.game.lichessGameId ?? review.game.id)} />
           <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {review.game.black}
           </span>
@@ -1572,7 +1573,7 @@ function ReviewView({
                         borderRadius: "6px", border: "1px solid #3c3a38", textAlign: "center",
                       }}>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "6px", marginBottom: "6px" }}>
-                          <PlayerAvatar name={name} size={24} platform={inferPlatformFromGameId(review.game.id)} />
+                          <PlayerAvatar name={name} size={24} platform={inferPlatformFromGameId(review.game.lichessGameId ?? review.game.id)} />
                           <span style={{ fontSize: "11px", color: "#aaa", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
                             {name}
                           </span>
@@ -1692,6 +1693,7 @@ export default function GamesPanel() {
   const [report, setReport] = useState<LiveReviewResponse | null>(null);  // game report / stats
   const [review, setReview] = useState<LiveReviewResponse | null>(null);  // board review
   const [reviewIndex, setReviewIndex] = useState(0);
+  const [gameSearch, setGameSearch] = useState("");
 
   useEffect(() => {
     const refreshLinkedAccounts = () => {
@@ -1873,27 +1875,40 @@ export default function GamesPanel() {
     () => games.find((g) => g.id === selectedGameId) ?? null,
     [games, selectedGameId]
   );
-  const hasRunningAnalysis = useMemo(
-    () => games.some((g) => g.status === "pending" || g.status === "processing"),
-    [games]
-  );
+  // hasRunningAnalysis uses global DB stats (not just the loaded page).
+  const hasRunningAnalysis = stats.pending > 0 || stats.processing > 0;
   const viewerUsernames = useMemo(
     () => getAllViewerUsernames(linkedAccounts),
     [linkedAccounts]
   );
 
-  // Poll while there are running jobs. Local storage mode has no Postgres realtime.
-  useEffect(() => {
-    // If user expanded the list with "Load more", don't hard-reset it while polling.
-    if (!hasRunningAnalysis || review || games.length > 100) return;
-    const timer = setInterval(() => {
-      void loadGames({ silent: true });
-    }, 4000);
+  const filteredGames = useMemo(() => {
+    const q = gameSearch.trim().toLowerCase();
+    if (!q) return games;
+    return games.filter(
+      (g) =>
+        g.white_username.toLowerCase().includes(q) ||
+        g.black_username.toLowerCase().includes(q)
+    );
+  }, [games, gameSearch]);
 
-    return () => {
-      clearInterval(timer);
-    };
-  }, [hasRunningAnalysis, loadGames, review, games.length]);
+  // Poll stats while jobs are running — never touches the games list or scroll position.
+  useEffect(() => {
+    if (!hasRunningAnalysis || review) return;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/games/stats?platform=${platform}`, {
+          headers: await getClientAuthHeaders(),
+        });
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          total: number; pending: number; processing: number; analyzed: number; failed: number;
+        };
+        setStats(json);
+      } catch { /* silent */ }
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [hasRunningAnalysis, review, platform]);
 
   async function queueSelectedGame() {
     if (!selectedGameId || !selectedGame) { setMessage("Select a game first."); return; }
@@ -2193,6 +2208,35 @@ export default function GamesPanel() {
       </div>
       {message && <div style={{ fontSize: "12px", color: "var(--text-secondary)", flexShrink: 0 }}>{message}</div>}
 
+      {/* Search */}
+      <div style={{ flexShrink: 0, position: "relative" }}>
+        <input
+          type="text"
+          placeholder="Search by player…"
+          value={gameSearch}
+          onChange={(e) => setGameSearch((e.target as HTMLInputElement).value)}
+          style={{
+            width: "100%",
+            padding: "7px 10px 7px 30px",
+            borderRadius: "7px",
+            border: "1px solid var(--border)",
+            background: "var(--bg-elevated)",
+            color: "var(--text-primary)",
+            fontSize: "13px",
+            fontFamily: "inherit",
+            outline: "none",
+            boxSizing: "border-box",
+          }}
+        />
+        <svg
+          width="14" height="14" viewBox="0 0 24 24" fill="none"
+          stroke="var(--text-muted)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+          style={{ position: "absolute", left: "9px", top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }}
+        >
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+      </div>
+
       {/* Games table */}
       <div style={{
         flex: 1,
@@ -2226,7 +2270,7 @@ export default function GamesPanel() {
 
         {/* Rows */}
         <div style={{ overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: "4px", padding: "6px 8px" }}>
-          {games.map((g) => {
+          {filteredGames.map((g) => {
             const isSelected = g.id === selectedGameId;
             const gamePlatform = inferPlatformFromGameId(g.lichess_game_id);
             const linkedUsername = getLinkedUsername(linkedAccounts, gamePlatform);
@@ -2275,9 +2319,9 @@ export default function GamesPanel() {
             );
           })}
 
-          {games.length === 0 && !loading && (
+          {filteredGames.length === 0 && !loading && (
             <div style={{ padding: "32px", color: "var(--text-muted)", textAlign: "center", fontSize: "13px" }}>
-              No games found. Link your account above to get started.
+              {gameSearch ? `No games match "${gameSearch}".` : "No games found. Link your account above to get started."}
             </div>
           )}
 

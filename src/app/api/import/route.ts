@@ -178,11 +178,12 @@ export async function POST(request: Request): Promise<Response> {
   const upserted = await upsertGames(gameRows);
   imported = upserted.length;
 
-  // Analyze recent games first to keep local runs manageable.
-  const enqueueCandidates = [...upserted]
+  // Only enqueue games that are still pending — skip already-analyzed/processing ones.
+  const enqueueCandidates = upserted
+    .filter((g) => g.status === "pending")
     .sort((a, b) => b.played_at.localeCompare(a.played_at))
     .slice(0, analyzeLimit);
-  const skippedQueue = Math.max(0, imported - enqueueCandidates.length);
+  const skippedQueue = Math.max(0, upserted.filter((g) => g.status !== "pending").length);
 
   // ── Enqueue analysis jobs in bounded concurrent batches ───────────
   const queueAvailable = await isRedisQueueAvailable();

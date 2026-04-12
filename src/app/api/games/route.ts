@@ -1,4 +1,4 @@
-import { countGamesByUserForPlatform, listGamesPage } from "@/lib/localDb";
+import { countGamesByUserForPlatform, countGamesByStatusForPlatform, listGamesPage } from "@/lib/localDb";
 import { getUserFromRequest } from "@/lib/supabase";
 
 const PAGE_SIZE = 100;
@@ -6,7 +6,12 @@ const PAGE_SIZE = 100;
 type Platform = "lichess" | "chess.com" | "all";
 
 export async function GET(request: Request): Promise<Response> {
-  const sessionUser = await getUserFromRequest(request);
+  let sessionUser;
+  try {
+    sessionUser = await getUserFromRequest(request);
+  } catch {
+    return Response.json({ error: "Auth service unavailable" }, { status: 500 });
+  }
   if (!sessionUser) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -41,17 +46,17 @@ export async function GET(request: Request): Promise<Response> {
     status: g.status,
   }));
 
-  const totalCount = await countGamesByUserForPlatform(userId, platform);
+  const [totalCount, statusCounts] = await Promise.all([
+    countGamesByUserForPlatform(userId, platform),
+    countGamesByStatusForPlatform(userId, platform),
+  ]);
   const nextCursor = games.length === PAGE_SIZE
     ? `${games[games.length - 1].played_at}|${games[games.length - 1].id}`
     : null;
 
   const stats = {
     total: totalCount ?? 0,
-    pending: games.filter((g) => g.status === "pending").length,
-    processing: games.filter((g) => g.status === "processing").length,
-    analyzed: games.filter((g) => g.status === "analyzed").length,
-    failed: games.filter((g) => g.status === "failed").length,
+    ...statusCounts,
   };
 
   return Response.json({ games, stats, platform, nextCursor });

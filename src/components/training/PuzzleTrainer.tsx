@@ -44,7 +44,7 @@ const SRS_BUTTONS: Array<{
     color: "var(--orange)",
     border: "rgba(200,120,50,0.35)",
     hoverBg: "rgba(200,120,50,0.25)",
-    interval: "10 min",
+    interval: "< 1 day",
   },
   {
     key: "good",
@@ -54,7 +54,7 @@ const SRS_BUTTONS: Array<{
     color: "var(--green)",
     border: "rgba(134,166,102,0.35)",
     hoverBg: "rgba(134,166,102,0.25)",
-    interval: "1 day",
+    interval: "~1 day+",
   },
   {
     key: "easy",
@@ -64,7 +64,7 @@ const SRS_BUTTONS: Array<{
     color: "var(--teal)",
     border: "rgba(74,158,142,0.35)",
     hoverBg: "rgba(74,158,142,0.25)",
-    interval: "4 days",
+    interval: "~4 days+",
   },
 ];
 
@@ -161,6 +161,10 @@ export default function PuzzleTrainer() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
+  // Track which puzzle IDs have been rated this session (for sidebar "done" indicator).
+  const [ratedIds, setRatedIds] = useState<Set<string>>(new Set());
+  // Experimental reset state
+  const [resetting, setResetting] = useState(false);
 
   const wrongResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -237,6 +241,17 @@ export default function PuzzleTrainer() {
 
   const revealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // ── Retry current puzzle (reset to initial position) ─────────────────────
+  const retryPuzzle = useCallback(() => {
+    if (wrongResetTimerRef.current) clearTimeout(wrongResetTimerRef.current);
+    if (revealTimerRef.current) clearInterval(revealTimerRef.current);
+    setPlayedMoves([]);
+    setViewPly(0);
+    setState("solving");
+    setWrongFen(undefined);
+    setWrongLastMove(undefined);
+  }, []);
+
   // ── SRS rating update ─────────────────────────────────────────────────────
   const handleSrsRating = useCallback(async (choice: SrsChoice) => {
     if (!currentPuzzle) return;
@@ -254,7 +269,10 @@ export default function PuzzleTrainer() {
       // Silently fail — puzzle still advances
     }
 
-    // Move to next puzzle
+    // Mark as rated and move to next puzzle
+    if (currentPuzzle) {
+      setRatedIds((prev) => new Set(prev).add(currentPuzzle.id));
+    }
     setCurrentIndex((prev) => prev + 1);
   }, [currentPuzzle]);
 
@@ -369,7 +387,7 @@ export default function PuzzleTrainer() {
          setWrongFen(undefined);
          setWrongLastMove(undefined);
          setState("solving");
-      }, 5000);
+      }, 800);
     }
   }, [currentPuzzle, state, viewPly, playedMoves, displayFen]);
 
@@ -567,6 +585,24 @@ export default function PuzzleTrainer() {
 
   // All puzzles done
   if (currentIndex >= puzzles.length) {
+    // Find the earliest next due time among the puzzles just reviewed.
+    const nextDue = puzzles
+      .map((p) => p.srs_due_at)
+      .filter(Boolean)
+      .sort()[0] ?? null;
+
+    const nextDueLabel = (() => {
+      if (!nextDue) return null;
+      const diffMs = new Date(nextDue).getTime() - Date.now();
+      if (diffMs <= 0) return "soon";
+      const mins = Math.round(diffMs / 60_000);
+      if (mins < 60) return `in ${mins} min`;
+      const hrs = Math.round(diffMs / 3_600_000);
+      if (hrs < 24) return `in ${hrs}h`;
+      const days = Math.round(diffMs / 86_400_000);
+      return `in ${days}d`;
+    })();
+
     return (
       <div
         style={{
@@ -600,8 +636,11 @@ export default function PuzzleTrainer() {
           <div style={{ fontSize: "16px", fontWeight: 700, color: "var(--text-primary)", marginBottom: "6px" }}>
             Session complete!
           </div>
-          <div style={{ fontSize: "13px", color: "var(--text-muted)" }}>
+          <div style={{ fontSize: "13px", color: "var(--text-muted)", maxWidth: "280px" }}>
             You reviewed {puzzles.length} puzzle{puzzles.length === 1 ? "" : "s"}.
+            {nextDueLabel && (
+              <> Your next review is due <span style={{ color: "var(--text-secondary)", fontWeight: 600 }}>{nextDueLabel}</span>.</>
+            )}
           </div>
         </div>
       </div>
@@ -626,12 +665,13 @@ export default function PuzzleTrainer() {
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
-          justifyContent: "center",
+          justifyContent: "flex-start",
           flex: 1,
-          padding: "16px 20px",
+          padding: "20px 20px 16px",
           gap: "12px",
           minWidth: 0,
-          overflow: "hidden",
+          overflowY: "auto",
+          overflowX: "hidden",
         }}
       >
         {/* ── Top bar: puzzle count + status ── */}
@@ -897,9 +937,35 @@ export default function PuzzleTrainer() {
             gap: "10px",
           }}
         >
-          {/* Solving phase: reveal button */}
+          {/* Solving phase: reveal + skip + (try again on wrong) */}
           {(isSolving || isWrong) && (
             <div style={{ display: "flex", gap: "8px" }}>
+              {isWrong && (
+                <button
+                  onClick={retryPuzzle}
+                  style={{
+                    padding: "9px 14px",
+                    borderRadius: "7px",
+                    border: "1px solid rgba(200,120,50,0.4)",
+                    background: "rgba(200,120,50,0.1)",
+                    color: "var(--orange)",
+                    fontSize: "13px",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    transition: "background var(--transition-fast)",
+                    whiteSpace: "nowrap",
+                  }}
+                  onMouseEnter={(e) => {
+                    (e.currentTarget as HTMLButtonElement).style.background = "rgba(200,120,50,0.2)";
+                  }}
+                  onMouseLeave={(e) => {
+                    (e.currentTarget as HTMLButtonElement).style.background = "rgba(200,120,50,0.1)";
+                  }}
+                >
+                  Try again
+                </button>
+              )}
               <button
                 onClick={handleRevealSolution}
                 style={{
@@ -951,6 +1017,7 @@ export default function PuzzleTrainer() {
               </button>
             </div>
           )}
+
 
 
         </div>
@@ -1051,6 +1118,26 @@ export default function PuzzleTrainer() {
                   </button>
                 ))}
               </div>
+              <div style={{ display: "flex", justifyContent: "center" }}>
+                <button
+                  onClick={retryPuzzle}
+                  style={{
+                    padding: "5px 12px",
+                    borderRadius: "5px",
+                    border: "1px solid #3c3a38",
+                    background: "transparent",
+                    color: "#8b8987",
+                    fontSize: "11px",
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    transition: "color 150ms",
+                  }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = "#e8e6e2"; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = "#8b8987"; }}
+                >
+                  ↺ Retry this puzzle
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -1060,7 +1147,7 @@ export default function PuzzleTrainer() {
         </div>
         <div style={{ flex: 1, overflowY: "auto" }}>
           {puzzles.map((puzzle, idx) => {
-            const isDone = idx < currentIndex;
+            const isDone = ratedIds.has(puzzle.id);
             const isCurrent = idx === currentIndex;
             return (
               <button
@@ -1111,6 +1198,58 @@ export default function PuzzleTrainer() {
               </button>
             );
           })}
+        </div>
+
+        {/* Experimental: reset SRS */}
+        <div style={{ padding: "10px 14px", borderTop: "1px solid #3c3a38", flexShrink: 0 }}>
+          <button
+            disabled={resetting}
+            onClick={async () => {
+              if (!confirm("Reset all puzzle cooldowns? This clears your SRS progress.")) return;
+              setResetting(true);
+              try {
+                await fetch("/api/puzzles", {
+                  method: "DELETE",
+                  headers: { ...(await getClientAuthHeaders()) },
+                });
+                // Reload puzzles
+                window.location.reload();
+              } catch {
+                setResetting(false);
+              }
+            }}
+            style={{
+              width: "100%",
+              padding: "6px 10px",
+              borderRadius: "5px",
+              border: "1px dashed #3c3a38",
+              background: "transparent",
+              color: "#5a5856",
+              fontSize: "11px",
+              cursor: resetting ? "not-allowed" : "pointer",
+              fontFamily: "inherit",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "5px",
+              transition: "color 150ms, border-color 150ms",
+            }}
+            onMouseEnter={(e) => {
+              if (!resetting) {
+                (e.currentTarget as HTMLButtonElement).style.color = "#f05149";
+                (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(240,81,73,0.4)";
+              }
+            }}
+            onMouseLeave={(e) => {
+              (e.currentTarget as HTMLButtonElement).style.color = "#5a5856";
+              (e.currentTarget as HTMLButtonElement).style.borderColor = "#3c3a38";
+            }}
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>
+            </svg>
+            {resetting ? "Resetting…" : "⚗ Experimental: Reset SRS"}
+          </button>
         </div>
       </aside>
     </div>

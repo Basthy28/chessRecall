@@ -1,4 +1,4 @@
-import { applyPuzzleSrsRating, listDuePuzzlesForUser } from "@/lib/localDb";
+import { applyPuzzleSrsRating, listDuePuzzlesForUser, resetPuzzleSrsForUser } from "@/lib/localDb";
 import { getUserFromRequest } from "@/lib/supabase";
 
 const DEFAULT_LIMIT = 20;
@@ -12,7 +12,12 @@ function parseLimit(request: Request): number {
 }
 
 export async function GET(request: Request): Promise<Response> {
-  const sessionUser = await getUserFromRequest(request);
+  let sessionUser;
+  try {
+    sessionUser = await getUserFromRequest(request);
+  } catch {
+    return Response.json({ error: "Auth service unavailable" }, { status: 500 });
+  }
   if (!sessionUser) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -23,7 +28,12 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function PATCH(request: Request): Promise<Response> {
-  const sessionUser = await getUserFromRequest(request);
+  let sessionUser;
+  try {
+    sessionUser = await getUserFromRequest(request);
+  } catch {
+    return Response.json({ error: "Auth service unavailable" }, { status: 500 });
+  }
   if (!sessionUser) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -53,4 +63,19 @@ export async function PATCH(request: Request): Promise<Response> {
   }
 
   return Response.json({ ok: true });
+}
+
+export async function DELETE(request: Request): Promise<Response> {
+  let sessionUser;
+  try {
+    sessionUser = await getUserFromRequest(request);
+  } catch {
+    return Response.json({ error: "Auth service unavailable" }, { status: 500 });
+  }
+  if (!sessionUser) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const count = await resetPuzzleSrsForUser(sessionUser.id);
+  return Response.json({ reset: count });
 }
