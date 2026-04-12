@@ -1929,7 +1929,58 @@ export default function GamesPanel() {
     }
   }
 
-  async function queueOldestBacklog() {
+  async function queueBacklogAll() {
+    setActionLoading(true);
+    setMessage("");
+    try {
+      let totalSelected = 0;
+      let totalQueued = 0;
+      let rounds = 0;
+
+      while (rounds < 20) {
+        const res = await fetch("/api/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
+          body: JSON.stringify({
+            platform,
+            order: "oldest",
+            limit: 1000,
+            viewerUsernames,
+          }),
+        });
+        const json = (await res.json()) as { selected?: number; queued?: number; queueUnavailable?: boolean; error?: string };
+
+        if (!res.ok) {
+          setMessage(json.error ?? "Failed to queue backlog games.");
+          await loadGames();
+          return;
+        }
+        if (json.queueUnavailable) {
+          setMessage("Redis queue offline. Start Redis + worker and try again.");
+          await loadGames();
+          return;
+        }
+
+        const selected = json.selected ?? 0;
+        const queued = json.queued ?? 0;
+        totalSelected += selected;
+        totalQueued += queued;
+        rounds += 1;
+
+        // Nothing else picked for queue in this pass -> backlog drained for current filter.
+        if (selected === 0 || queued === 0) break;
+      }
+
+      setMessage(`Queued backlog (${totalQueued}/${totalSelected}) in ${rounds} batch(es).`);
+      await loadGames();
+    } catch {
+      setMessage("Network error while queueing backlog.");
+    } finally {
+      setActionLoading(false);
+    }
+  }
+
+  async function queueOldestDebug300() {
     setActionLoading(true);
     setMessage("");
     try {
@@ -1949,11 +2000,11 @@ export default function GamesPanel() {
       } else if (json.queueUnavailable) {
         setMessage("Redis queue offline. Start Redis + worker and try again.");
       } else {
-        setMessage(`Queued oldest backlog (${json.queued ?? 0}/${json.selected ?? 0}).`);
+        setMessage(`Debug oldest queued (${json.queued ?? 0}/${json.selected ?? 0}).`);
       }
       await loadGames();
     } catch {
-      setMessage("Network error while queueing oldest backlog.");
+      setMessage("Network error while queueing oldest debug batch.");
     } finally {
       setActionLoading(false);
     }
@@ -2147,10 +2198,18 @@ export default function GamesPanel() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => void queueOldestBacklog()}
+            onClick={() => void queueBacklogAll()}
             disabled={actionLoading || stats.pending === 0}
           >
-            Queue Oldest 300
+            Queue Backlog
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => void queueOldestDebug300()}
+            disabled={actionLoading || stats.pending === 0}
+          >
+            Debug Oldest 300
           </Button>
           <Button variant="primary" size="sm" onClick={() => void openLiveReview()} disabled={reviewLoading || !selectedGameId}>
             {reviewLoading ? "…" : "Live Review"}
