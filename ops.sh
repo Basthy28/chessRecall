@@ -133,6 +133,23 @@ case "${1:-help}" in
     echo "Purge complete for user_id=$2"
     ;;
 
+  db-requeue-analyzed)
+    require_user_id "$1" "$2"
+    echo "Resetting analyzed games for user_id=$2 back to 'failed' (puzzles wiped for clean re-run)..."
+    psql_exec -c "
+      BEGIN;
+      DELETE FROM puzzles
+        WHERE game_id IN (
+          SELECT id FROM games WHERE user_id = '$2'::uuid AND status = 'analyzed'
+        );
+      UPDATE games SET status = 'failed'
+        WHERE user_id = '$2'::uuid AND status = 'analyzed';
+      COMMIT;
+    "
+    psql_exec -c "SELECT count(*) AS games_reset FROM games WHERE user_id = '$2'::uuid AND status = 'failed';"
+    echo "Done. Use the app UI (Queue Backlog) or /api/analyze to re-queue."
+    ;;
+
   help|*)
     cat << 'EOF'
 Chess Recall Operations
@@ -154,9 +171,10 @@ MONITORING:
   ./ops.sh status       Show all service status
 
 DB OPERATIONS (Local Postgres only):
-  ./ops.sh db-users                 List users present in games
-  ./ops.sh db-user-stats <user_id>  Show games/puzzles/cooldowns for a user
-  ./ops.sh db-purge-user <user_id>  Delete local data for a user
+  ./ops.sh db-users                      List users present in games
+  ./ops.sh db-user-stats <user_id>       Show games/puzzles/cooldowns for a user
+  ./ops.sh db-purge-user <user_id>       Delete local data for a user
+  ./ops.sh db-requeue-analyzed <user_id> Reset all analyzed games to failed + wipe their puzzles (re-run analysis)
 
 WORKFLOW EXAMPLE:
   1. Start test:     ./ops.sh test-up

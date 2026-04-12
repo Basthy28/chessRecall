@@ -677,7 +677,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
   },
   {
     connection: redisConnection,
-    concurrency: 3,        // 3 parallel jobs on a 4-CPU machine
+    concurrency: 1,        // engine is a singleton with a shared listener — must be sequential
     lockDuration: 10 * 60 * 1000,
     maxStalledCount: 3,
   }
