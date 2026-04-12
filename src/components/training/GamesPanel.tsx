@@ -1980,35 +1980,6 @@ export default function GamesPanel() {
     }
   }
 
-  async function queueOldestDebug300() {
-    setActionLoading(true);
-    setMessage("");
-    try {
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
-        body: JSON.stringify({
-          platform,
-          order: "oldest",
-          limit: 300,
-          viewerUsernames,
-        }),
-      });
-      const json = (await res.json()) as { selected?: number; queued?: number; queueUnavailable?: boolean; error?: string };
-      if (!res.ok) {
-        setMessage(json.error ?? "Failed to queue oldest backlog games.");
-      } else if (json.queueUnavailable) {
-        setMessage("Redis queue offline. Start Redis + worker and try again.");
-      } else {
-        setMessage(`Debug oldest queued (${json.queued ?? 0}/${json.selected ?? 0}).`);
-      }
-      await loadGames();
-    } catch {
-      setMessage("Network error while queueing oldest debug batch.");
-    } finally {
-      setActionLoading(false);
-    }
-  }
 
   async function recoverStuckGames() {
     const stuckIds = games
@@ -2187,14 +2158,16 @@ export default function GamesPanel() {
           <Button variant="secondary" size="sm" onClick={() => void queueSelectedGame()} disabled={actionLoading || !selectedGameId}>
             {actionLoading ? "…" : selectedGame?.status === "processing" ? "Re-queue (stuck)" : "Queue Analysis"}
           </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => void recoverStuckGames()}
-            disabled={actionLoading || stats.processing === 0}
-          >
-            Recover All Stuck
-          </Button>
+          {stats.processing > 0 && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void recoverStuckGames()}
+              disabled={actionLoading}
+            >
+              Recover All Stuck
+            </Button>
+          )}
           <Button
             variant="secondary"
             size="sm"
@@ -2202,14 +2175,6 @@ export default function GamesPanel() {
             disabled={actionLoading || stats.pending === 0}
           >
             Queue Backlog
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => void queueOldestDebug300()}
-            disabled={actionLoading || stats.pending === 0}
-          >
-            Debug Oldest 300
           </Button>
           <Button variant="primary" size="sm" onClick={() => void openLiveReview()} disabled={reviewLoading || !selectedGameId}>
             {reviewLoading ? "…" : "Live Review"}
