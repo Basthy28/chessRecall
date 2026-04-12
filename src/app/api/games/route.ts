@@ -56,7 +56,10 @@ export async function GET(request: Request): Promise<Response> {
 
   const stats = {
     total: totalCount ?? 0,
-    ...statusCounts,
+    pending: statusCounts.pending,
+    processing: statusCounts.processing,
+    analyzed: statusCounts.analyzed,
+    failed: statusCounts.failed,
   };
 
   return Response.json({ games, stats, platform, nextCursor });
