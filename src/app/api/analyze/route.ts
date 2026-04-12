@@ -8,7 +8,7 @@ const ENQUEUE_CONCURRENCY = 20;
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
 
-type Platform = "lichess" | "chess.com";
+type Platform = "lichess" | "chess.com" | "all";
 
 function normalizeUsername(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -52,7 +52,12 @@ export async function POST(request: Request): Promise<Response> {
     : [];
   if (username) viewerUsernames.push(username);
   const normalizedViewerUsernames = Array.from(new Set(viewerUsernames));
-  const platform: Platform = raw.platform === "chess.com" ? "chess.com" : "lichess";
+  const rawPlatform = typeof raw.platform === "string" ? raw.platform.toLowerCase() : "all";
+  const platform: Platform =
+    rawPlatform === "chess.com" || rawPlatform === "lichess" || rawPlatform === "all"
+      ? (rawPlatform as Platform)
+      : "all";
+  const order: "newest" | "oldest" = raw.order === "oldest" ? "oldest" : "newest";
   const requestedLimit =
     typeof raw.limit === "number" && Number.isFinite(raw.limit)
       ? Math.floor(raw.limit)
@@ -85,6 +90,7 @@ export async function POST(request: Request): Promise<Response> {
     limit,
     username,
     gameIds,
+    order,
   });
   if (rows.length === 0) {
     return Response.json({
@@ -138,5 +144,6 @@ export async function POST(request: Request): Promise<Response> {
     queueUnavailable: false,
     platform,
     limit,
+    order,
   });
 }

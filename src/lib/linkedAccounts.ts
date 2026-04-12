@@ -57,7 +57,7 @@ export async function syncLinkedAccountsToSupabase(
     const supabase = createBrowserClient();
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return;
-    await supabase.from("users").upsert({
+    await (supabase.from("users") as any).upsert({
       id: user.id,
       lichess_username: normalizeUsername(accounts.lichess) || null,
       chess_com_username: normalizeUsername(accounts.chessCom) || null,
@@ -80,11 +80,11 @@ export async function restoreLinkedAccountsFromSupabase(): Promise<LinkedAccount
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return null;
 
-    const { data } = await supabase
+    const { data } = await (supabase
       .from("users")
       .select("lichess_username, chess_com_username")
       .eq("id", user.id)
-      .single();
+      .single() as any);
 
     if (!data) return null;
 

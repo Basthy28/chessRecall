@@ -69,6 +69,8 @@ interface GamesResponse {
 interface ImportResponse {
   imported?: number;
   queued?: number;
+  skippedQueue?: number;
+  analyzeLimit?: number;
   queueUnavailable?: boolean;
   cooldownRemainingMs?: number;
   error?: string;
@@ -1838,7 +1840,14 @@ export default function GamesPanel() {
       if (res.ok) {
         setLastSyncMs(p, username);
         setLastSynced(prev => ({ ...prev, [`${p}_${username}`]: Date.now() }));
-        setMessage(`Synced ${p}: imported ${payload.imported ?? 0}, queued ${payload.queued ?? 0}.`);
+        const skipped = payload.skippedQueue ?? 0;
+        if (skipped > 0) {
+          setMessage(
+            `Synced ${p}: imported ${payload.imported ?? 0}, queued ${payload.queued ?? 0}, skipped ${skipped} (queue limit ${payload.analyzeLimit ?? "n/a"}).`
+          );
+        } else {
+          setMessage(`Synced ${p}: imported ${payload.imported ?? 0}, queued ${payload.queued ?? 0}.`);
+        }
         void loadGames({ silent: true });
       } else if (res.status === 429) {
         const remainingSec = Math.ceil((payload.cooldownRemainingMs ?? MANUAL_SYNC_COOLDOWN_MS) / 1000);
@@ -1875,7 +1884,8 @@ export default function GamesPanel() {
 
   // Poll while there are running jobs. Local storage mode has no Postgres realtime.
   useEffect(() => {
-    if (!hasRunningAnalysis || review) return;
+    // If user expanded the list with "Load more", don't hard-reset it while polling.
+    if (!hasRunningAnalysis || review || games.length > 100) return;
     const timer = setInterval(() => {
       void loadGames({ silent: true });
     }, 4000);
@@ -1883,7 +1893,7 @@ export default function GamesPanel() {
     return () => {
       clearInterval(timer);
     };
-  }, [hasRunningAnalysis, loadGames, review]);
+  }, [hasRunningAnalysis, loadGames, review, games.length]);
 
   async function queueSelectedGame() {
     if (!selectedGameId || !selectedGame) { setMessage("Select a game first."); return; }
@@ -1898,7 +1908,7 @@ export default function GamesPanel() {
         headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
         body: JSON.stringify({
           gameIds: [selectedGameId],
-          platform,
+          platform: selectedPlatform,
           username: selectedUsername,
           viewerUsernames,
         }),
@@ -1914,6 +1924,36 @@ export default function GamesPanel() {
       await loadGames();
     } catch {
       setMessage("Network error while queueing.");
+    } finally {
+      setActionLoading(false);
+    }
+  }
+
+  async function queueOldestBacklog() {
+    setActionLoading(true);
+    setMessage("");
+    try {
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
+        body: JSON.stringify({
+          platform,
+          order: "oldest",
+          limit: 300,
+          viewerUsernames,
+        }),
+      });
+      const json = (await res.json()) as { selected?: number; queued?: number; queueUnavailable?: boolean; error?: string };
+      if (!res.ok) {
+        setMessage(json.error ?? "Failed to queue oldest backlog games.");
+      } else if (json.queueUnavailable) {
+        setMessage("Redis queue offline. Start Redis + worker and try again.");
+      } else {
+        setMessage(`Queued oldest backlog (${json.queued ?? 0}/${json.selected ?? 0}).`);
+      }
+      await loadGames();
+    } catch {
+      setMessage("Network error while queueing oldest backlog.");
     } finally {
       setActionLoading(false);
     }
@@ -2103,6 +2143,14 @@ export default function GamesPanel() {
             disabled={actionLoading || stats.processing === 0}
           >
             Recover All Stuck
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => void queueOldestBacklog()}
+            disabled={actionLoading || stats.pending === 0}
+          >
+            Queue Oldest 300
           </Button>
           <Button variant="primary" size="sm" onClick={() => void openLiveReview()} disabled={reviewLoading || !selectedGameId}>
             {reviewLoading ? "…" : "Live Review"}

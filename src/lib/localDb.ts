@@ -210,6 +210,19 @@ export async function countGamesByUser(userId: string): Promise<number> {
   return Number(rows[0]?.count ?? 0);
 }
 
+export async function countGamesByUserForPlatform(userId: string, platform: Platform): Promise<number> {
+  await ensureSchema();
+  const pool = getPool();
+  const where: string[] = ["g.user_id = $1", platformPredicate(platform)];
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS count
+     FROM games g
+     WHERE ${where.join(" AND ")}`,
+    [userId]
+  );
+  return Number(rows[0]?.count ?? 0);
+}
+
 export async function countPuzzlesByUser(userId: string): Promise<number> {
   await ensureSchema();
   const pool = getPool();
@@ -260,8 +273,19 @@ export async function listGamesPage(params: {
   const where: string[] = ["g.user_id = $1", platformPredicate(params.platform)];
   const values: Array<string | number> = [params.userId];
   if (params.cursorPlayedAt) {
-    values.push(params.cursorPlayedAt);
-    where.push(`g.played_at < $${values.length}`);
+    const [cursorPlayedAt, cursorId] = params.cursorPlayedAt.split("|");
+    if (cursorPlayedAt && cursorId) {
+      values.push(cursorPlayedAt);
+      const playedAtIdx = values.length;
+      values.push(cursorId);
+      const idIdx = values.length;
+      where.push(
+        `(g.played_at < $${playedAtIdx} OR (g.played_at = $${playedAtIdx} AND g.id < $${idIdx}::uuid))`
+      );
+    } else {
+      values.push(params.cursorPlayedAt);
+      where.push(`g.played_at < $${values.length}`);
+    }
   }
   values.push(params.limit);
 
@@ -278,10 +302,11 @@ export async function listGamesPage(params: {
 
 export async function listAnalyzableGames(params: {
   userId: string;
-  platform: Exclude<Platform, "all">;
+  platform: Platform;
   limit: number;
   username: string;
   gameIds: string[];
+  order?: "newest" | "oldest";
 }): Promise<Array<Pick<Game, "id" | "user_id" | "pgn" | "white_username" | "black_username" | "status" | "played_at" | "lichess_game_id">>> {
   await ensureSchema();
   const pool = getPool();
@@ -303,11 +328,12 @@ export async function listAnalyzableGames(params: {
   }
 
   values.push(params.limit);
+  const orderDirection = params.order === "oldest" ? "ASC" : "DESC";
   const { rows } = await pool.query(
     `SELECT g.id, g.user_id, g.pgn, g.white_username, g.black_username, g.status, g.played_at, g.lichess_game_id
      FROM games g
      WHERE ${where.join(" AND ")}
-     ORDER BY g.played_at DESC, g.id DESC
+     ORDER BY g.played_at ${orderDirection}, g.id ${orderDirection}
      LIMIT $${values.length}`,
     values
   );

@@ -1,4 +1,4 @@
-import { countGamesByUser, listGamesPage } from "@/lib/localDb";
+import { countGamesByUserForPlatform, listGamesPage } from "@/lib/localDb";
 import { getUserFromRequest } from "@/lib/supabase";
 
 const PAGE_SIZE = 100;
@@ -41,9 +41,9 @@ export async function GET(request: Request): Promise<Response> {
     status: g.status,
   }));
 
-  const totalCount = await countGamesByUser(userId);
+  const totalCount = await countGamesByUserForPlatform(userId, platform);
   const nextCursor = games.length === PAGE_SIZE
-    ? games[games.length - 1].played_at
+    ? `${games[games.length - 1].played_at}|${games[games.length - 1].id}`
     : null;
 
   const stats = {
