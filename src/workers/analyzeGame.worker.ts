@@ -53,7 +53,6 @@ import type {
   AnalyzeGameJobData,
   AnalyzeGameJobResult,
   GameStatus,
-  MoveClassification,
   Puzzle,
   PuzzlePhase,
 } from "@/types";
@@ -97,16 +96,47 @@ interface EvalResult {
 // ENGINE_MODE=native  → spawn the system `stockfish` binary (5-10x faster, use on cluster)
 // ENGINE_MODE=wasm    → use npm WASM package (default, works anywhere)
 const ENGINE_MODE = (process.env.ENGINE_MODE ?? "wasm") as "native" | "wasm";
-// Default to 3 threads (4 OCPU A1 Flex — leave 1 for OS / Node process).
+// Default to 1 thread so multiple worker jobs/containers can scale without oversubscribing CPU.
 // Override via env: STOCKFISH_THREADS=N
-const STOCKFISH_THREADS = Math.max(1, Number(process.env.STOCKFISH_THREADS ?? "3"));
-// Default to 8 GB hash (machine has 24 GB; large hash cuts transposition misses dramatically).
+const STOCKFISH_THREADS = Math.max(1, Number(process.env.STOCKFISH_THREADS ?? "1"));
+// Keep hash modest per-engine so running multiple workers stays practical.
 // Override via env: STOCKFISH_HASH_MB=N
-const STOCKFISH_HASH_MB = Math.max(64, Number(process.env.STOCKFISH_HASH_MB ?? "8192"));
+const STOCKFISH_HASH_MB = Math.max(64, Number(process.env.STOCKFISH_HASH_MB ?? "512"));
 const STOCKFISH_PATH = process.env.STOCKFISH_PATH ?? "/usr/games/stockfish";
-// Use movetime (ms) when > 0, otherwise fall back to depth. Defaulting to 1000ms gives much deeper endgame analysis.
-const STOCKFISH_MOVETIME_MS = Number(process.env.STOCKFISH_MOVETIME_MS ?? "1000");
+// Legacy env keeps backward compatibility: when set, it drives both scan and validation phases.
+const LEGACY_STOCKFISH_MOVETIME_MS = process.env.STOCKFISH_MOVETIME_MS
+  ? Number(process.env.STOCKFISH_MOVETIME_MS)
+  : null;
+// Fast scan over every position.
+const STOCKFISH_SCAN_MOVETIME_MS = Math.max(
+  0,
+  Number(process.env.STOCKFISH_SCAN_MOVETIME_MS ?? LEGACY_STOCKFISH_MOVETIME_MS ?? "700")
+);
+// Deeper re-check only on puzzle candidates.
+const STOCKFISH_VALIDATION_MOVETIME_MS = Math.max(
+  0,
+  Number(
+    process.env.STOCKFISH_VALIDATION_MOVETIME_MS ??
+    LEGACY_STOCKFISH_MOVETIME_MS ??
+    "1400"
+  )
+);
 const ENV_DEPTH = process.env.ANALYSIS_DEPTH ? Number(process.env.ANALYSIS_DEPTH) : null;
+const WORKER_CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY ?? "1"));
+const PUZZLE_MIN_EVAL_DROP_CP = Math.max(
+  1,
+  Number(process.env.PUZZLE_MIN_EVAL_DROP_CP ?? DEFAULT_VALIDATOR_CONFIG.minEvalDrop)
+);
+const PUZZLE_MIN_SOLUTION_GAP_CP = Math.max(
+  1,
+  Number(process.env.PUZZLE_MIN_SOLUTION_GAP_CP ?? DEFAULT_VALIDATOR_CONFIG.minSolutionGap)
+);
+const PUZZLE_MIN_WIN_CHANCE = Math.min(
+  1,
+  Math.max(0, Number(process.env.PUZZLE_MIN_WIN_CHANCE ?? "0.12"))
+);
+const MATE_SCORE = 100_000;
+const MATE_THRESHOLD = 90_000;
 
 // ── Save native fetch before Stockfish ASM can nullify it ──────────
 // The Stockfish emscripten ASM module sets globalThis.fetch = null in
@@ -132,15 +162,6 @@ try {
 } catch {
   console.warn("[worker] Could not load ecoBook.json — book classification disabled");
 }
-
-function lookupEco(fen: string): EcoEntry | null {
-  const key = fen.split(" ").slice(0, 4).join(" ");
-  return _ecoMap.get(key) ?? null;
-}
-
-// ── Stockfish singleton ─────────────────────────────────────────────
-// The ASM module can only be initialized once per process.
-let _sharedEngine: StockfishEngine | null = null;
 
 // ── Redis connection ────────────────────────────────────────────────
 function createWorkerRedis(): IORedis {
@@ -218,7 +239,13 @@ async function validatePuzzleLine(
       const currentFen = chess.fen();
       try {
         // MultiPV=2 to check for alternatives
-        const ev = await evaluatePosition(engine, currentFen, engineDepth, 2, STOCKFISH_MOVETIME_MS);
+        const ev = await evaluatePosition(
+          engine,
+          currentFen,
+          engineDepth,
+          2,
+          STOCKFISH_VALIDATION_MOVETIME_MS
+        );
         
         // If the engine no longer likes this move, the sequence is unstable.
         if (ev.best.move !== moveUci) {
@@ -276,6 +303,9 @@ function spawnNativeEngine(): StockfishEngine {
     sendCommand(cmd: string) {
       proc.stdin.write(cmd + "\n");
     },
+    terminate() {
+      proc.kill();
+    },
   };
 
   proc.stdout.on("data", (chunk: Buffer) => {
@@ -300,24 +330,23 @@ function spawnNativeEngine(): StockfishEngine {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stockfish init — singleton per process
+// Stockfish init — one engine per job
 // ─────────────────────────────────────────────────────────────────────────────
 async function initStockfish(): Promise<StockfishEngine> {
-  if (_sharedEngine) {
-    _sharedEngine.sendCommand("ucinewgame");
-    return _sharedEngine;
-  }
-
   let engine: StockfishEngine;
 
   if (ENGINE_MODE === "native") {
     // Native binary — fastest, use on the Oracle cluster after `apt install stockfish`
-    console.log(`[worker] Stockfish: native binary, threads=${STOCKFISH_THREADS} hash=${STOCKFISH_HASH_MB}MB movetime=${STOCKFISH_MOVETIME_MS}ms`);
+    console.log(
+      `[worker] Stockfish: native binary, threads=${STOCKFISH_THREADS} hash=${STOCKFISH_HASH_MB}MB scan=${STOCKFISH_SCAN_MOVETIME_MS}ms validate=${STOCKFISH_VALIDATION_MOVETIME_MS}ms drop=${PUZZLE_MIN_EVAL_DROP_CP}cp gap=${PUZZLE_MIN_SOLUTION_GAP_CP}cp`
+    );
     engine = spawnNativeEngine();
   } else {
     // WASM fallback — works anywhere without installing anything
     const engineVariant = STOCKFISH_THREADS > 1 ? "full" : "lite-single";
-    console.log(`[worker] Stockfish: WASM/${engineVariant} threads=${STOCKFISH_THREADS} hash=${STOCKFISH_HASH_MB}MB movetime=${STOCKFISH_MOVETIME_MS}ms`);
+    console.log(
+      `[worker] Stockfish: WASM/${engineVariant} threads=${STOCKFISH_THREADS} hash=${STOCKFISH_HASH_MB}MB scan=${STOCKFISH_SCAN_MOVETIME_MS}ms validate=${STOCKFISH_VALIDATION_MOVETIME_MS}ms drop=${PUZZLE_MIN_EVAL_DROP_CP}cp gap=${PUZZLE_MIN_SOLUTION_GAP_CP}cp`
+    );
     engine = await initEngine(engineVariant);
 
     // Restore fetch if Stockfish ASM nullified it
@@ -350,8 +379,44 @@ async function initStockfish(): Promise<StockfishEngine> {
     engine.sendCommand("isready");
   });
 
-  _sharedEngine = engine;
+  engine.sendCommand("ucinewgame");
   return engine;
+}
+
+function isMateScore(score: number): boolean {
+  return Math.abs(score) >= MATE_THRESHOLD;
+}
+
+function getTerminalEval(fen: string): EvalResult | null {
+  try {
+    const chess = new Chess(fen);
+    if (!chess.isGameOver()) return null;
+
+    const score = chess.isCheckmate() ? -MATE_SCORE : 0;
+    return {
+      best: {
+        move: "",
+        score,
+        pv: [],
+      },
+      second: null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getPlayedScoreCp(evalAfter: EvalResult): number {
+  return -evalAfter.best.score;
+}
+
+function getSolutionGapCp(evalBefore: EvalResult): number {
+  if (evalBefore.second === null) return MATE_SCORE;
+  return evalBefore.best.score - evalBefore.second.score;
+}
+
+function isOnlyMoveOrMate(evalBefore: EvalResult, minSolutionGap: number): boolean {
+  return isMateScore(evalBefore.best.score) || getSolutionGapCp(evalBefore) >= minSolutionGap;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,6 +430,9 @@ async function evaluatePosition(
   multiPv: number,
   movetimeMs = 0  // when > 0, use movetime instead of depth (cluster mode)
 ): Promise<EvalResult> {
+  const terminalEval = getTerminalEval(fen);
+  if (terminalEval) return terminalEval;
+
   return new Promise<EvalResult>((resolve, reject) => {
     const timeout = setTimeout(
       () => reject(new Error(`evaluatePosition timeout for FEN: ${fen}`)),
@@ -416,7 +484,7 @@ async function evaluatePosition(
       } else if (line.startsWith("bestmove")) {
         clearTimeout(timeout);
         if (pvBest.size === 0) {
-          reject(new Error(`No eval data for FEN: ${fen.slice(0, 40)}`));
+          reject(new Error(`No eval data for FEN: ${fen}`));
           return;
         }
         const best = pvBest.get(1);
@@ -486,6 +554,42 @@ function detectPhase(fen: string, moveNumber: number): PuzzlePhase {
   return "middlegame";
 }
 
+function isPuzzleCandidate(params: {
+  evalBefore: EvalResult;
+  evalAfter: EvalResult;
+  minEvalDrop: number;
+  minSolutionGap: number;
+  minWinChance: number;
+}): boolean {
+  const { evalBefore, evalAfter, minEvalDrop, minSolutionGap, minWinChance } = params;
+
+  if (!isOnlyMoveOrMate(evalBefore, minSolutionGap)) return false;
+
+  const bestScore = evalBefore.best.score;
+  const playedScore = getPlayedScoreCp(evalAfter);
+  const evalDropCp = bestScore - playedScore;
+  const winBefore = getExpectedPoints(bestScore);
+
+  const bestIsWinningMate = isMateScore(bestScore) && bestScore > 0;
+  const playedIsLosingMate = isMateScore(playedScore) && playedScore < 0;
+  const playedStillWinningMate = isMateScore(playedScore) && playedScore > 0;
+  const missedWinningMate = bestIsWinningMate && !playedStillWinningMate;
+
+  // Keep some defensive/comeback puzzles out when the position was already dead,
+  // but always keep tactical mates and self-mates.
+  if (
+    winBefore < minWinChance &&
+    !bestIsWinningMate &&
+    !playedIsLosingMate
+  ) {
+    return false;
+  }
+
+  if (missedWinningMate || playedIsLosingMate) return true;
+
+  return evalDropCp >= minEvalDrop;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Worker
 // ─────────────────────────────────────────────────────────────────────────────
@@ -513,6 +617,8 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
       const config = {
         ...DEFAULT_VALIDATOR_CONFIG,
         ...(ENV_DEPTH !== null ? { analysisDepth: ENV_DEPTH } : {}),
+        minEvalDrop: PUZZLE_MIN_EVAL_DROP_CP,
+        minSolutionGap: PUZZLE_MIN_SOLUTION_GAP_CP,
       };
       const playerTurn = playerColor === "white" ? "w" : "b";
 
@@ -537,7 +643,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
             positions[i].fen,
             config.analysisDepth,
             config.multiPv,
-            STOCKFISH_MOVETIME_MS
+            STOCKFISH_SCAN_MOVETIME_MS
           );
         } catch (err) {
           console.warn(
@@ -567,28 +673,20 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           : false;
         const baseClass = classifyMove(prevScoreWhite, currentScoreWhite, pos.turn, sacrifice, legalMoveCount);
 
-        // Calculate expected points for db puzzle (winBest / winAfter drops)
-        const winBest = getExpectedPoints(evalBefore.best.score); // From the worker pov, evalBefore is side-to-move!
-        const winAfter = getExpectedPoints(-evalAfter.best.score);
+        const playedScore = getPlayedScoreCp(evalAfter);
 
         // ── Step 5: Create SRS puzzles (player turns only) ───────────────
         if (pos.turn !== playerTurn) continue;
 
-        const isBlunder = baseClass === "blunder";
+        const isPuzzle = isPuzzleCandidate({
+          evalBefore,
+          evalAfter,
+          minEvalDrop: config.minEvalDrop,
+          minSolutionGap: config.minSolutionGap,
+          minWinChance: PUZZLE_MIN_WIN_CHANCE,
+        });
 
-        if (!isBlunder) continue;
-
-        // Skip puzzles from already-hopeless positions.
-        // If the player had < 15% win chance before the move, the game was
-        // already decided — training on these doesn't build useful pattern memory.
-        const MIN_WIN_CHANCE_FOR_PUZZLE = 0.15; // 15%
-        if (winBest < MIN_WIN_CHANCE_FOR_PUZZLE) continue;
-
-        // For blunders: enforce Only-Winning-Move rule (gap between best and 2nd-best)
-        if (isBlunder && evalBefore.second !== null) {
-          const solutionGap = evalBefore.best.score - evalBefore.second.score;
-          if (solutionGap < config.minSolutionGap) continue;
-        }
+        if (!isPuzzle) continue;
 
         let solutionSan: string;
         let solutionLineSan: string[];
@@ -612,7 +710,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         }
 
         const phase = detectPhase(pos.fen, pos.moveNumber);
-        const evalDrop = Math.round((winBest - winAfter) * 1000);
+        const evalDrop = Math.max(0, Math.round(evalBefore.best.score - playedScore));
 
         const puzzle: Omit<Puzzle, "id" | "created_at"> = {
           game_id: gameId,
@@ -625,8 +723,8 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           solution_line_san: solutionLineSan,
           is_brilliant: false,
 
-          eval_before: Math.round(winBest * 10000),
-          eval_after: Math.round(winAfter * 10000),
+          eval_before: Math.round(evalBefore.best.score),
+          eval_after: Math.round(playedScore),
           eval_best: evalBefore.best.score,
           eval_second_best: evalBefore.second?.score ?? null,
           eval_drop: evalDrop,
@@ -647,7 +745,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           await insertPuzzle(puzzle);
           puzzlesValidated++;
           console.log(
-            `[worker] ${isBlunder ? "Blunder" : "Miss"} puzzle at ply ${i + 1} (drop=${evalDrop})`
+            `[worker] Puzzle at ply ${i + 1} (class=${baseClass}, drop=${evalDrop}, gap=${getSolutionGapCp(evalBefore)})`
           );
         } catch (insertErr) {
           console.error(
@@ -671,13 +769,13 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
       await setGameStatus(gameId, "failed");
       throw err;
     } finally {
-      // Do NOT destroy the engine — singleton reused across all jobs.
+      engine?.terminate?.();
       engine = null;
     }
   },
   {
     connection: redisConnection,
-    concurrency: 1,        // engine is a singleton with a shared listener — must be sequential
+    concurrency: WORKER_CONCURRENCY,
     lockDuration: 10 * 60 * 1000,
     maxStalledCount: 3,
   }
@@ -703,4 +801,6 @@ worker.on("error", (err) => {
 // ── Auto-sync: import new games for all users on a 1h cadence ─────────────
 startAutoSync();
 
-console.log(`[worker] Started — listening on queue "${ANALYZE_QUEUE_NAME}"`);
+console.log(
+  `[worker] Started — listening on queue "${ANALYZE_QUEUE_NAME}" with concurrency=${WORKER_CONCURRENCY}, threads=${STOCKFISH_THREADS}, hash=${STOCKFISH_HASH_MB}MB, scan=${STOCKFISH_SCAN_MOVETIME_MS}ms, validate=${STOCKFISH_VALIDATION_MOVETIME_MS}ms, drop=${PUZZLE_MIN_EVAL_DROP_CP}cp, gap=${PUZZLE_MIN_SOLUTION_GAP_CP}cp`
+);

@@ -1,4 +1,9 @@
-import { applyPuzzleSrsRating, listDuePuzzlesForUser, resetPuzzleSrsForUser } from "@/lib/localDb";
+import {
+  applyPuzzleSrsRating,
+  getPuzzleProgressStatsForUser,
+  listDuePuzzlesForUser,
+  resetPuzzleSrsForUser,
+} from "@/lib/localDb";
 import { getUserFromRequest } from "@/lib/supabase";
 
 const DEFAULT_LIMIT = 20;
@@ -24,7 +29,8 @@ export async function GET(request: Request): Promise<Response> {
 
   const now = new Date().toISOString();
   const puzzles = await listDuePuzzlesForUser(sessionUser.id, parseLimit(request), now);
-  return Response.json({ puzzles });
+  const stats = await getPuzzleProgressStatsForUser(sessionUser.id, now);
+  return Response.json({ puzzles, stats });
 }
 
 export async function PATCH(request: Request): Promise<Response> {
@@ -48,6 +54,11 @@ export async function PATCH(request: Request): Promise<Response> {
   const raw = body as Record<string, unknown>;
   const puzzleId = typeof raw.puzzleId === "string" ? raw.puzzleId : "";
   const choice = raw.choice;
+  const revealed = raw.revealed === true;
+  const mistakes =
+    typeof raw.mistakes === "number" && Number.isFinite(raw.mistakes)
+      ? Math.max(0, Math.floor(raw.mistakes))
+      : 0;
 
   if (!puzzleId) {
     return Response.json({ error: "Missing puzzleId" }, { status: 400 });
@@ -57,12 +68,16 @@ export async function PATCH(request: Request): Promise<Response> {
     return Response.json({ error: "Invalid choice" }, { status: 400 });
   }
 
-  const ok = await applyPuzzleSrsRating(sessionUser.id, puzzleId, choice);
+  const ok = await applyPuzzleSrsRating(sessionUser.id, puzzleId, choice, {
+    revealed,
+    mistakes,
+  });
   if (!ok) {
     return Response.json({ error: "Puzzle not found" }, { status: 404 });
   }
 
-  return Response.json({ ok: true });
+  const stats = await getPuzzleProgressStatsForUser(sessionUser.id, new Date().toISOString());
+  return Response.json({ ok: true, stats });
 }
 
 export async function DELETE(request: Request): Promise<Response> {
@@ -77,5 +92,6 @@ export async function DELETE(request: Request): Promise<Response> {
   }
 
   const count = await resetPuzzleSrsForUser(sessionUser.id);
-  return Response.json({ reset: count });
+  const stats = await getPuzzleProgressStatsForUser(sessionUser.id, new Date().toISOString());
+  return Response.json({ reset: count, stats });
 }

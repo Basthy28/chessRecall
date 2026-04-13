@@ -81,7 +81,27 @@ export interface Puzzle {
   srs_ease: number; // SM-2 ease factor, starts at 2.5
   last_reviewed_at: string | null;
 
+  // Associated game metadata (joined when useful for UI)
+  game_lichess_id?: string | null;
+  game_white_username?: string | null;
+  game_black_username?: string | null;
+  game_played_at?: string | null;
+  game_time_control?: string | null;
+  game_result?: GameResult | null;
+
   created_at: string;
+}
+
+export interface PuzzleProgressStats {
+  total: number;
+  due_now: number;
+  unseen: number;
+  learning: number;
+  mastered: number;
+  reviewed: number;
+  total_attempts: number;
+  total_correct: number;
+  accuracy: number;
 }
 
 // ------------------------------------------------------------------
@@ -173,8 +193,8 @@ export interface PuzzleValidatorConfig {
 }
 
 export const DEFAULT_VALIDATOR_CONFIG: PuzzleValidatorConfig = {
-  minEvalDrop: 150,
-  minSolutionGap: 100,
+  minEvalDrop: 180,
+  minSolutionGap: 120,
   analysisDepth: 22,
   multiPv: 3,
 };

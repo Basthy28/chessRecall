@@ -20,10 +20,11 @@ export async function GET(request: Request): Promise<Response> {
     platformParam === "chess.com" || platformParam === "lichess" || platformParam === "all"
       ? (platformParam as Platform)
       : "all";
+  const searchQuery = (url.searchParams.get("q") ?? "").trim();
 
   const [total, statusCounts] = await Promise.all([
-    countGamesByUserForPlatform(sessionUser.id, platform),
-    countGamesByStatusForPlatform(sessionUser.id, platform),
+    countGamesByUserForPlatform(sessionUser.id, platform, searchQuery),
+    countGamesByStatusForPlatform(sessionUser.id, platform, searchQuery),
   ]);
 
   return Response.json({ total, ...statusCounts });

@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-import type { Game, GameStatus, Puzzle } from "@/types";
+import type { Game, GameStatus, Puzzle, PuzzleProgressStats } from "@/types";
 
 type Platform = "lichess" | "chess.com" | "all";
 type SrsChoice = "hard" | "good" | "easy";
@@ -144,6 +144,12 @@ function mapPuzzle(row: Record<string, unknown>): Puzzle {
     srs_due_at: row.srs_due_at ? new Date(String(row.srs_due_at)).toISOString() : null,
     srs_ease: Number(row.srs_ease),
     last_reviewed_at: row.last_reviewed_at ? new Date(String(row.last_reviewed_at)).toISOString() : null,
+    game_lichess_id: row.game_lichess_id ? String(row.game_lichess_id) : null,
+    game_white_username: row.game_white_username ? String(row.game_white_username) : null,
+    game_black_username: row.game_black_username ? String(row.game_black_username) : null,
+    game_played_at: row.game_played_at ? new Date(String(row.game_played_at)).toISOString() : null,
+    game_time_control: row.game_time_control ? String(row.game_time_control) : null,
+    game_result: (row.game_result as Puzzle["game_result"]) ?? null,
     created_at: new Date(String(row.created_at)).toISOString(),
   };
 }
@@ -210,31 +216,53 @@ export async function countGamesByUser(userId: string): Promise<number> {
   return Number(rows[0]?.count ?? 0);
 }
 
-export async function countGamesByUserForPlatform(userId: string, platform: Platform): Promise<number> {
+export async function countGamesByUserForPlatform(
+  userId: string,
+  platform: Platform,
+  searchQuery?: string
+): Promise<number> {
   await ensureSchema();
   const pool = getPool();
   const where: string[] = ["g.user_id = $1", platformPredicate(platform)];
+  const values: Array<string | number> = [userId];
+  buildPlayerSearchClause(searchQuery, where, values);
   const { rows } = await pool.query(
     `SELECT count(*)::int AS count
      FROM games g
      WHERE ${where.join(" AND ")}`,
-    [userId]
+    values
   );
   return Number(rows[0]?.count ?? 0);
 }
 
+function buildPlayerSearchClause(
+  searchQuery: string | undefined,
+  where: string[],
+  values: Array<string | number>
+): void {
+  const normalized = searchQuery?.trim().toLowerCase() ?? "";
+  if (!normalized) return;
+  values.push(`%${normalized}%`);
+  const idx = values.length;
+  where.push(`(lower(g.white_username) LIKE $${idx} OR lower(g.black_username) LIKE $${idx})`);
+}
+
 export async function countGamesByStatusForPlatform(
   userId: string,
-  platform: Platform
+  platform: Platform,
+  searchQuery?: string
 ): Promise<{ pending: number; processing: number; analyzed: number; failed: number }> {
   await ensureSchema();
   const pool = getPool();
+  const where: string[] = ["g.user_id = $1", platformPredicate(platform)];
+  const values: Array<string | number> = [userId];
+  buildPlayerSearchClause(searchQuery, where, values);
   const { rows } = await pool.query(
     `SELECT status, count(*)::int AS count
      FROM games g
-     WHERE g.user_id = $1 AND ${platformPredicate(platform)}
+     WHERE ${where.join(" AND ")}
      GROUP BY status`,
-    [userId]
+    values
   );
   const out = { pending: 0, processing: 0, analyzed: 0, failed: 0 };
   for (const row of rows) {
@@ -288,11 +316,13 @@ export async function listGamesPage(params: {
   platform: Platform;
   cursorPlayedAt: string | null;
   limit: number;
+  searchQuery?: string;
 }): Promise<Game[]> {
   await ensureSchema();
   const pool = getPool();
   const where: string[] = ["g.user_id = $1", platformPredicate(params.platform)];
   const values: Array<string | number> = [params.userId];
+  buildPlayerSearchClause(params.searchQuery, where, values);
   if (params.cursorPlayedAt) {
     const [cursorPlayedAt, cursorId] = params.cursorPlayedAt.split("|");
     if (cursorPlayedAt && cursorId) {
@@ -451,8 +481,16 @@ export async function listDuePuzzlesForUser(userId: string, limit: number, nowIs
   await ensureSchema();
   const pool = getPool();
   const { rows } = await pool.query(
-    `SELECT *
+    `SELECT
+       p.*,
+       g.lichess_game_id AS game_lichess_id,
+       g.white_username AS game_white_username,
+       g.black_username AS game_black_username,
+       g.played_at AS game_played_at,
+       g.time_control AS game_time_control,
+       g.result AS game_result
      FROM puzzles p
+     JOIN games g ON g.id = p.game_id
      WHERE p.user_id = $1
        AND (p.srs_due_at IS NULL OR p.srs_due_at <= $2)
      ORDER BY p.srs_due_at ASC NULLS FIRST
@@ -462,12 +500,59 @@ export async function listDuePuzzlesForUser(userId: string, limit: number, nowIs
   return rows.map((row) => mapPuzzle(row as Record<string, unknown>));
 }
 
+export async function getPuzzleProgressStatsForUser(
+  userId: string,
+  nowIso: string
+): Promise<PuzzleProgressStats> {
+  await ensureSchema();
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT
+       count(*)::int AS total,
+       count(*) FILTER (WHERE srs_due_at IS NULL OR srs_due_at <= $2)::int AS due_now,
+       count(*) FILTER (WHERE times_seen = 0)::int AS unseen,
+       count(*) FILTER (
+         WHERE times_seen > 0
+           AND (srs_due_at IS NULL OR srs_due_at < ($2::timestamptz + interval '60 days'))
+       )::int AS learning,
+       count(*) FILTER (WHERE srs_due_at >= ($2::timestamptz + interval '60 days'))::int AS mastered,
+       count(*) FILTER (WHERE times_seen > 0)::int AS reviewed,
+       coalesce(sum(times_seen), 0)::int AS total_attempts,
+       coalesce(sum(times_correct), 0)::int AS total_correct
+     FROM puzzles
+     WHERE user_id = $1`,
+    [userId, nowIso]
+  );
+  const row = (rows[0] ?? {}) as Record<string, unknown>;
+  const totalAttempts = Number(row.total_attempts ?? 0);
+  const totalCorrect = Number(row.total_correct ?? 0);
+
+  return {
+    total: Number(row.total ?? 0),
+    due_now: Number(row.due_now ?? 0),
+    unseen: Number(row.unseen ?? 0),
+    learning: Number(row.learning ?? 0),
+    mastered: Number(row.mastered ?? 0),
+    reviewed: Number(row.reviewed ?? 0),
+    total_attempts: totalAttempts,
+    total_correct: totalCorrect,
+    accuracy: totalAttempts > 0 ? totalCorrect / totalAttempts : 0,
+  };
+}
+
 // Interval at which a puzzle is considered "mastered" and stops appearing.
 const RETIRE_INTERVAL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 
-export async function applyPuzzleSrsRating(userId: string, puzzleId: string, choice: SrsChoice): Promise<boolean> {
+export async function applyPuzzleSrsRating(
+  userId: string,
+  puzzleId: string,
+  choice: SrsChoice,
+  options?: { revealed?: boolean; mistakes?: number }
+): Promise<boolean> {
   await ensureSchema();
   const pool = getPool();
+  const revealed = options?.revealed === true;
+  const mistakes = Math.max(0, Math.floor(options?.mistakes ?? 0));
 
   // Fetch current puzzle state to compute SM-2 style next interval.
   const { rows: puzzleRows } = await pool.query(
@@ -505,20 +590,29 @@ export async function applyPuzzleSrsRating(userId: string, puzzleId: string, cho
       break;
   }
 
+  if (revealed) {
+    nextIntervalMs = Math.min(nextIntervalMs, 12 * 60 * 60 * 1000);
+    nextEase = Math.max(1.3, nextEase - 0.25);
+  } else if (mistakes > 0) {
+    nextIntervalMs = Math.max(30 * 60 * 1000, nextIntervalMs * 0.6);
+    nextEase = Math.max(1.3, nextEase - Math.min(0.18, mistakes * 0.05));
+  }
+
   // Graduation: if the next interval would exceed 90 days the puzzle is mastered.
   // Set srs_due_at exactly 90 days from now — it will resurface rarely as a refresher,
   // but since listDuePuzzlesForUser orders by srs_due_at ASC, it will never crowd out active puzzles.
   const dueAt = new Date(Date.now() + Math.min(nextIntervalMs, RETIRE_INTERVAL_MS)).toISOString();
 
+  const earnedCorrect = !revealed && mistakes === 0 ? 1 : 0;
   const { rowCount } = await pool.query(
     `UPDATE puzzles
      SET times_seen = times_seen + 1,
-         times_correct = times_correct + 1,
-         srs_ease = $1,
-         srs_due_at = $2,
+         times_correct = times_correct + $1,
+         srs_ease = $2,
+         srs_due_at = $3,
          last_reviewed_at = now()
-     WHERE id = $3 AND user_id = $4`,
-    [nextEase.toFixed(4), dueAt, puzzleId, userId]
+     WHERE id = $4 AND user_id = $5`,
+    [earnedCorrect, nextEase.toFixed(4), dueAt, puzzleId, userId]
   );
 
   return (rowCount ?? 0) > 0;

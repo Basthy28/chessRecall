@@ -10,6 +10,12 @@ import IORedis from "ioredis";
 import type { AnalyzeGameJobData, AnalyzeGameJobResult } from "@/types";
 import { ANALYZE_QUEUE_NAME } from "@/lib/constants";
 
+interface EnqueueOptions {
+  force?: boolean;
+}
+
+const FORCE_REQUEUE_LOCK_TTL_MS = 60_000;
+
 function createRedisClient(options: {
   connectTimeout: number;
   maxRetriesPerRequest: number | null;
@@ -66,16 +72,35 @@ export function getAnalyzeQueue(): Queue<AnalyzeGameJobData, AnalyzeGameJobResul
   return _queue;
 }
 
-export async function enqueueGameAnalysis(data: AnalyzeGameJobData): Promise<string> {
+export async function enqueueGameAnalysis(
+  data: AnalyzeGameJobData,
+  options?: EnqueueOptions
+): Promise<string> {
   const queue = getAnalyzeQueue();
+  const force = options?.force === true;
+  const jobId = force
+    ? `game-${data.gameId}-retry-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    : `game-${data.gameId}`;
   const job = await queue.add("analyze", data, {
-    jobId: `game-${data.gameId}`,   // stable ID — BullMQ ignores duplicates
+    jobId,
     attempts: 3,
     backoff: { type: "exponential", delay: 5000 },
     removeOnComplete: { count: 100 },
     removeOnFail: { count: 50 },
   });
   return job.id!;
+}
+
+export async function reserveForcedRequeueSlot(gameId: string): Promise<boolean> {
+  const key = `analyze:force-requeue:${gameId}`;
+  const result = await getRedis().set(
+    key,
+    String(Date.now()),
+    "PX",
+    FORCE_REQUEUE_LOCK_TTL_MS,
+    "NX"
+  );
+  return result === "OK";
 }
 
 export async function isRedisQueueAvailable(timeoutMs: number = 5000): Promise<boolean> {

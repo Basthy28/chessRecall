@@ -1,6 +1,6 @@
 import { listAnalyzableGames, updateGameStatusByIds } from "@/lib/localDb";
 import { getUserFromRequest } from "@/lib/supabase";
-import { enqueueGameAnalysis, isRedisQueueAvailable } from "@/lib/queue";
+import { enqueueGameAnalysis, isRedisQueueAvailable, reserveForcedRequeueSlot } from "@/lib/queue";
 import type { AnalyzeGameJobData } from "@/types";
 
 const ENQUEUE_TIMEOUT_MS = 8000;
@@ -26,9 +26,12 @@ function inferPlayerColor(
   return "white";
 }
 
-async function enqueueWithTimeout(jobData: AnalyzeGameJobData): Promise<void> {
+async function enqueueWithTimeout(
+  jobData: AnalyzeGameJobData,
+  options?: { force?: boolean }
+): Promise<void> {
   await Promise.race([
-    enqueueGameAnalysis(jobData),
+    enqueueGameAnalysis(jobData, { force: options?.force === true }),
     new Promise<never>((_, reject) => {
       setTimeout(() => {
         reject(new Error(`Queue enqueue timed out after ${ENQUEUE_TIMEOUT_MS}ms`));
@@ -63,6 +66,7 @@ export async function POST(request: Request): Promise<Response> {
       ? Math.floor(raw.limit)
       : DEFAULT_LIMIT;
   const limit = Math.max(1, Math.min(requestedLimit, MAX_LIMIT));
+  const forceRequeue = raw.forceRequeue === true;
   const gameIds = Array.isArray(raw.gameIds)
     ? raw.gameIds.filter((id): id is string => typeof id === "string" && id.length > 0)
     : [];
@@ -120,11 +124,21 @@ export async function POST(request: Request): Promise<Response> {
 
   const queuedIds: string[] = [];
   let failures = 0;
+  let skipped = 0;
 
   for (let i = 0; i < rows.length; i += ENQUEUE_CONCURRENCY) {
     const batch = rows.slice(i, i + ENQUEUE_CONCURRENCY);
     const results = await Promise.allSettled(
       batch.map(async (row) => {
+        const shouldForce = forceRequeue || row.status === "processing" || row.status === "failed";
+        if (shouldForce) {
+          const reserved = await reserveForcedRequeueSlot(row.id);
+          if (!reserved) {
+            skipped++;
+            return;
+          }
+        }
+
         const playerColor: "white" | "black" =
           inferPlayerColor(row.white_username, row.black_username, normalizedViewerUsernames);
 
@@ -135,7 +149,7 @@ export async function POST(request: Request): Promise<Response> {
           playerColor,
         };
 
-        await enqueueWithTimeout(jobData);
+        await enqueueWithTimeout(jobData, { force: shouldForce });
         queuedIds.push(row.id);
       })
     );
@@ -156,6 +170,7 @@ export async function POST(request: Request): Promise<Response> {
   return Response.json({
     selected: rows.length,
     queued: queuedIds.length,
+    skipped,
     queueMode: gameIds.length > 0 ? "selection" : "backlog",
     queueUnavailable: false,
     platform,

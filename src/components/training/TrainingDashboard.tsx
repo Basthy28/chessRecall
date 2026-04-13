@@ -6,7 +6,7 @@ import TrainingQueue from "@/components/training/TrainingQueue";
 import GamesPanel from "@/components/training/GamesPanel";
 import PuzzleTrainer from "@/components/training/PuzzleTrainer";
 import Button from "@/components/ui/Button";
-import AuthModal from "@/components/auth/AuthModal";
+import AuthModal, { type AuthModalMode } from "@/components/auth/AuthModal";
 import { useAuth } from "@/hooks/useAuth";
 import { createBrowserClient } from "@/lib/supabase";
 import {
@@ -179,6 +179,7 @@ const SRS_BUTTONS = [
 export default function TrainingDashboard() {
   const { userId, userEmail, loading: authLoading } = useAuth();
   const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authModalMode, setAuthModalMode] = useState<AuthModalMode>("signin");
   const [activePuzzle, setActivePuzzle] = useState<Puzzle | null>(
     MOCK_PUZZLES[0] ?? null
   );
@@ -187,6 +188,7 @@ export default function TrainingDashboard() {
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [chessComAvatar, setChessComAvatar] = useState<string | null>(null);
+  const [requestedReviewGameId, setRequestedReviewGameId] = useState<string | null>(null);
 
   // Fetch chess.com avatar from linked account
   useEffect(() => {
@@ -220,6 +222,19 @@ export default function TrainingDashboard() {
     await supabase.auth.signOut();
   }, []);
 
+  useEffect(() => {
+    const supabase = createBrowserClient();
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event) => {
+      if (event === "PASSWORD_RECOVERY") {
+        setAuthModalMode("reset");
+        setShowAuthModal(true);
+      }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
   return (
     <div
       style={{
@@ -232,6 +247,7 @@ export default function TrainingDashboard() {
     >
       {showAuthModal && (
         <AuthModal
+          initialMode={authModalMode}
           onAuthSuccess={handleAuthSuccess}
           onDismiss={() => setShowAuthModal(false)}
         />
@@ -367,7 +383,10 @@ export default function TrainingDashboard() {
               </div>
             ) : (
               <button
-                onClick={() => setShowAuthModal(true)}
+                onClick={() => {
+                  setAuthModalMode("signup");
+                  setShowAuthModal(true);
+                }}
                 style={{
                   padding: "6px 14px",
                   borderRadius: "6px",
@@ -421,7 +440,10 @@ export default function TrainingDashboard() {
             </div>
           </div>
           <button
-            onClick={() => setShowAuthModal(true)}
+            onClick={() => {
+              setAuthModalMode("signin");
+              setShowAuthModal(true);
+            }}
             style={{
               padding: "9px 24px",
               borderRadius: "8px",
@@ -461,9 +483,17 @@ export default function TrainingDashboard() {
         }}
       >
         {activeNav === "games" ? (
-          <GamesPanel />
+          <GamesPanel
+            requestedReviewGameId={requestedReviewGameId}
+            onRequestedReviewHandled={() => setRequestedReviewGameId(null)}
+          />
         ) : (
-          <PuzzleTrainer />
+          <PuzzleTrainer
+            onOpenGameReview={(gameId) => {
+              setRequestedReviewGameId(gameId);
+              setActiveNav("games");
+            }}
+          />
         )}
       </main>
       )}

@@ -27,12 +27,14 @@ export async function GET(request: Request): Promise<Response> {
   // Cursor: ISO timestamp of the oldest game on the previous page.
   // First page: no cursor. Subsequent pages: cursor = played_at of last item.
   const cursorPlayedAt = url.searchParams.get("cursor") ?? null;
+  const searchQuery = (url.searchParams.get("q") ?? "").trim();
 
   const games = (await listGamesPage({
     userId,
     platform,
     cursorPlayedAt,
     limit: PAGE_SIZE,
+    searchQuery,
   })).map((g) => ({
     id: g.id,
     lichess_game_id: g.lichess_game_id,
@@ -47,8 +49,8 @@ export async function GET(request: Request): Promise<Response> {
   }));
 
   const [totalCount, statusCounts] = await Promise.all([
-    countGamesByUserForPlatform(userId, platform),
-    countGamesByStatusForPlatform(userId, platform),
+    countGamesByUserForPlatform(userId, platform, searchQuery),
+    countGamesByStatusForPlatform(userId, platform, searchQuery),
   ]);
   const nextCursor = games.length === PAGE_SIZE
     ? `${games[games.length - 1].played_at}|${games[games.length - 1].id}`
@@ -62,5 +64,5 @@ export async function GET(request: Request): Promise<Response> {
     failed: statusCounts.failed,
   };
 
-  return Response.json({ games, stats, platform, nextCursor });
+  return Response.json({ games, stats, platform, nextCursor, q: searchQuery });
 }

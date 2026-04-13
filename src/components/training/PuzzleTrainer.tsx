@@ -6,7 +6,7 @@ import type { Key } from "chessground/types";
 import type { DrawShape } from "chessground/draw";
 import ChessBoard from "@/components/board/ChessBoard";
 import { getClientAuthHeaders } from "@/lib/supabase";
-import type { Puzzle } from "@/types";
+import type { Puzzle, PuzzleProgressStats } from "@/types";
 import type { MoveAnnotationOverlay } from "@/components/board/ChessBoard";
 import { useLiveAnalysis } from "@/hooks/useLiveAnalysis";
 import { classifyMove } from "@/lib/analysis";
@@ -143,9 +143,14 @@ function NoPuzzlesState() {
 }
 
 // ── Main Component ────────────────────────────────────────────────────────────
-export default function PuzzleTrainer() {
+interface PuzzleTrainerProps {
+  onOpenGameReview?: (gameId: string) => void;
+}
+
+export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) {
   const { userId } = useAuth();
   const [puzzles, setPuzzles] = useState<Puzzle[]>([]);
+  const [progressStats, setProgressStats] = useState<PuzzleProgressStats | null>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [state, setState] = useState<PuzzleState>("solving");
   
@@ -165,6 +170,9 @@ export default function PuzzleTrainer() {
   const [ratedIds, setRatedIds] = useState<Set<string>>(new Set());
   // Experimental reset state
   const [resetting, setResetting] = useState(false);
+  const [mistakeCount, setMistakeCount] = useState(0);
+  const [wasRevealed, setWasRevealed] = useState(false);
+  const [isCompactLayout, setIsCompactLayout] = useState(false);
 
   const wrongResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -191,8 +199,9 @@ export default function PuzzleTrainer() {
           }
           throw new Error(payload.error ?? "Failed to load puzzles");
         }
-        const payload = (await res.json()) as { puzzles?: Puzzle[] };
+        const payload = (await res.json()) as { puzzles?: Puzzle[]; stats?: PuzzleProgressStats };
         setPuzzles(payload.puzzles ?? []);
+        setProgressStats(payload.stats ?? null);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
@@ -214,7 +223,17 @@ export default function PuzzleTrainer() {
     setState("solving");
     setWrongFen(undefined);
     setWrongLastMove(undefined);
+    setMistakeCount(0);
+    setWasRevealed(false);
   }, [currentPuzzle]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const syncLayout = () => setIsCompactLayout(window.innerWidth < 960);
+    syncLayout();
+    window.addEventListener("resize", syncLayout);
+    return () => window.removeEventListener("resize", syncLayout);
+  }, []);
 
   // Compute Fen and LastMove based on viewPly
   const baseFen = currentPuzzle?.fen ?? "start";
@@ -250,6 +269,8 @@ export default function PuzzleTrainer() {
     setState("solving");
     setWrongFen(undefined);
     setWrongLastMove(undefined);
+    setMistakeCount(0);
+    setWasRevealed(false);
   }, []);
 
   // ── SRS rating update ─────────────────────────────────────────────────────
@@ -257,14 +278,23 @@ export default function PuzzleTrainer() {
     if (!currentPuzzle) return;
 
     try {
-      await fetch("/api/puzzles", {
+      const res = await fetch("/api/puzzles", {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
           ...(await getClientAuthHeaders()),
         },
-        body: JSON.stringify({ puzzleId: currentPuzzle.id, choice }),
+        body: JSON.stringify({
+          puzzleId: currentPuzzle.id,
+          choice,
+          revealed: wasRevealed,
+          mistakes: mistakeCount,
+        }),
       });
+      const payload = (await res.json().catch(() => ({}))) as { stats?: PuzzleProgressStats };
+      if (res.ok && payload.stats) {
+        setProgressStats(payload.stats);
+      }
     } catch {
       // Silently fail — puzzle still advances
     }
@@ -274,7 +304,7 @@ export default function PuzzleTrainer() {
       setRatedIds((prev) => new Set(prev).add(currentPuzzle.id));
     }
     setCurrentIndex((prev) => prev + 1);
-  }, [currentPuzzle]);
+  }, [currentPuzzle, mistakeCount, wasRevealed]);
 
   // ── Keyboard shortcuts for SRS rating & history review ─────────────────────
   useEffect(() => {
@@ -377,6 +407,7 @@ export default function PuzzleTrainer() {
     } else {
       // Wrong move logic
       setState("wrong");
+      setMistakeCount((prev) => prev + 1);
       const wFen = applyUciMove(displayFen, moveUci);
       if (wFen) {
          setWrongFen(wFen);
@@ -410,6 +441,7 @@ export default function PuzzleTrainer() {
       targetLine = [currentPuzzle.solution_move];
     }
 
+    setWasRevealed(true);
     setPlayedMoves(targetLine);
     setViewPly(0);
     setState("correct");
@@ -514,10 +546,10 @@ export default function PuzzleTrainer() {
   // Engine arrows on the board post-solution
   const engineShapes = useMemo((): DrawShape[] => {
     if (!isRating || engineLines.length === 0 || engineDepth < 4) return [];
-    return engineLines.slice(0, 3).map((line, i) => ({
+    return engineLines.slice(1, 3).map((line, i) => ({
       orig: line.move.slice(0, 2) as Key,
       dest: line.move.slice(2, 4) as Key,
-      brush: i === 0 ? "green" : i === 1 ? "paleBlue" : "paleGrey",
+      brush: i === 0 ? "paleBlue" : "paleGrey",
     }));
   }, [isRating, engineLines, engineDepth]);
 
@@ -654,6 +686,7 @@ export default function PuzzleTrainer() {
     <div
       style={{
         display: "flex",
+        flexDirection: isCompactLayout ? "column" : "row",
         flex: 1,
         overflow: "hidden",
         minHeight: 0,
@@ -718,7 +751,7 @@ export default function PuzzleTrainer() {
                   marginRight: "4px",
                 }}
               />
-              You played a blunder as {currentPuzzle.player_color}
+              You missed the strongest continuation as {currentPuzzle.player_color}
             </span>
             <span style={{ opacity: 0.4 }}>·</span>
             <span
@@ -749,6 +782,33 @@ export default function PuzzleTrainer() {
               >
                 Brilliant move!
               </span>
+            )}
+            {(currentPuzzle.game_white_username || currentPuzzle.game_black_username) && (
+              <>
+                <span style={{ opacity: 0.4 }}>·</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (currentPuzzle.game_id && onOpenGameReview) {
+                      onOpenGameReview(currentPuzzle.game_id);
+                    }
+                  }}
+                  disabled={!onOpenGameReview}
+                  style={{
+                    padding: "2px 8px",
+                    borderRadius: "999px",
+                    border: "1px solid rgba(129,182,76,0.35)",
+                    background: "rgba(129,182,76,0.12)",
+                    color: "#81b64c",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    cursor: onOpenGameReview ? "pointer" : "default",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  {currentPuzzle.game_white_username ?? "?"} vs {currentPuzzle.game_black_username ?? "?"}
+                </button>
+              </>
             )}
           </div>
 
@@ -937,6 +997,27 @@ export default function PuzzleTrainer() {
             gap: "10px",
           }}
         >
+          {currentPuzzle.game_id && onOpenGameReview && (
+            <button
+              type="button"
+              onClick={() => onOpenGameReview(currentPuzzle.game_id)}
+              style={{
+                alignSelf: "flex-start",
+                padding: "8px 12px",
+                borderRadius: "7px",
+                border: "1px solid rgba(129,182,76,0.3)",
+                background: "rgba(129,182,76,0.12)",
+                color: "#81b64c",
+                fontSize: "12px",
+                fontWeight: 700,
+                cursor: "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              Open associated game review
+            </button>
+          )}
+
           {/* Solving phase: reveal + skip + (try again on wrong) */}
           {(isSolving || isWrong) && (
             <div style={{ display: "flex", gap: "8px" }}>
@@ -1026,16 +1107,34 @@ export default function PuzzleTrainer() {
       {/* ── Sidebar: Right analysis + puzzle queue ── */}
       <aside
         style={{
-          width: "380px",
+          width: isCompactLayout ? "100%" : "380px",
           flexShrink: 0,
           display: "flex",
           flexDirection: "column",
-          borderLeft: "1px solid #3c3a38",
+          borderLeft: isCompactLayout ? "none" : "1px solid #3c3a38",
+          borderTop: isCompactLayout ? "1px solid #3c3a38" : "none",
           background: "#262421",
           overflow: "hidden",
           color: "#ffffff"
         }}
       >
+        {progressStats && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "8px", padding: "14px", borderBottom: "1px solid #3c3a38" }}>
+            {[
+              { label: "Due", value: progressStats.due_now },
+              { label: "Mastered", value: progressStats.mastered },
+              { label: "Accuracy", value: `${Math.round(progressStats.accuracy * 100)}%` },
+              { label: "Unseen", value: progressStats.unseen },
+              { label: "Learning", value: progressStats.learning },
+              { label: "Session", value: `${ratedIds.size}/${puzzles.length}` },
+            ].map((item) => (
+              <div key={item.label} style={{ padding: "10px 8px", background: "#1a1917", border: "1px solid #3c3a38", borderRadius: "8px", textAlign: "center" }}>
+                <div style={{ fontSize: "10px", color: "#8b8987", textTransform: "uppercase", letterSpacing: "0.06em" }}>{item.label}</div>
+                <div style={{ marginTop: "4px", fontSize: "15px", fontWeight: 800, color: "#fff", fontVariantNumeric: "tabular-nums" }}>{item.value}</div>
+              </div>
+            ))}
+          </div>
+        )}
         {isRating && (
           <div style={{ display: "flex", flexDirection: "column", padding: "16px", gap: "16px", borderBottom: "1px solid #3c3a38" }}>
             <div style={{ display: "flex", alignItems: "center", gap: "6px", paddingBottom: "8px", borderBottom: "1px solid #3c3a38" }}>
@@ -1188,6 +1287,9 @@ export default function PuzzleTrainer() {
                   </div>
                   <div style={{ fontSize: "11px", color: "#8b8987", textTransform: "capitalize" }}>
                     {phaseLabel(puzzle.phase)} · {puzzle.player_color}
+                    {puzzle.game_white_username && puzzle.game_black_username
+                      ? ` · ${puzzle.game_white_username} vs ${puzzle.game_black_username}`
+                      : ""}
                   </div>
                 </div>
                 {isDone && (

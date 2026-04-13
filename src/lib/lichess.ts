@@ -9,6 +9,12 @@ import type { Game, GameResult, LichessGame } from "@/types";
 
 const LICHESS_BASE_URL = "https://lichess.org";
 
+function isNonBulletGame(game: LichessGame): boolean {
+  const speed = (game.speed ?? "").toLowerCase();
+  const perf = (game.perf ?? "").toLowerCase();
+  return speed !== "bullet" && perf !== "bullet";
+}
+
 // ── Public API ────────────────────────────────────────────────────────
 
 /**
@@ -68,7 +74,8 @@ export async function fetchUserGames(
   const games: LichessGame[] = text
     .split("\n")
     .filter((line) => line.trim().length > 0)
-    .map((line) => JSON.parse(line) as LichessGame);
+    .map((line) => JSON.parse(line) as LichessGame)
+    .filter(isNonBulletGame);
 
   return games;
 }

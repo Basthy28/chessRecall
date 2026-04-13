@@ -96,6 +96,11 @@ interface LiveReviewResponse {
   error?: string;
 }
 
+interface GamesPanelProps {
+  requestedReviewGameId?: string | null;
+  onRequestedReviewHandled?: () => void;
+}
+
 // ── Pure utility helpers ────────────────────────────────────────────
 
 function statusColor(status: GameStatus): string {
@@ -1002,12 +1007,12 @@ function ReviewView({
     const cls: string = (isLiveBrilliant ? "brilliant" : liveClassification)
       ?? "";
 
-    if (!cls || cls === "book" || cls === "best" || cls === "good") return undefined;
+    if (!cls || cls === "book" || cls === "excellent" || cls === "good") return undefined;
 
     const lastUci = activePath[activePath.length - 1];
     const destSquare = lastUci.slice(2, 4) as Key;
     const SYMBOLS: Record<string, string> = {
-      brilliant: "!!", great: "!", excellent: "!", inaccuracy: "?!", mistake: "?", blunder: "??", miss: "✗",
+      brilliant: "!!", great: "!", best: "★", inaccuracy: "?!", mistake: "?", blunder: "??", miss: "✗",
     };
     const symbol = SYMBOLS[cls];
     if (!symbol) return undefined;
@@ -1667,7 +1672,10 @@ function ReviewView({
 
 
 // ── Main component ─────────────────────────────────────────────────
-export default function GamesPanel() {
+export default function GamesPanel({
+  requestedReviewGameId = null,
+  onRequestedReviewHandled,
+}: GamesPanelProps) {
   const [platform, setPlatform] = useState<Platform>("all");
   const [linkedAccounts, setLinkedAccounts] = useState<LinkedAccounts>({
     lichess: "",
@@ -1693,7 +1701,10 @@ export default function GamesPanel() {
   const [report, setReport] = useState<LiveReviewResponse | null>(null);  // game report / stats
   const [review, setReview] = useState<LiveReviewResponse | null>(null);  // board review
   const [reviewIndex, setReviewIndex] = useState(0);
+  const [gameSearchInput, setGameSearchInput] = useState("");
   const [gameSearch, setGameSearch] = useState("");
+  const [isCompactLayout, setIsCompactLayout] = useState(false);
+  const lastRequestedReviewIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     const refreshLinkedAccounts = () => {
@@ -1710,6 +1721,21 @@ export default function GamesPanel() {
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const syncLayout = () => setIsCompactLayout(window.innerWidth < 900);
+    syncLayout();
+    window.addEventListener("resize", syncLayout);
+    return () => window.removeEventListener("resize", syncLayout);
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setGameSearch(gameSearchInput.trim());
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [gameSearchInput]);
+
   function linkAccount(p: "lichess" | "chess.com") {
     const val = (p === "lichess" ? linkInputs.lichess : linkInputs.chessCom).trim().toLowerCase();
     if (!val) return;
@@ -1721,16 +1747,6 @@ export default function GamesPanel() {
     void syncLinkedAccountsToSupabase(next);
   }
 
-  function unlinkAccount(p: "lichess" | "chess.com") {
-    const next: LinkedAccounts = p === "chess.com"
-      ? { ...linkedAccounts, chessCom: "" }
-      : { ...linkedAccounts, lichess: "" };
-    setLinkedAccounts(next);
-    saveLinkedAccounts(next);
-    void syncLinkedAccountsToSupabase(next);
-    setLinkInputs(prev => p === "chess.com" ? { ...prev, chessCom: "" } : { ...prev, lichess: "" });
-  }
-
   const loadGames = useCallback(async (options?: { silent?: boolean }) => {
     const silent = options?.silent ?? false;
     if (!silent) {
@@ -1740,6 +1756,7 @@ export default function GamesPanel() {
 
     try {
       const params = new URLSearchParams({ platform });
+      if (gameSearch) params.set("q", gameSearch);
       const res = await fetch(`/api/games?${params.toString()}`, { headers: await getClientAuthHeaders() });
       const json = (await res.json()) as GamesResponse & { error?: string };
 
@@ -1758,13 +1775,14 @@ export default function GamesPanel() {
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [platform]);
+  }, [platform, gameSearch]);
 
   const loadMoreGames = useCallback(async () => {
     if (!nextCursor || loadingMore) return;
     setLoadingMore(true);
     try {
       const params = new URLSearchParams({ platform, cursor: nextCursor });
+      if (gameSearch) params.set("q", gameSearch);
       const res = await fetch(`/api/games?${params.toString()}`, { headers: await getClientAuthHeaders() });
       const json = (await res.json()) as GamesResponse & { error?: string };
       if (!res.ok) return;
@@ -1777,7 +1795,7 @@ export default function GamesPanel() {
     } catch { /**/ } finally {
       setLoadingMore(false);
     }
-  }, [platform, nextCursor, loadingMore]);
+  }, [platform, nextCursor, loadingMore, gameSearch]);
 
   useEffect(() => {
     void loadGames();
@@ -1882,22 +1900,14 @@ export default function GamesPanel() {
     [linkedAccounts]
   );
 
-  const filteredGames = useMemo(() => {
-    const q = gameSearch.trim().toLowerCase();
-    if (!q) return games;
-    return games.filter(
-      (g) =>
-        g.white_username.toLowerCase().includes(q) ||
-        g.black_username.toLowerCase().includes(q)
-    );
-  }, [games, gameSearch]);
-
   // Poll stats while jobs are running — never touches the games list or scroll position.
   useEffect(() => {
     if (!hasRunningAnalysis || review) return;
     const timer = setInterval(async () => {
       try {
-        const res = await fetch(`/api/games/stats?platform=${platform}`, {
+        const params = new URLSearchParams({ platform });
+        if (gameSearch) params.set("q", gameSearch);
+        const res = await fetch(`/api/games/stats?${params.toString()}`, {
           headers: await getClientAuthHeaders(),
         });
         if (!res.ok) return;
@@ -1908,7 +1918,7 @@ export default function GamesPanel() {
       } catch { /* silent */ }
     }, 8000);
     return () => clearInterval(timer);
-  }, [hasRunningAnalysis, review, platform]);
+  }, [hasRunningAnalysis, review, platform, gameSearch]);
 
   async function queueSelectedGame() {
     if (!selectedGameId || !selectedGame) { setMessage("Select a game first."); return; }
@@ -1930,15 +1940,21 @@ export default function GamesPanel() {
           platform: selectedPlatform,
           username: selectedUsername,
           viewerUsernames,
+          forceRequeue: selectedGame.status === "processing" || selectedGame.status === "failed",
         }),
       });
-      const json = (await res.json()) as { selected?: number; queued?: number; queueUnavailable?: boolean; error?: string };
+      const json = (await res.json()) as { selected?: number; queued?: number; skipped?: number; queueUnavailable?: boolean; error?: string };
       if (!res.ok) {
         setMessage(json.error ?? "Failed to queue selected games.");
       } else if (json.queueUnavailable) {
         setMessage("Redis queue offline. Start Redis + worker and try again.");
       } else {
-        setMessage(`Queued (${json.queued ?? 0}/${json.selected ?? 0}).`);
+        const skipped = json.skipped ?? 0;
+        setMessage(
+          skipped > 0
+            ? `Queued (${json.queued ?? 0}/${json.selected ?? 0}) — ${skipped} already recently re-queued.`
+            : `Queued (${json.queued ?? 0}/${json.selected ?? 0}).`
+        );
       }
       await loadGames();
     } catch {
@@ -2019,16 +2035,22 @@ export default function GamesPanel() {
         body: JSON.stringify({
           gameIds: stuckIds,
           viewerUsernames,
+          forceRequeue: true,
         }),
       });
-      const json = (await res.json()) as { selected?: number; queued?: number; error?: string; queueUnavailable?: boolean };
+      const json = (await res.json()) as { selected?: number; queued?: number; skipped?: number; error?: string; queueUnavailable?: boolean };
 
       if (!res.ok) {
         setMessage(json.error ?? "Failed to recover stuck games.");
       } else if (json.queueUnavailable) {
         setMessage("Redis queue offline. Start Redis + worker and retry recovery.");
       } else {
-        setMessage(`Recovery queued (${json.queued ?? 0}/${json.selected ?? stuckIds.length}).`);
+        const skipped = json.skipped ?? 0;
+        setMessage(
+          skipped > 0
+            ? `Recovery queued (${json.queued ?? 0}/${json.selected ?? stuckIds.length}) — ${skipped} already recently re-queued.`
+            : `Recovery queued (${json.queued ?? 0}/${json.selected ?? stuckIds.length}).`
+        );
       }
 
       await loadGames();
@@ -2063,6 +2085,19 @@ export default function GamesPanel() {
       setReviewLoading(false);
     }
   }
+
+  useEffect(() => {
+    if (!requestedReviewGameId) {
+      lastRequestedReviewIdRef.current = null;
+      return;
+    }
+    if (lastRequestedReviewIdRef.current === requestedReviewGameId) return;
+    lastRequestedReviewIdRef.current = requestedReviewGameId;
+    setSelectedGameId(requestedReviewGameId);
+    void openLiveReview(requestedReviewGameId).finally(() => {
+      onRequestedReviewHandled?.();
+    });
+  }, [requestedReviewGameId, onRequestedReviewHandled]);
 
   // ── Review mode: full chess.com-style layout ───────────────────
   if (review) {
@@ -2116,12 +2151,12 @@ export default function GamesPanel() {
                   >
                     Sync now
                   </button>
-                  <button
-                    onClick={() => unlinkAccount(p)}
-                    style={{ fontSize: "11px", color: "var(--text-muted)", background: "none", border: "1px solid var(--border)", borderRadius: "4px", padding: "2px 8px", cursor: "pointer", fontFamily: "inherit", flexShrink: 0 }}
+                  <span
+                    style={{ fontSize: "10px", color: "var(--text-muted)", flexShrink: 0 }}
+                    title="Linked accounts stay locked while sync and analysis jobs may still depend on them."
                   >
-                    Unlink
-                  </button>
+                    locked
+                  </span>
                 </>
               ) : (
                 <>
@@ -2148,7 +2183,7 @@ export default function GamesPanel() {
       </div>
 
       {/* Filters + actions */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap", flexShrink: 0 }}>
+      <div style={{ display: "flex", flexDirection: isCompactLayout ? "column" : "row", alignItems: isCompactLayout ? "stretch" : "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap", flexShrink: 0 }}>
         <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
           {(["all", "lichess", "chess.com"] as const).map((p) => (
             <button
@@ -2173,7 +2208,7 @@ export default function GamesPanel() {
           </Button>
         </div>
 
-        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", width: isCompactLayout ? "100%" : undefined }}>
           <Button variant="secondary" size="sm" onClick={() => void queueSelectedGame()} disabled={actionLoading || !selectedGameId || selectedGame?.status === "analyzed"}>
             {actionLoading ? "…" : selectedGame?.status === "processing" ? "Re-queue (stuck)" : "Queue Analysis"}
           </Button>
@@ -2217,8 +2252,8 @@ export default function GamesPanel() {
         <input
           type="text"
           placeholder="Search by player…"
-          value={gameSearch}
-          onChange={(e) => setGameSearch((e.target as HTMLInputElement).value)}
+          value={gameSearchInput}
+          onChange={(e) => setGameSearchInput((e.target as HTMLInputElement).value)}
           style={{
             width: "100%",
             padding: "7px 10px 7px 30px",
@@ -2253,6 +2288,7 @@ export default function GamesPanel() {
         overflow: "hidden",
       }}>
         {/* Header */}
+        {!isCompactLayout && (
         <div style={{
           display: "grid",
           gridTemplateColumns: "1fr 100px 80px 90px",
@@ -2271,10 +2307,11 @@ export default function GamesPanel() {
           <div>Result</div>
           <div>Status</div>
         </div>
+        )}
 
         {/* Rows */}
         <div style={{ overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: "4px", padding: "6px 8px" }}>
-          {filteredGames.map((g) => {
+          {games.map((g) => {
             const isSelected = g.id === selectedGameId;
             const gamePlatform = inferPlatformFromGameId(g.lichess_game_id);
             const linkedUsername = getLinkedUsername(linkedAccounts, gamePlatform);
@@ -2287,7 +2324,7 @@ export default function GamesPanel() {
                 onDoubleClick={() => { setSelectedGameId(g.id); void openLiveReview(g.id); }}
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "1fr 100px 80px 90px",
+                  gridTemplateColumns: isCompactLayout ? "1fr auto" : "1fr 100px 80px 90px",
                   gap: "8px",
                   padding: "9px 14px",
                   borderRadius: "7px",
@@ -2311,11 +2348,18 @@ export default function GamesPanel() {
                   <div style={{ color: "var(--text-muted)", fontSize: "11px" }}>
                     {g.white_rating ?? "?"} / {g.black_rating ?? "?"} · {g.time_control}
                   </div>
+                  {isCompactLayout && (
+                    <div style={{ color: "var(--text-muted)", fontSize: "11px" }}>
+                      {new Date(g.played_at).toLocaleDateString()} · {g.result}
+                    </div>
+                  )}
                 </div>
+                {!isCompactLayout && (
                 <div style={{ color: "var(--text-secondary)", fontSize: "11px" }}>
                   {new Date(g.played_at).toLocaleDateString()}
                 </div>
-                <div style={{ color: "var(--text-secondary)", textTransform: "capitalize" }}>{g.result}</div>
+                )}
+                {!isCompactLayout && <div style={{ color: "var(--text-secondary)", textTransform: "capitalize" }}>{g.result}</div>}
                 <div style={{ color: statusColor(g.status), fontWeight: 600, textTransform: "capitalize", fontSize: "11px" }}>
                   {g.status}
                 </div>
@@ -2323,7 +2367,7 @@ export default function GamesPanel() {
             );
           })}
 
-          {filteredGames.length === 0 && !loading && (
+          {games.length === 0 && !loading && (
             <div style={{ padding: "32px", color: "var(--text-muted)", textAlign: "center", fontSize: "13px" }}>
               {gameSearch ? `No games match "${gameSearch}".` : "No games found. Link your account above to get started."}
             </div>
@@ -2342,7 +2386,7 @@ export default function GamesPanel() {
                   fontFamily: "inherit", opacity: loadingMore ? 0.5 : 1,
                 }}
               >
-                {loadingMore ? "Loading…" : `Load more (${stats.total - games.length} remaining)`}
+                {loadingMore ? "Loading…" : `Load more (${Math.max(0, stats.total - games.length)} remaining)`}
               </button>
             </div>
           )}

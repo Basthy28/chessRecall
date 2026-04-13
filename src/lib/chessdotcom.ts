@@ -56,6 +56,21 @@ function isImportableGame(game: ChessComGame): boolean {
   );
 }
 
+function parseInitialTimeControlSeconds(timeControl: string | undefined): number | null {
+  if (!timeControl) return null;
+  const normalized = timeControl.trim().toLowerCase();
+  if (normalized.includes("/")) return null;
+  const match = normalized.match(/^(\d+)(?:\+\d+)?$/);
+  if (!match) return null;
+  const initialSeconds = Number.parseInt(match[1], 10);
+  return Number.isFinite(initialSeconds) ? initialSeconds : null;
+}
+
+function isBulletGame(game: ChessComGame): boolean {
+  const initialSeconds = parseInitialTimeControlSeconds(game.time_control);
+  return initialSeconds !== null && initialSeconds < 180;
+}
+
 function extractChessComId(url: string): string {
   const trimmed = url.replace(/\/+$/, "");
   const parts = trimmed.split("/").filter(Boolean);
@@ -134,7 +149,7 @@ export async function fetchChessComGames(
         if (!monthRes || !monthRes.ok) continue;
 
         const { games } = (await monthRes.json()) as ChessComArchiveResponse;
-        const clean = (games ?? []).filter(isImportableGame);
+        const clean = (games ?? []).filter((game) => isImportableGame(game) && !isBulletGame(game));
 
         // Newest-first within each monthly archive.
         const ordered = clean

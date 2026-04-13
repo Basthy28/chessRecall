@@ -19,7 +19,10 @@ import { Chess } from "chess.js";
 const ANALYSIS_ENGINE_URL = "/stockfish/stockfish-18-single.js";
 const ANALYSIS_MULTI_PV   = 3;
 const ANALYSIS_DEBOUNCE_MS = 150;
-const ANALYSIS_MOVETIME_MS = 5_000;   // 5 s — fast enough for navigation
+const ANALYSIS_MOVETIME_MS = Math.max(
+  2_500,
+  Number(process.env.NEXT_PUBLIC_ANALYSIS_MOVETIME_MS ?? 8_000)
+);
 const ANALYSIS_TIMEOUT_MS  = ANALYSIS_MOVETIME_MS + 6_000;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
