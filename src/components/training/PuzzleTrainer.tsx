@@ -156,6 +156,130 @@ function NoPuzzlesState() {
   );
 }
 
+type PuzzleStageMeta = {
+  label: string;
+  note: string;
+  color: string;
+  bg: string;
+  border: string;
+};
+
+function formatDueLabel(value: string | null): string | null {
+  if (!value) return null;
+  const diffMs = new Date(value).getTime() - Date.now();
+  const absMs = Math.abs(diffMs);
+
+  if (absMs < 15 * 60_000) return "Due now";
+
+  const mins = Math.round(absMs / 60_000);
+  if (mins < 60) return diffMs < 0 ? `${mins}m overdue` : `In ${mins}m`;
+
+  const hours = Math.round(absMs / 3_600_000);
+  if (hours < 24) return diffMs < 0 ? `${hours}h overdue` : `In ${hours}h`;
+
+  const days = Math.round(absMs / 86_400_000);
+  return diffMs < 0 ? `${days}d overdue` : `In ${days}d`;
+}
+
+function getPuzzleStageMeta(puzzle: Puzzle): PuzzleStageMeta {
+  const seen = puzzle.times_seen ?? 0;
+  const correct = puzzle.times_correct ?? 0;
+  const accuracy = seen > 0 ? correct / seen : 0;
+
+  if (seen === 0) {
+    return {
+      label: "Fresh",
+      note: "Brand-new motif from one of your games.",
+      color: "#c0a060",
+      bg: "rgba(192,160,96,0.12)",
+      border: "rgba(192,160,96,0.3)",
+    };
+  }
+
+  if (correct === 0 || accuracy < 0.35) {
+    return {
+      label: "Repair",
+      note: "Still not stable. Clean execution matters here.",
+      color: "#f6b43d",
+      bg: "rgba(246,180,61,0.14)",
+      border: "rgba(246,180,61,0.32)",
+    };
+  }
+
+  if (seen < 3 || accuracy < 0.75) {
+    return {
+      label: "Learning",
+      note: "The idea is there, but it still needs repetition.",
+      color: "#81b64c",
+      bg: "rgba(129,182,76,0.13)",
+      border: "rgba(129,182,76,0.3)",
+    };
+  }
+
+  if (puzzle.srs_ease >= 2.7 && accuracy >= 0.85 && correct >= 3) {
+    return {
+      label: "Mastery",
+      note: "Long-term retention check. Keep it clean.",
+      color: "#4a9e8e",
+      bg: "rgba(74,158,142,0.15)",
+      border: "rgba(74,158,142,0.32)",
+    };
+  }
+
+  return {
+    label: "Reinforce",
+    note: "Known pattern, back now to make it stick.",
+    color: "#5c8bb0",
+    bg: "rgba(92,139,176,0.15)",
+    border: "rgba(92,139,176,0.32)",
+  };
+}
+
+function getPuzzleReason(puzzle: Puzzle, stage: PuzzleStageMeta): string {
+  if (puzzle.times_seen === 0) return "Fresh extraction from one of your games.";
+  if (puzzle.times_correct === 0) return "You still have not solved this motif cleanly.";
+
+  const gap = puzzle.eval_second_best === null ? null : Math.abs(puzzle.eval_best - puzzle.eval_second_best);
+  if (gap !== null && gap >= 120) return "This is close to an only-move decision, so precision matters.";
+
+  if (puzzle.srs_due_at && new Date(puzzle.srs_due_at).getTime() <= Date.now()) {
+    return "Its review window expired, so it is back now before the idea fades.";
+  }
+
+  return stage.note;
+}
+
+function MiniStatCard({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div style={{ padding: "10px 8px", background: "#1a1917", border: "1px solid #3c3a38", borderRadius: "8px", textAlign: "center" }}>
+      <div style={{ fontSize: "10px", color: "#8b8987", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
+      <div style={{ marginTop: "4px", fontSize: "15px", fontWeight: 800, color: "#fff", fontVariantNumeric: "tabular-nums" }}>{value}</div>
+    </div>
+  );
+}
+
+function StagePill({ stage, compact = false }: { stage: PuzzleStageMeta; compact?: boolean }) {
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: compact ? "1px 6px" : "3px 8px",
+        borderRadius: "999px",
+        background: stage.bg,
+        border: `1px solid ${stage.border}`,
+        color: stage.color,
+        fontSize: compact ? "10px" : "11px",
+        fontWeight: 700,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {stage.label}
+    </span>
+  );
+}
+
 // ── Main Component ────────────────────────────────────────────────────────────
 interface PuzzleTrainerProps {
   onOpenGameReview?: (gameId: string) => void;
@@ -171,7 +295,6 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   // Interactive puzzle state
   const [playedMoves, setPlayedMoves] = useState<string[]>([]);
   const [viewPly, setViewPly] = useState<number>(0);
-  const [debugLastEval, setDebugLastEval] = useState<string>("Ninghuem jogou nada ainda");
 
   // Wrong move visual feedback
   const [wrongFen, setWrongFen] = useState<string | undefined>();
@@ -399,7 +522,6 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
     // Use startsWith to elegantly handle cases where the puzzle expects a promotion (e.g. "e7e8q") 
     // but the UI dragging interaction only emitted "e7e8".
     const isCorrect = expectedMove && expectedMove.startsWith(moveUci);
-    setDebugLastEval(`Eu arrastei ${moveUci}. O sistema queria ${expectedMove}. Deu isCorrect=${isCorrect}`);
 
     if (isCorrect) {
       const newPlayed = [...playedMoves, moveUci];
@@ -700,6 +822,30 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
 
   // Board is interactive while solving, or after puzzle is solved (for free play)
   const boardInteractive = state === "solving" || state === "rating";
+  const currentStage = getPuzzleStageMeta(currentPuzzle);
+  const currentReason = getPuzzleReason(currentPuzzle, currentStage);
+  const currentDueLabel = formatDueLabel(currentPuzzle.srs_due_at);
+  const sessionProgress = puzzles.length > 0 ? ratedIds.size / puzzles.length : 0;
+  const sessionProgressPercent = Math.round(sessionProgress * 100);
+  const currentAccuracy =
+    currentPuzzle.times_seen > 0
+      ? Math.round((currentPuzzle.times_correct / currentPuzzle.times_seen) * 100)
+      : null;
+  const onlyMoveGap =
+    currentPuzzle.eval_second_best === null ? null : Math.round(Math.abs(currentPuzzle.eval_best - currentPuzzle.eval_second_best));
+  const evalSwingLabel = `${(currentPuzzle.eval_drop / 100).toFixed(2)} pawns`;
+  const sessionSummary =
+    ratedIds.size === 0
+      ? "Fresh session. Start clean and push the easy ones out."
+      : ratedIds.size === puzzles.length - 1
+        ? "Final rep of the session. Lock this one in."
+        : `${puzzles.length - ratedIds.size} puzzle${puzzles.length - ratedIds.size === 1 ? "" : "s"} still in today's route.`;
+  const focusCards = [
+    { label: "Swing", value: evalSwingLabel },
+    { label: "Only Move Gap", value: onlyMoveGap !== null ? `${(onlyMoveGap / 100).toFixed(2)}` : "Multi-choice" },
+    { label: "Clean Rate", value: currentAccuracy !== null ? `${currentAccuracy}%` : "New" },
+    { label: "Next Check", value: currentDueLabel ?? "After rating" },
+  ];
 
   return (
     <div
@@ -832,16 +978,21 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
           </div>
 
           {/* Right: puzzle count + status badge */}
-          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-            <span
-              style={{
-                fontSize: "12px",
-                color: "var(--text-muted)",
-                fontVariantNumeric: "tabular-nums",
-              }}
-            >
-              Puzzle {currentIndex + 1} of {puzzles.length}
-            </span>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: isCompactLayout ? 0 : "220px", justifyContent: "flex-end" }}>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "4px", minWidth: isCompactLayout ? 0 : "140px" }}>
+              <span
+                style={{
+                  fontSize: "12px",
+                  color: "var(--text-muted)",
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              >
+                Puzzle {currentIndex + 1} of {puzzles.length}
+              </span>
+              <div style={{ width: "100%", maxWidth: "160px", height: "6px", borderRadius: "999px", background: "rgba(255,255,255,0.08)", overflow: "hidden" }}>
+                <div style={{ width: `${sessionProgressPercent}%`, height: "100%", background: "linear-gradient(90deg, #81b64c 0%, #c0a060 100%)", transition: "width 180ms ease" }} />
+              </div>
+            </div>
             {isSolving && (
               <div
                 style={{
@@ -911,6 +1062,50 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
                 Played in game: {playedInGameLabel}
               </div>
             )}
+          </div>
+        </div>
+
+        <div
+          style={{
+            width: "100%",
+            maxWidth: "min(900px, calc(100vh - 220px))",
+            display: "grid",
+            gridTemplateColumns: isCompactLayout ? "1fr" : "minmax(0, 1.4fr) minmax(0, 1fr)",
+            gap: "12px",
+          }}
+        >
+          <div
+            style={{
+              padding: "14px 16px",
+              borderRadius: "10px",
+              border: `1px solid ${currentStage.border}`,
+              background: "linear-gradient(135deg, rgba(255,255,255,0.02) 0%, rgba(0,0,0,0.18) 100%)",
+              display: "flex",
+              flexDirection: "column",
+              gap: "8px",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+              <div>
+                <div style={{ fontSize: "10px", color: "#8b8987", textTransform: "uppercase", letterSpacing: "0.08em" }}>Training Focus</div>
+                <div style={{ marginTop: "4px", fontSize: "18px", fontWeight: 800, color: "#fff" }}>
+                  {phaseLabel(currentPuzzle.phase)} {currentPuzzle.player_color === "white" ? "attack" : "defense"}
+                </div>
+              </div>
+              <StagePill stage={currentStage} />
+            </div>
+            <div style={{ fontSize: "13px", color: "#c9c6c1", lineHeight: 1.5 }}>
+              {currentReason}
+            </div>
+            <div style={{ fontSize: "12px", color: "#8b8987" }}>
+              {sessionSummary}
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
+            {focusCards.map((item) => (
+              <MiniStatCard key={item.label} label={item.label} value={item.value} />
+            ))}
           </div>
         </div>
 
@@ -1154,20 +1349,47 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
         }}
       >
         {progressStats && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "8px", padding: "14px", borderBottom: "1px solid #3c3a38" }}>
-            {[
-              { label: "Due", value: progressStats.due_now },
-              { label: "Mastered", value: progressStats.mastered },
-              { label: "Accuracy", value: `${Math.round(progressStats.accuracy * 100)}%` },
-              { label: "Unseen", value: progressStats.unseen },
-              { label: "Learning", value: progressStats.learning },
-              { label: "Session", value: `${ratedIds.size}/${puzzles.length}` },
-            ].map((item) => (
-              <div key={item.label} style={{ padding: "10px 8px", background: "#1a1917", border: "1px solid #3c3a38", borderRadius: "8px", textAlign: "center" }}>
-                <div style={{ fontSize: "10px", color: "#8b8987", textTransform: "uppercase", letterSpacing: "0.06em" }}>{item.label}</div>
-                <div style={{ marginTop: "4px", fontSize: "15px", fontWeight: 800, color: "#fff", fontVariantNumeric: "tabular-nums" }}>{item.value}</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "12px", padding: "14px", borderBottom: "1px solid #3c3a38" }}>
+            <div
+              style={{
+                padding: "14px",
+                borderRadius: "10px",
+                border: "1px solid rgba(192,160,96,0.22)",
+                background: "linear-gradient(135deg, rgba(192,160,96,0.12) 0%, rgba(255,255,255,0.03) 100%)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "10px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+                <div>
+                  <div style={{ fontSize: "10px", color: "#a7a29a", textTransform: "uppercase", letterSpacing: "0.08em" }}>Today&apos;s Route</div>
+                  <div style={{ marginTop: "4px", fontSize: "17px", fontWeight: 800, color: "#fff" }}>
+                    {ratedIds.size}/{puzzles.length} solved this session
+                  </div>
+                </div>
+                <StagePill stage={currentStage} compact />
               </div>
-            ))}
+              <div style={{ height: "8px", borderRadius: "999px", background: "rgba(255,255,255,0.08)", overflow: "hidden" }}>
+                <div style={{ width: `${sessionProgressPercent}%`, height: "100%", background: "linear-gradient(90deg, #81b64c 0%, #c0a060 100%)", transition: "width 180ms ease" }} />
+              </div>
+              <div style={{ fontSize: "12px", color: "#c9c6c1", lineHeight: 1.5 }}>
+                {currentReason}
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "8px" }}>
+              {[
+                { label: "Due", value: progressStats.due_now },
+                { label: "Mastered", value: progressStats.mastered },
+                { label: "Accuracy", value: `${Math.round(progressStats.accuracy * 100)}%` },
+                { label: "Unseen", value: progressStats.unseen },
+                { label: "Learning", value: progressStats.learning },
+                { label: "Total", value: progressStats.total },
+              ].map((item) => (
+                <MiniStatCard key={item.label} label={item.label} value={item.value} />
+              ))}
+            </div>
           </div>
         )}
         {isRating && (
@@ -1276,13 +1498,20 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
           </div>
         )}
 
-        <div style={{ padding: "12px 14px 8px", borderBottom: "1px solid #3c3a38", fontSize: "11px", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: "#8b8987" }}>
-          Due Today — {puzzles.length} puzzle{puzzles.length === 1 ? "" : "s"}
+        <div style={{ padding: "12px 14px 8px", borderBottom: "1px solid #3c3a38", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+          <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: "#8b8987" }}>
+            Training Route — {puzzles.length} puzzle{puzzles.length === 1 ? "" : "s"}
+          </span>
+          <span style={{ fontSize: "11px", color: "#5a5856", fontVariantNumeric: "tabular-nums" }}>
+            {puzzles.length - ratedIds.size} left
+          </span>
         </div>
         <div style={{ flex: 1, overflowY: "auto" }}>
           {puzzles.map((puzzle, idx) => {
             const isDone = ratedIds.has(puzzle.id);
             const isCurrent = idx === currentIndex;
+            const stage = getPuzzleStageMeta(puzzle);
+            const dueLabel = formatDueLabel(puzzle.srs_due_at);
             return (
               <button
                 key={puzzle.id}
@@ -1314,11 +1543,14 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
                 {/* Status dot */}
                 <div style={{ width: "8px", height: "8px", borderRadius: "50%", flexShrink: 0, background: isDone ? "var(--green)" : isCurrent ? "var(--accent)" : "#5a5856" }} />
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: "12px", fontWeight: isCurrent ? 600 : 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    Move {puzzle.move_number}
-                    {puzzle.is_brilliant && (
-                      <span style={{ marginLeft: "5px", fontSize: "10px", color: "var(--accent)" }}>★</span>
-                    )}
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0, marginBottom: "3px" }}>
+                    <div style={{ fontSize: "12px", fontWeight: isCurrent ? 600 : 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                      Move {puzzle.move_number}
+                      {puzzle.is_brilliant && (
+                        <span style={{ marginLeft: "5px", fontSize: "10px", color: "var(--accent)" }}>★</span>
+                      )}
+                    </div>
+                    {!isDone && <StagePill stage={stage} compact />}
                   </div>
                   <div style={{ fontSize: "11px", color: "#8b8987", textTransform: "capitalize" }}>
                     {phaseLabel(puzzle.phase)} · {puzzle.player_color}
@@ -1326,6 +1558,11 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
                       ? ` · ${puzzle.game_white_username} vs ${puzzle.game_black_username}`
                       : ""}
                   </div>
+                  {dueLabel && !isDone && (
+                    <div style={{ fontSize: "10px", color: "#5a5856", marginTop: "3px" }}>
+                      {dueLabel}
+                    </div>
+                  )}
                 </div>
                 {isDone && (
                   <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--green)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>

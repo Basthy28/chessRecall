@@ -319,7 +319,7 @@ function EvalBar({
   return (
     <div
       style={{
-        width: "24px",
+        width: "30px",
         height: "100%",
         minHeight: "240px",
         borderTopLeftRadius: "4px",
@@ -357,12 +357,12 @@ function EvalBar({
           left: 0,
           right: 0,
           textAlign: "center",
-          fontSize: "9px",
+          fontSize: "10px",
           fontWeight: 700,
           color: labelColor,
-          lineHeight: 1.1,
-          padding: "0 1px",
-          wordBreak: "break-all",
+          lineHeight: 1,
+          padding: "0 2px",
+          whiteSpace: "nowrap",
         }}
       >
         {gameResult ?? formatEval(score)}
@@ -1550,9 +1550,6 @@ function ReviewView({
                         </div>
                         <div style={{ fontSize: "21px", fontWeight: 900, color: "#fff", fontVariantNumeric: "tabular-nums" }}>
                           {acc.toFixed(1)}%
-                        </div>
-                        <div style={{ fontSize: "10px", color: "#666", marginTop: "2px" }}>
-                          WintrChess-style accuracy
                         </div>
                       </div>
                     ))}
