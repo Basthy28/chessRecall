@@ -89,6 +89,7 @@ interface EvalLine {
 interface EvalResult {
   best: EvalLine;
   second: EvalLine | null;
+  lines: EvalLine[];
 }
 
 // ── Cluster / env config ─────────────────────────────────────────────
@@ -226,7 +227,9 @@ async function validatePuzzleLine(
   initialFen: string,
   pvUci: string[],
   engineDepth: number,
-  minGapCp: number
+  minGapCp: number,
+  validationMultiPv: number,
+  rootEval?: EvalResult
 ): Promise<string[]> {
   const validUci: string[] = [];
   const chess = new Chess(initialFen);
@@ -236,14 +239,16 @@ async function validatePuzzleLine(
     const isPlayerTurn = (i % 2 === 0);
     const currentFen = chess.fen();
     try {
-      // MultiPV=2 to check for alternatives (including the root move at i=0).
-      const ev = await evaluatePosition(
-        engine,
-        currentFen,
-        engineDepth,
-        2,
-        STOCKFISH_VALIDATION_MOVETIME_MS
-      );
+      const legalMoveCount = countLegalMoves(currentFen);
+      const ev = i === 0 && rootEval
+        ? rootEval
+        : await evaluatePosition(
+          engine,
+          currentFen,
+          engineDepth,
+          validationMultiPv,
+          STOCKFISH_VALIDATION_MOVETIME_MS
+        );
 
       // If the engine no longer likes this move, the sequence is unstable.
       if (ev.best.move !== moveUci) {
@@ -252,9 +257,15 @@ async function validatePuzzleLine(
 
       // Only the player's moves need to be "forced" (only winning move).
       // The opponent just plays the best defense.
-      if (isPlayerTurn && ev.second !== null) {
-        const gap = ev.best.score - ev.second.score;
-        const ambiguousMate = isWinningMateScore(ev.best.score) && isWinningMateScore(ev.second.score);
+      if (isPlayerTurn) {
+        if (legalMoveCount > 1 && ev.lines.length < 2 && !isWinningMateScore(ev.best.score)) {
+          break;
+        }
+
+        const alternativeLines = ev.lines.slice(1);
+        const bestAlternative = alternativeLines[0] ?? null;
+        const gap = bestAlternative ? ev.best.score - bestAlternative.score : MATE_SCORE;
+        const ambiguousMate = isWinningMateScore(ev.best.score) && alternativeLines.some((line) => isWinningMateScore(line.score));
         if (gap < minGapCp || ambiguousMate) {
           break; // Alternative is too good (or also mating).
         }
@@ -284,8 +295,12 @@ async function validatePuzzleLine(
     validUci.pop();
   }
 
-  // A puzzle must have at least 2 moves: player's forced move + opponent's best response.
-  // Single-move puzzles are just berrada (no real tactic, no choice).
+  // Allow mate-in-1 style puzzles when the player's move ends the game immediately.
+  if (validUci.length === 1) {
+    return chess.isCheckmate() ? validUci : [];
+  }
+
+  // Otherwise require at least player move + best defense.
   if (validUci.length < 2) {
     return [];
   }
@@ -408,6 +423,13 @@ function getTerminalEval(fen: string): EvalResult | null {
         pv: [],
       },
       second: null,
+      lines: [
+        {
+          move: "",
+          score,
+          pv: [],
+        },
+      ],
     };
   } catch {
     return null;
@@ -418,19 +440,105 @@ function getPlayedScoreCp(evalAfter: EvalResult): number {
   return -evalAfter.best.score;
 }
 
-function getSolutionGapCp(evalBefore: EvalResult): number {
-  if (evalBefore.second === null) return MATE_SCORE;
+function countLegalMoves(fen: string): number {
+  try {
+    return new Chess(fen).moves().length;
+  } catch {
+    return 0;
+  }
+}
+
+function applyUciMoveToFen(fen: string, uciMove: string): string | null {
+  try {
+    const chess = new Chess(fen);
+    const moved = chess.move({
+      from: uciMove.slice(0, 2),
+      to: uciMove.slice(2, 4),
+      promotion: uciMove.length > 4 ? uciMove[4] : undefined,
+    });
+    if (!moved) return null;
+    return chess.fen();
+  } catch {
+    return null;
+  }
+}
+
+function getSolutionGapCp(evalBefore: EvalResult, legalMoveCount?: number): number {
+  if (evalBefore.second === null) {
+    return legalMoveCount !== undefined && legalMoveCount > 1 ? 0 : MATE_SCORE;
+  }
   return evalBefore.best.score - evalBefore.second.score;
 }
 
-function isOnlyMoveOrMate(evalBefore: EvalResult, minSolutionGap: number): boolean {
+function isOnlyMoveOrMate(evalBefore: EvalResult, minSolutionGap: number, legalMoveCount?: number): boolean {
   const bestIsWinningMate = isWinningMateScore(evalBefore.best.score);
-  const secondIsWinningMate = isWinningMateScore(evalBefore.second?.score ?? 0);
+  const alternativeLines = evalBefore.lines.slice(1);
+
+  if (
+    legalMoveCount !== undefined &&
+    legalMoveCount > 1 &&
+    alternativeLines.length === 0 &&
+    !bestIsWinningMate
+  ) {
+    return false;
+  }
+
+  const secondIsWinningMate = alternativeLines.some((line) => isWinningMateScore(line.score));
 
   // Two winning mates means the move is not uniquely forced enough for training.
   if (bestIsWinningMate && secondIsWinningMate) return false;
 
-  return isMateScore(evalBefore.best.score) || getSolutionGapCp(evalBefore) >= minSolutionGap;
+  return isMateScore(evalBefore.best.score) || getSolutionGapCp(evalBefore, legalMoveCount) >= minSolutionGap;
+}
+
+async function revalidatePuzzleCandidate(
+  engine: StockfishEngine,
+  fen: string,
+  playedMove: string,
+  engineDepth: number,
+  multiPv: number,
+  minEvalDrop: number,
+  minSolutionGap: number,
+  minWinChance: number
+): Promise<{ evalBefore: EvalResult; evalAfter: EvalResult; legalMoveCount: number } | null> {
+  const legalMoveCount = countLegalMoves(fen);
+  if (legalMoveCount <= 1) return null;
+
+  const evalBefore = await evaluatePosition(
+    engine,
+    fen,
+    engineDepth,
+    Math.max(3, multiPv),
+    STOCKFISH_VALIDATION_MOVETIME_MS
+  );
+
+  if (!isOnlyMoveOrMate(evalBefore, minSolutionGap, legalMoveCount)) {
+    return null;
+  }
+
+  const playedFen = applyUciMoveToFen(fen, playedMove);
+  if (!playedFen) return null;
+
+  const evalAfter = await evaluatePosition(
+    engine,
+    playedFen,
+    engineDepth,
+    Math.max(2, multiPv),
+    STOCKFISH_VALIDATION_MOVETIME_MS
+  );
+
+  if (!isPuzzleCandidate({
+    evalBefore,
+    evalAfter,
+    minEvalDrop,
+    minSolutionGap,
+    minWinChance,
+    legalMoveCount,
+  })) {
+    return null;
+  }
+
+  return { evalBefore, evalAfter, legalMoveCount };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -501,9 +609,12 @@ async function evaluatePosition(
           reject(new Error(`No eval data for FEN: ${fen}`));
           return;
         }
-        const best = pvBest.get(1);
+        const lines = Array.from(pvBest.entries())
+          .sort((left, right) => left[0] - right[0])
+          .map(([, value]) => value);
+        const best = lines[0];
         if (!best) { reject(new Error("Missing pvBest[1]")); return; }
-        resolve({ best, second: pvBest.get(2) ?? null });
+        resolve({ best, second: lines[1] ?? null, lines });
       }
     };
 
@@ -574,10 +685,11 @@ function isPuzzleCandidate(params: {
   minEvalDrop: number;
   minSolutionGap: number;
   minWinChance: number;
+  legalMoveCount?: number;
 }): boolean {
-  const { evalBefore, evalAfter, minEvalDrop, minSolutionGap, minWinChance } = params;
+  const { evalBefore, evalAfter, minEvalDrop, minSolutionGap, minWinChance, legalMoveCount } = params;
 
-  if (!isOnlyMoveOrMate(evalBefore, minSolutionGap)) return false;
+  if (!isOnlyMoveOrMate(evalBefore, minSolutionGap, legalMoveCount)) return false;
 
   const bestScore = evalBefore.best.score;
   const playedScore = getPlayedScoreCp(evalAfter);
@@ -681,15 +793,13 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         const currentScoreWhite = turnAfter === "w" ? evalAfter.best.score : -evalAfter.best.score;
 
         const uciMove = pos.movePlayed;
-        const legalMoveCount = (() => { try { return new Chess(pos.fen).moves().length; } catch { return undefined; } })();
+        const legalMoveCount = countLegalMoves(pos.fen);
         // Forced positions (<=1 legal move) are not useful puzzle prompts.
-        if (legalMoveCount !== undefined && legalMoveCount <= 1) continue;
+        if (legalMoveCount <= 1) continue;
         const sacrifice = (legalMoveCount !== 1 && uciMove)
           ? isSacrificeMove(pos.fen, uciMove)
           : false;
         const baseClass = classifyMove(prevScoreWhite, currentScoreWhite, pos.turn, sacrifice, legalMoveCount);
-
-        const playedScore = getPlayedScoreCp(evalAfter);
 
         // ── Step 5: Create SRS puzzles (player turns only) ───────────────
         if (pos.turn !== playerTurn) continue;
@@ -700,6 +810,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           minEvalDrop: config.minEvalDrop,
           minSolutionGap: config.minSolutionGap,
           minWinChance: PUZZLE_MIN_WIN_CHANCE,
+          legalMoveCount,
         });
 
         if (!isPuzzle) continue;
@@ -707,14 +818,32 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         let solutionSan: string;
         let solutionLineSan: string[];
         let validPvLine: string[];
+        let validatedBefore: EvalResult;
+        let validatedAfter: EvalResult;
         try {
+          const deepValidation = await revalidatePuzzleCandidate(
+            engine,
+            pos.fen,
+            pos.movePlayed,
+            config.analysisDepth,
+            config.multiPv,
+            config.minEvalDrop,
+            config.minSolutionGap,
+            PUZZLE_MIN_WIN_CHANCE
+          );
+          if (!deepValidation) continue;
+          validatedBefore = deepValidation.evalBefore;
+          validatedAfter = deepValidation.evalAfter;
+
           // Verify that the PV line is actually forced
           validPvLine = await validatePuzzleLine(
             engine,
             pos.fen,
-            evalBefore.best.pv,
+            validatedBefore.best.pv,
             config.analysisDepth,
-            config.minSolutionGap
+            config.minSolutionGap,
+            Math.max(3, config.multiPv),
+            validatedBefore
           );
           if (validPvLine.length < 1) continue;
 
@@ -733,7 +862,8 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
         }
 
         const phase = detectPhase(pos.fen, pos.moveNumber);
-        const evalDrop = Math.max(0, Math.round(evalBefore.best.score - playedScore));
+        const validatedPlayedScore = getPlayedScoreCp(validatedAfter);
+        const evalDrop = Math.max(0, Math.round(validatedBefore.best.score - validatedPlayedScore));
 
         const puzzle: Omit<Puzzle, "id" | "created_at"> = {
           game_id: gameId,
@@ -746,10 +876,10 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           solution_line_san: solutionLineSan,
           is_brilliant: false,
 
-          eval_before: Math.round(evalBefore.best.score),
-          eval_after: Math.round(playedScore),
-          eval_best: evalBefore.best.score,
-          eval_second_best: evalBefore.second?.score ?? null,
+          eval_before: Math.round(validatedBefore.best.score),
+          eval_after: Math.round(validatedPlayedScore),
+          eval_best: validatedBefore.best.score,
+          eval_second_best: validatedBefore.second?.score ?? null,
           eval_drop: evalDrop,
           move_number: pos.moveNumber,
           player_color: playerColor,
@@ -768,7 +898,7 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           await insertPuzzle(puzzle);
           puzzlesValidated++;
           console.log(
-            `[worker] Puzzle at ply ${i + 1} (class=${baseClass}, drop=${evalDrop}, gap=${getSolutionGapCp(evalBefore)})`
+            `[worker] Puzzle at ply ${i + 1} (class=${baseClass}, drop=${evalDrop}, gap=${getSolutionGapCp(validatedBefore, legalMoveCount)})`
           );
         } catch (insertErr) {
           console.error(
