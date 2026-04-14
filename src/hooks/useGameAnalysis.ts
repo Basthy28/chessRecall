@@ -54,6 +54,41 @@ export interface GameAnalysisResult {
   snapshots: PositionEvaluationSnapshot[];
 }
 
+const REPORT_CLASSIFICATION_ORDER: MoveClassification[] = [
+  "brilliant",
+  "great",
+  "best",
+  "excellent",
+  "good",
+  "inaccuracy",
+  "mistake",
+  "blunder",
+  "book",
+];
+
+function buildGameStats(analyses: MoveAnalysis[]): GameStats {
+  const whiteMoves = analyses.filter((move) => move.turn === "w");
+  const blackMoves = analyses.filter((move) => move.turn === "b");
+  const whiteAccuracy = whiteMoves.length > 0
+    ? whiteMoves.reduce((sum, move) => sum + move.accuracy, 0) / whiteMoves.length
+    : 0;
+  const blackAccuracy = blackMoves.length > 0
+    ? blackMoves.reduce((sum, move) => sum + move.accuracy, 0) / blackMoves.length
+    : 0;
+
+  return {
+    whiteAccuracy: Math.round(whiteAccuracy * 10) / 10,
+    blackAccuracy: Math.round(blackAccuracy * 10) / 10,
+    breakdown: REPORT_CLASSIFICATION_ORDER.map((classification) => ({
+      classification,
+      white: whiteMoves.filter((move) => move.classification === classification).length,
+      black: blackMoves.filter((move) => move.classification === classification).length,
+    })),
+    estimatedWhiteElo: null,
+    estimatedBlackElo: null,
+  };
+}
+
 function parseScore(line: string): number | null {
   const mateMatch = line.match(/\bscore mate (-?\d+)\b/);
   if (mateMatch) {
@@ -244,104 +279,86 @@ export function useGameAnalysis(
       setStats(null);
       setSnapshots([]);
 
-      const total = positions.length;
-      const nextSnapshots: PositionEvaluationSnapshot[] = new Array(total)
-        .fill(null)
-        .map((_, index) => ({ fen: positions[index], score: null, depth: 0 }));
+      try {
+        const total = positions.length;
+        const nextSnapshots: PositionEvaluationSnapshot[] = new Array(total)
+          .fill(null)
+          .map((_, index) => ({ fen: positions[index], score: null, depth: 0 }));
 
-      for (let i = 0; i < total; i++) {
-        if (cancelled || cancelRef.current) break;
+        for (let i = 0; i < total; i++) {
+          if (cancelled || cancelRef.current) break;
 
-        nextSnapshots[i] = await evalPosition(positions[i]);
+          nextSnapshots[i] = await evalPosition(positions[i]);
+
+          if (!cancelled) {
+            setProgress(Math.round(((i + 1) / total) * 100));
+            setSnapshots([...nextSnapshots]);
+          }
+        }
+
+        if (cancelled || cancelRef.current) {
+          return;
+        }
+
+        const analyses: MoveAnalysis[] = [];
+        for (let i = 0; i < moves.length; i++) {
+          const previous = nextSnapshots[i];
+          const current = nextSnapshots[i + 1];
+          if (previous.score === null || current.score === null) continue;
+
+          try {
+            const playedUci = resolvePlayedUci(positions[i], moves[i]);
+            if (!playedUci) continue;
+
+            let turn: "w" | "b" = "w";
+            try {
+              turn = new Chess(positions[i]).turn();
+            } catch {
+              // Use white as a stable fallback if the FEN is malformed.
+            }
+
+            const classification = classifyReviewedMove({
+              parentFen: positions[i],
+              currentFen: positions[i + 1],
+              playedUci,
+              previous,
+              current,
+            });
+            if (!classification) continue;
+
+            const accuracy = getMoveAccuracyFromScores(previous.score, current.score, turn);
+            analyses.push({
+              ply: moves[i].ply,
+              san: moves[i].san,
+              turn,
+              classification,
+              accuracy,
+            });
+          } catch (error) {
+            console.warn("[useGameAnalysis] skipped move during report build", {
+              ply: moves[i]?.ply,
+              fen: positions[i],
+              error,
+            });
+          }
+        }
 
         if (!cancelled) {
-          setProgress(Math.round(((i + 1) / total) * 100));
+          setMoveAnalyses(analyses);
           setSnapshots([...nextSnapshots]);
+          setStats(buildGameStats(analyses));
+          setProgress(100);
         }
-      }
-
-      if (cancelled || cancelRef.current) {
-        setIsAnalyzing(false);
-        return;
-      }
-
-      const analyses: MoveAnalysis[] = [];
-      for (let i = 0; i < moves.length; i++) {
-        const previous = nextSnapshots[i];
-        const current = nextSnapshots[i + 1];
-        if (previous.score === null || current.score === null) continue;
-
-        const playedUci = resolvePlayedUci(positions[i], moves[i]);
-        if (!playedUci) continue;
-
-        let turn: "w" | "b" = "w";
-        try {
-          turn = new Chess(positions[i]).turn();
-        } catch {
-          // Use white as a stable fallback if the FEN is malformed.
+      } catch (error) {
+        console.warn("[useGameAnalysis] report generation failed", error);
+        if (!cancelled) {
+          setMoveAnalyses([]);
+          setStats(buildGameStats([]));
         }
-
-        const classification = classifyReviewedMove({
-          parentFen: positions[i],
-          currentFen: positions[i + 1],
-          playedUci,
-          previous,
-          current,
-        });
-        if (!classification) continue;
-
-        const accuracy = getMoveAccuracyFromScores(previous.score, current.score, turn);
-        analyses.push({
-          ply: moves[i].ply,
-          san: moves[i].san,
-          turn,
-          classification,
-          accuracy,
-        });
-      }
-
-      if (!cancelled) {
-        setMoveAnalyses(analyses);
-        setSnapshots([...nextSnapshots]);
-      }
-
-      const whiteMoves = analyses.filter((move) => move.turn === "w");
-      const blackMoves = analyses.filter((move) => move.turn === "b");
-      const whiteAccuracy = whiteMoves.length > 0
-        ? whiteMoves.reduce((sum, move) => sum + move.accuracy, 0) / whiteMoves.length
-        : 0;
-      const blackAccuracy = blackMoves.length > 0
-        ? blackMoves.reduce((sum, move) => sum + move.accuracy, 0) / blackMoves.length
-        : 0;
-
-      const order: MoveClassification[] = [
-        "brilliant",
-        "great",
-        "best",
-        "excellent",
-        "good",
-        "inaccuracy",
-        "mistake",
-        "blunder",
-        "book",
-      ];
-
-      const breakdown = order.map((classification) => ({
-        classification,
-        white: whiteMoves.filter((move) => move.classification === classification).length,
-        black: blackMoves.filter((move) => move.classification === classification).length,
-      }));
-
-      if (!cancelled) {
-        setStats({
-          whiteAccuracy: Math.round(whiteAccuracy * 10) / 10,
-          blackAccuracy: Math.round(blackAccuracy * 10) / 10,
-          breakdown,
-          estimatedWhiteElo: null,
-          estimatedBlackElo: null,
-        });
-        setIsAnalyzing(false);
-        setProgress(100);
+      } finally {
+        if (!cancelled) {
+          setIsAnalyzing(false);
+        }
       }
     }
 
