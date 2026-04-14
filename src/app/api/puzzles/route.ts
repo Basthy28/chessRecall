@@ -37,10 +37,15 @@ export async function GET(request: Request): Promise<Response> {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const now = new Date().toISOString();
-  const puzzles = await listDuePuzzlesForUser(sessionUser.id, parseLimit(request), now, parseMode(request));
-  const stats = await getPuzzleProgressStatsForUser(sessionUser.id, now);
-  return Response.json({ puzzles, stats });
+  try {
+    const now = new Date().toISOString();
+    const puzzles = await listDuePuzzlesForUser(sessionUser.id, parseLimit(request), now, parseMode(request));
+    const stats = await getPuzzleProgressStatsForUser(sessionUser.id, now);
+    return Response.json({ puzzles, stats });
+  } catch (error) {
+    console.error("[api/puzzles] GET failed", error);
+    return Response.json({ error: "Failed to load puzzles" }, { status: 500 });
+  }
 }
 
 export async function PATCH(request: Request): Promise<Response> {

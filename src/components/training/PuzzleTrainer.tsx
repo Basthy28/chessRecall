@@ -220,6 +220,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [inlineError, setInlineError] = useState<string | null>(null);
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
   // Track which puzzle IDs have been rated this session (for sidebar "done" indicator).
   const [ratedIds, setRatedIds] = useState<Set<string>>(new Set());
@@ -230,6 +231,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   const [isCompactLayout, setIsCompactLayout] = useState(false);
 
   const wrongResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastLoadedModeRef = useRef<PuzzleTrainingMode>("mixed");
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -266,6 +268,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
 
     setLoading(true);
     setError(null);
+    setInlineError(null);
     try {
       const res = await fetch(`/api/puzzles?limit=${PUZZLE_BATCH_LIMIT}&mode=${mode}`, {
         headers: {
@@ -282,14 +285,22 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
       const payload = (await res.json()) as { puzzles?: Puzzle[]; stats?: PuzzleProgressStats };
       setPuzzles(payload.puzzles ?? []);
       setProgressStats(payload.stats ?? null);
+      lastLoadedModeRef.current = mode;
       resetSession();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
+      if (puzzles.length > 0) {
+        setInlineError(`Couldn't load ${mode} puzzles. Showing ${lastLoadedModeRef.current} instead.`);
+        if (mode !== lastLoadedModeRef.current) {
+          setTrainingMode(lastLoadedModeRef.current);
+        }
+      } else {
+        setError(msg);
+      }
     } finally {
       setLoading(false);
     }
-  }, [resetSession, userId]);
+  }, [puzzles.length, resetSession, userId]);
 
   // ── Fetch due puzzles ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -842,6 +853,23 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
           overflowX: "hidden",
         }}
       >
+        {inlineError && (
+          <div
+            style={{
+              width: "100%",
+              maxWidth: "min(900px, calc(100vh - 220px))",
+              padding: "10px 12px",
+              borderRadius: "8px",
+              border: "1px solid rgba(200,120,50,0.32)",
+              background: "rgba(200,120,50,0.1)",
+              color: "#f3c28a",
+              fontSize: "12px",
+              lineHeight: 1.4,
+            }}
+          >
+            {inlineError}
+          </div>
+        )}
         {/* ── Top bar: puzzle count + status ── */}
         <div
           style={{

@@ -489,57 +489,7 @@ export async function listDuePuzzlesForUser(
   const weakAccuracyThreshold = 0.8;
   const weakEaseThreshold = 2.35;
   const accuracyExpr = "coalesce((p.times_correct::float / nullif(p.times_seen, 0)), 0)";
-  const params: Array<string | number> = [userId, nowIso];
-  let where = "p.user_id = $1";
-  let orderBy = "p.created_at DESC";
-
-  switch (mode) {
-    case "review":
-      where += " AND p.times_seen > 0 AND p.srs_due_at IS NOT NULL AND p.srs_due_at <= $2";
-      orderBy = "p.srs_due_at ASC, p.eval_drop DESC, p.last_reviewed_at ASC NULLS FIRST";
-      break;
-    case "new":
-      where += " AND p.times_seen = 0";
-      orderBy = "p.created_at DESC, p.eval_drop DESC";
-      break;
-    case "weak":
-      params.push(nextRotationIso, weakAccuracyThreshold, weakEaseThreshold);
-      where += ` AND p.times_seen > 0
-        AND (p.srs_due_at IS NULL OR p.srs_due_at < $3::timestamptz)
-        AND (${accuracyExpr} < $4 OR p.srs_ease < $5)`;
-      orderBy = `${accuracyExpr} ASC, p.srs_ease ASC, p.last_reviewed_at DESC NULLS LAST, p.eval_drop DESC`;
-      break;
-    case "mixed":
-    default:
-      params.push(nextRotationIso, weakAccuracyThreshold, weakEaseThreshold);
-      where += " AND (p.times_seen = 0 OR p.srs_due_at IS NULL OR p.srs_due_at < $3::timestamptz)";
-      orderBy = `CASE
-          WHEN p.times_seen > 0 AND p.srs_due_at IS NOT NULL AND p.srs_due_at <= $2 THEN 0
-          WHEN p.times_seen > 0 AND (${accuracyExpr} < $4 OR p.srs_ease < $5) THEN 1
-          WHEN p.times_seen = 0 THEN 2
-          ELSE 3
-        END ASC,
-        CASE
-          WHEN p.times_seen > 0 AND p.srs_due_at IS NOT NULL AND p.srs_due_at <= $2 THEN p.srs_due_at
-          ELSE NULL
-        END ASC NULLS LAST,
-        CASE
-          WHEN p.times_seen > 0 THEN ${accuracyExpr}
-          ELSE NULL
-        END ASC NULLS LAST,
-        CASE
-          WHEN p.times_seen = 0 THEN p.created_at
-          ELSE NULL
-        END DESC NULLS LAST,
-        p.eval_drop DESC,
-        p.created_at DESC`;
-      break;
-  }
-
-  params.push(limit);
-  const limitParam = `$${params.length}`;
-  const { rows } = await pool.query(
-    `SELECT
+  const baseSelect = `SELECT
        p.*,
        g.lichess_game_id AS game_lichess_id,
        g.white_username AS game_white_username,
@@ -548,12 +498,71 @@ export async function listDuePuzzlesForUser(
        g.time_control AS game_time_control,
        g.result AS game_result
      FROM puzzles p
-     JOIN games g ON g.id = p.game_id
-     WHERE ${where}
-     ORDER BY ${orderBy}
-     LIMIT ${limitParam}`,
-    params
-  );
+     JOIN games g ON g.id = p.game_id`;
+  let query = "";
+  let params: Array<string | number> = [];
+
+  switch (mode) {
+    case "review":
+      query = `${baseSelect}
+        WHERE p.user_id = $1
+          AND p.times_seen > 0
+          AND p.srs_due_at IS NOT NULL
+          AND p.srs_due_at <= $2
+        ORDER BY p.srs_due_at ASC, p.eval_drop DESC, p.last_reviewed_at ASC NULLS FIRST
+        LIMIT $3`;
+      params = [userId, nowIso, limit];
+      break;
+    case "new":
+      query = `${baseSelect}
+        WHERE p.user_id = $1
+          AND p.times_seen = 0
+        ORDER BY p.created_at DESC, p.eval_drop DESC
+        LIMIT $2`;
+      params = [userId, limit];
+      break;
+    case "weak":
+      query = `${baseSelect}
+        WHERE p.user_id = $1
+          AND p.times_seen > 0
+          AND (p.srs_due_at IS NULL OR p.srs_due_at < $2::timestamptz)
+          AND (${accuracyExpr} < $3 OR p.srs_ease < $4)
+        ORDER BY ${accuracyExpr} ASC, p.srs_ease ASC, p.last_reviewed_at DESC NULLS LAST, p.eval_drop DESC
+        LIMIT $5`;
+      params = [userId, nextRotationIso, weakAccuracyThreshold, weakEaseThreshold, limit];
+      break;
+    case "mixed":
+    default:
+      query = `${baseSelect}
+        WHERE p.user_id = $1
+          AND (p.times_seen = 0 OR p.srs_due_at IS NULL OR p.srs_due_at < $3::timestamptz)
+        ORDER BY
+          CASE
+            WHEN p.times_seen > 0 AND p.srs_due_at IS NOT NULL AND p.srs_due_at <= $2 THEN 0
+            WHEN p.times_seen > 0 AND (${accuracyExpr} < $4 OR p.srs_ease < $5) THEN 1
+            WHEN p.times_seen = 0 THEN 2
+            ELSE 3
+          END ASC,
+          CASE
+            WHEN p.times_seen > 0 AND p.srs_due_at IS NOT NULL AND p.srs_due_at <= $2 THEN p.srs_due_at
+            ELSE NULL
+          END ASC NULLS LAST,
+          CASE
+            WHEN p.times_seen > 0 THEN ${accuracyExpr}
+            ELSE NULL
+          END ASC NULLS LAST,
+          CASE
+            WHEN p.times_seen = 0 THEN p.created_at
+            ELSE NULL
+          END DESC NULLS LAST,
+          p.eval_drop DESC,
+          p.created_at DESC
+        LIMIT $6`;
+      params = [userId, nowIso, nextRotationIso, weakAccuracyThreshold, weakEaseThreshold, limit];
+      break;
+  }
+
+  const { rows } = await pool.query(query, params);
   return rows.map((row) => mapPuzzle(row as Record<string, unknown>));
 }
 
