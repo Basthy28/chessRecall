@@ -88,6 +88,20 @@ function applyUciMove(fen: string, uci: string): string | null {
   }
 }
 
+function uciToSanSafe(fen: string, uci: string): string {
+  try {
+    const chess = new Chess(fen);
+    const move = chess.move({
+      from: uci.slice(0, 2),
+      to: uci.slice(2, 4),
+      promotion: uci.length === 5 ? (uci[4] as "q" | "r" | "b" | "n") : undefined,
+    });
+    return move?.san ?? uci;
+  } catch {
+    return uci;
+  }
+}
+
 // ── Phase display ────────────────────────────────────────────────────────────
 function phaseLabel(phase: string): string {
   switch (phase) {
@@ -237,6 +251,11 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
 
   // Compute Fen and LastMove based on viewPly
   const baseFen = currentPuzzle?.fen ?? "start";
+  const playedInGameLabel = useMemo(() => {
+    if (!currentPuzzle?.blunder_move) return "-";
+    return uciToSanSafe(currentPuzzle.fen, currentPuzzle.blunder_move);
+  }, [currentPuzzle]);
+
   const { displayFen, displayLastMove } = useMemo(() => {
     let f = baseFen;
     let lm: [Key, Key] | undefined;
@@ -874,6 +893,22 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
                 }}
               >
                 Correct!
+              </div>
+            )}
+            {currentPuzzle?.blunder_move && (
+              <div
+                style={{
+                  padding: "4px 10px",
+                  borderRadius: "6px",
+                  background: "rgba(255,255,255,0.03)",
+                  border: "1px solid rgba(255,255,255,0.1)",
+                  fontSize: "12px",
+                  fontWeight: 600,
+                  color: "var(--text-muted)",
+                }}
+                title={`Played in game (UCI): ${currentPuzzle.blunder_move}`}
+              >
+                Played in game: {playedInGameLabel}
               </div>
             )}
           </div>

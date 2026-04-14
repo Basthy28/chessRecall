@@ -10,15 +10,14 @@ ENV NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY
 
 # Copy app files
 COPY package*.json ./
+RUN npm install
+
 COPY tsconfig.json ./
 COPY next.config.ts ./
 COPY postcss.config.mjs ./
 COPY eslint.config.mjs ./
 COPY src ./src
 COPY public ./public
-
-# Install deps
-RUN npm install
 
 # Build app for production
 RUN npm run build

@@ -1853,7 +1853,12 @@ export default function GamesPanel({
       const res = await fetch("/api/import", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
-        body: JSON.stringify({ username, platform: p }),
+        body: JSON.stringify({
+          username,
+          platform: p,
+          fullSync: true,
+          analyzeLimit: 1000,
+        }),
       });
       const payload = (await res.json().catch(() => ({}))) as ImportResponse;
 

@@ -234,35 +234,33 @@ async function validatePuzzleLine(
   for (let i = 0; i < pvUci.length; i++) {
     const moveUci = pvUci[i];
     const isPlayerTurn = (i % 2 === 0);
+    const currentFen = chess.fen();
+    try {
+      // MultiPV=2 to check for alternatives (including the root move at i=0).
+      const ev = await evaluatePosition(
+        engine,
+        currentFen,
+        engineDepth,
+        2,
+        STOCKFISH_VALIDATION_MOVETIME_MS
+      );
 
-    if (i > 0) {
-      const currentFen = chess.fen();
-      try {
-        // MultiPV=2 to check for alternatives
-        const ev = await evaluatePosition(
-          engine,
-          currentFen,
-          engineDepth,
-          2,
-          STOCKFISH_VALIDATION_MOVETIME_MS
-        );
-        
-        // If the engine no longer likes this move, the sequence is unstable.
-        if (ev.best.move !== moveUci) {
-          break;
-        }
-
-        // Only the player's moves need to be "forced" (only winning move).
-        // The opponent just plays the best defense.
-        if (isPlayerTurn && ev.second !== null) {
-          const gap = ev.best.score - ev.second.score;
-          if (gap < minGapCp) {
-            break; // Alternative is too good; not a strict puzzle sequence anymore.
-          }
-        }
-      } catch {
-        break; // Stop extending the puzzle on engine error
+      // If the engine no longer likes this move, the sequence is unstable.
+      if (ev.best.move !== moveUci) {
+        break;
       }
+
+      // Only the player's moves need to be "forced" (only winning move).
+      // The opponent just plays the best defense.
+      if (isPlayerTurn && ev.second !== null) {
+        const gap = ev.best.score - ev.second.score;
+        const ambiguousMate = isWinningMateScore(ev.best.score) && isWinningMateScore(ev.second.score);
+        if (gap < minGapCp || ambiguousMate) {
+          break; // Alternative is too good (or also mating).
+        }
+      }
+    } catch {
+      break; // Stop extending the puzzle on engine error
     }
 
     try {
@@ -284,6 +282,12 @@ async function validatePuzzleLine(
   // Length 2 = player then opponent (even) -> we pop it so it ends on player.
   if (validUci.length % 2 === 0) {
     validUci.pop();
+  }
+
+  // A puzzle must have at least 2 moves: player's forced move + opponent's best response.
+  // Single-move puzzles are just berrada (no real tactic, no choice).
+  if (validUci.length < 2) {
+    return [];
   }
 
   return validUci;
@@ -387,6 +391,10 @@ function isMateScore(score: number): boolean {
   return Math.abs(score) >= MATE_THRESHOLD;
 }
 
+function isWinningMateScore(score: number): boolean {
+  return isMateScore(score) && score > 0;
+}
+
 function getTerminalEval(fen: string): EvalResult | null {
   try {
     const chess = new Chess(fen);
@@ -416,6 +424,12 @@ function getSolutionGapCp(evalBefore: EvalResult): number {
 }
 
 function isOnlyMoveOrMate(evalBefore: EvalResult, minSolutionGap: number): boolean {
+  const bestIsWinningMate = isWinningMateScore(evalBefore.best.score);
+  const secondIsWinningMate = isWinningMateScore(evalBefore.second?.score ?? 0);
+
+  // Two winning mates means the move is not uniquely forced enough for training.
+  if (bestIsWinningMate && secondIsWinningMate) return false;
+
   return isMateScore(evalBefore.best.score) || getSolutionGapCp(evalBefore) >= minSolutionGap;
 }
 
@@ -668,6 +682,8 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
 
         const uciMove = pos.movePlayed;
         const legalMoveCount = (() => { try { return new Chess(pos.fen).moves().length; } catch { return undefined; } })();
+        // Forced positions (<=1 legal move) are not useful puzzle prompts.
+        if (legalMoveCount !== undefined && legalMoveCount <= 1) continue;
         const sacrifice = (legalMoveCount !== 1 && uciMove)
           ? isSacrificeMove(pos.fen, uciMove)
           : false;
@@ -702,7 +718,14 @@ const worker = new Worker<AnalyzeGameJobData, AnalyzeGameJobResult>(
           );
           if (validPvLine.length < 1) continue;
 
-          solutionSan = uciToSan(pos.fen, validPvLine[0]);
+          // If the engine's solution is the exact move that was already played in the game,
+          // this is not a useful puzzle candidate.
+          const solvedMove = validPvLine[0];
+          const playedMove = pos.movePlayed;
+          if (!solvedMove || !playedMove) continue;
+          if (solvedMove === playedMove || solvedMove.slice(0, 4) === playedMove.slice(0, 4)) continue;
+
+          solutionSan = uciToSan(pos.fen, solvedMove);
           solutionLineSan = pvToSan(pos.fen, validPvLine);
         } catch (err) {
           console.warn(`[worker] uciToSan failed at ply ${i + 1}:`, err instanceof Error ? err.message : err);

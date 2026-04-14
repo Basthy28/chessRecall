@@ -9,6 +9,9 @@ COMPOSE_PROD="docker-compose.yml"
 COMPOSE_TEST="docker-compose.test.yml"
 TEST_PROJECT="chessrecall-test"
 PG_CONTAINER="chessrecall-postgres"
+ROOT_FOLDER="/home/ubuntu/chessRecall"
+
+cd "$ROOT_FOLDER"
 
 # Load .env when available so POSTGRES_* defaults can be overridden safely.
 if [[ -f .env ]]; then
@@ -23,6 +26,28 @@ PGDB="${POSTGRES_DB:-chessrecall}"
 
 psql_exec() {
   docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PGUSER" -d "$PGDB" "$@"
+}
+
+redis_exec() {
+  local redis_password="${REDIS_PASSWORD:-}"
+  if [[ -n "$redis_password" ]]; then
+    docker exec -i chessrecall-redis redis-cli -a "$redis_password" "$@"
+  else
+    docker exec -i chessrecall-redis redis-cli "$@"
+  fi
+}
+
+clear_analyze_queue_keys() {
+  # BullMQ stores queue data under bull:<queue-name>*
+  mapfile -t keys < <(redis_exec --scan --pattern "bull:analyze-game*" 2>/dev/null || true)
+
+  if [[ ${#keys[@]} -eq 0 ]]; then
+    echo "No analyze queue keys found in Redis."
+    return 0
+  fi
+
+  redis_exec DEL "${keys[@]}" >/dev/null
+  echo "Cleared ${#keys[@]} analyze queue key(s) from Redis."
 }
 
 require_user_id() {
@@ -67,10 +92,12 @@ case "${1:-help}" in
 
   prod-deploy)
     echo "Deploying to production..."
-    echo "Pulling latest code..."
-    git pull origin main
-    echo "Rebuilding production services only..."
-    docker compose -f "$COMPOSE_PROD" up -d --build --no-deps app worker cloudflared
+    echo "Pulling latest code (fast-forward only)..."
+    git pull --ff-only origin main
+    echo "Building fresh app/worker images..."
+    docker compose -f "$COMPOSE_PROD" build --pull app worker
+    echo "Recreating production services with new images..."
+    docker compose -f "$COMPOSE_PROD" up -d --force-recreate --no-deps app worker cloudflared
     echo "Production deployed!"
     echo "Check at https://chessrecall.qzz.io"
     ;;
@@ -82,9 +109,17 @@ case "${1:-help}" in
     ;;
 
   prod-rebuild)
-    echo "Rebuilding production app/worker/cloudflared only..."
-    docker compose -f "$COMPOSE_PROD" up -d --build --no-deps app worker cloudflared
+    echo "Rebuilding production app/worker and recreating containers..."
+    docker compose -f "$COMPOSE_PROD" build --pull app worker
+    docker compose -f "$COMPOSE_PROD" up -d --force-recreate --no-deps app worker cloudflared
     echo "Production rebuild done"
+    ;;
+
+  prod-rebuild-hard)
+    echo "Hard rebuild production app/worker (no cache) and recreate containers..."
+    docker compose -f "$COMPOSE_PROD" build --no-cache --pull app worker
+    docker compose -f "$COMPOSE_PROD" up -d --force-recreate --no-deps app worker cloudflared
+    echo "Production hard rebuild done"
     ;;
 
   prod-logs)
@@ -133,6 +168,21 @@ case "${1:-help}" in
     echo "Purge complete for user_id=$2"
     ;;
 
+  db-purge-user-safe)
+    require_user_id "$1" "$2"
+    echo "Safe purge for user_id=$2: stop worker -> purge DB -> clear analyze queue -> start worker"
+    docker compose -f "$COMPOSE_PROD" stop worker >/dev/null || true
+    psql_exec -c "
+      BEGIN;
+      DELETE FROM import_sync_cooldowns WHERE user_id = '$2'::uuid;
+      DELETE FROM games WHERE user_id = '$2'::uuid;
+      COMMIT;
+    "
+    clear_analyze_queue_keys
+    docker compose -f "$COMPOSE_PROD" up -d worker >/dev/null
+    echo "Safe purge complete for user_id=$2"
+    ;;
+
   db-requeue-analyzed)
     require_user_id "$1" "$2"
     echo "Resetting analyzed games for user_id=$2 back to 'failed' (puzzles wiped for clean re-run)..."
@@ -165,6 +215,7 @@ PRODUCTION:
   ./ops.sh prod-deploy  Pull + rebuild app/worker/cloudflared
   ./ops.sh prod-up      Recover/start production safely (no test impact)
   ./ops.sh prod-rebuild Rebuild app/worker/cloudflared only
+  ./ops.sh prod-rebuild-hard Force no-cache rebuild app/worker + recreate containers
   ./ops.sh prod-logs    Follow production app logs
 
 MONITORING:
@@ -174,6 +225,7 @@ DB OPERATIONS (Local Postgres only):
   ./ops.sh db-users                      List users present in games
   ./ops.sh db-user-stats <user_id>       Show games/puzzles/cooldowns for a user
   ./ops.sh db-purge-user <user_id>       Delete local data for a user
+  ./ops.sh db-purge-user-safe <user_id>  Purge user + clear analyze queue safely (stop/start worker)
   ./ops.sh db-requeue-analyzed <user_id> Reset all analyzed games to failed + wipe their puzzles (re-run analysis)
 
 WORKFLOW EXAMPLE:
