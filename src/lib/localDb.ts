@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-import type { Game, GameStatus, Puzzle, PuzzleProgressStats } from "@/types";
+import type { Game, GameStatus, Puzzle, PuzzleProgressStats, PuzzleTrainingMode } from "@/types";
 
 type Platform = "lichess" | "chess.com" | "all";
 type SrsChoice = "hard" | "good" | "easy";
@@ -477,9 +477,67 @@ export async function resetPuzzleSrsForUser(userId: string): Promise<number> {
   return rowCount ?? 0;
 }
 
-export async function listDuePuzzlesForUser(userId: string, limit: number, nowIso: string): Promise<Puzzle[]> {
+export async function listDuePuzzlesForUser(
+  userId: string,
+  limit: number,
+  nowIso: string,
+  mode: PuzzleTrainingMode = "mixed"
+): Promise<Puzzle[]> {
   await ensureSchema();
   const pool = getPool();
+  const nextRotationIso = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+  const weakAccuracyThreshold = 0.8;
+  const weakEaseThreshold = 2.35;
+  const accuracyExpr = "coalesce((p.times_correct::float / nullif(p.times_seen, 0)), 0)";
+  const params: Array<string | number> = [userId, nowIso];
+  let where = "p.user_id = $1";
+  let orderBy = "p.created_at DESC";
+
+  switch (mode) {
+    case "review":
+      where += " AND p.times_seen > 0 AND p.srs_due_at IS NOT NULL AND p.srs_due_at <= $2";
+      orderBy = "p.srs_due_at ASC, p.eval_drop DESC, p.last_reviewed_at ASC NULLS FIRST";
+      break;
+    case "new":
+      where += " AND p.times_seen = 0";
+      orderBy = "p.created_at DESC, p.eval_drop DESC";
+      break;
+    case "weak":
+      params.push(nextRotationIso, weakAccuracyThreshold, weakEaseThreshold);
+      where += ` AND p.times_seen > 0
+        AND (p.srs_due_at IS NULL OR p.srs_due_at < $3::timestamptz)
+        AND (${accuracyExpr} < $4 OR p.srs_ease < $5)`;
+      orderBy = `${accuracyExpr} ASC, p.srs_ease ASC, p.last_reviewed_at DESC NULLS LAST, p.eval_drop DESC`;
+      break;
+    case "mixed":
+    default:
+      params.push(nextRotationIso, weakAccuracyThreshold, weakEaseThreshold);
+      where += " AND (p.times_seen = 0 OR p.srs_due_at IS NULL OR p.srs_due_at < $3::timestamptz)";
+      orderBy = `CASE
+          WHEN p.times_seen > 0 AND p.srs_due_at IS NOT NULL AND p.srs_due_at <= $2 THEN 0
+          WHEN p.times_seen > 0 AND (${accuracyExpr} < $4 OR p.srs_ease < $5) THEN 1
+          WHEN p.times_seen = 0 THEN 2
+          ELSE 3
+        END ASC,
+        CASE
+          WHEN p.times_seen > 0 AND p.srs_due_at IS NOT NULL AND p.srs_due_at <= $2 THEN p.srs_due_at
+          ELSE NULL
+        END ASC NULLS LAST,
+        CASE
+          WHEN p.times_seen > 0 THEN ${accuracyExpr}
+          ELSE NULL
+        END ASC NULLS LAST,
+        CASE
+          WHEN p.times_seen = 0 THEN p.created_at
+          ELSE NULL
+        END DESC NULLS LAST,
+        p.eval_drop DESC,
+        p.created_at DESC`;
+      break;
+  }
+
+  params.push(limit);
+  const limitParam = `$${params.length}`;
   const { rows } = await pool.query(
     `SELECT
        p.*,
@@ -491,11 +549,10 @@ export async function listDuePuzzlesForUser(userId: string, limit: number, nowIs
        g.result AS game_result
      FROM puzzles p
      JOIN games g ON g.id = p.game_id
-     WHERE p.user_id = $1
-       AND (p.srs_due_at IS NULL OR p.srs_due_at <= $2)
-     ORDER BY p.srs_due_at ASC NULLS FIRST
-     LIMIT $3`,
-    [userId, nowIso, limit]
+     WHERE ${where}
+     ORDER BY ${orderBy}
+     LIMIT ${limitParam}`,
+    params
   );
   return rows.map((row) => mapPuzzle(row as Record<string, unknown>));
 }
@@ -509,7 +566,7 @@ export async function getPuzzleProgressStatsForUser(
   const { rows } = await pool.query(
     `SELECT
        count(*)::int AS total,
-       count(*) FILTER (WHERE srs_due_at IS NULL OR srs_due_at <= $2)::int AS due_now,
+       count(*) FILTER (WHERE times_seen > 0 AND srs_due_at IS NOT NULL AND srs_due_at <= $2)::int AS due_now,
        count(*) FILTER (WHERE times_seen = 0)::int AS unseen,
        count(*) FILTER (
          WHERE times_seen > 0

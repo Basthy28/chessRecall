@@ -5,6 +5,7 @@ import {
   resetPuzzleSrsForUser,
 } from "@/lib/localDb";
 import { getUserFromRequest } from "@/lib/supabase";
+import type { PuzzleTrainingMode } from "@/types";
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -14,6 +15,15 @@ function parseLimit(request: Request): number {
   const raw = Number(url.searchParams.get("limit") ?? DEFAULT_LIMIT);
   if (!Number.isFinite(raw)) return DEFAULT_LIMIT;
   return Math.max(1, Math.min(Math.floor(raw), MAX_LIMIT));
+}
+
+function parseMode(request: Request): PuzzleTrainingMode {
+  const url = new URL(request.url);
+  const raw = url.searchParams.get("mode");
+  if (raw === "review" || raw === "new" || raw === "weak" || raw === "mixed") {
+    return raw;
+  }
+  return "mixed";
 }
 
 export async function GET(request: Request): Promise<Response> {
@@ -28,7 +38,7 @@ export async function GET(request: Request): Promise<Response> {
   }
 
   const now = new Date().toISOString();
-  const puzzles = await listDuePuzzlesForUser(sessionUser.id, parseLimit(request), now);
+  const puzzles = await listDuePuzzlesForUser(sessionUser.id, parseLimit(request), now, parseMode(request));
   const stats = await getPuzzleProgressStatsForUser(sessionUser.id, now);
   return Response.json({ puzzles, stats });
 }

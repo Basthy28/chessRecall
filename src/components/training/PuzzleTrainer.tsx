@@ -6,11 +6,19 @@ import type { Key } from "chessground/types";
 import type { DrawShape } from "chessground/draw";
 import ChessBoard from "@/components/board/ChessBoard";
 import { getClientAuthHeaders } from "@/lib/supabase";
-import type { Puzzle, PuzzleProgressStats } from "@/types";
+import type { Puzzle, PuzzleProgressStats, PuzzleTrainingMode } from "@/types";
 import type { MoveAnnotationOverlay } from "@/components/board/ChessBoard";
 import { useLiveAnalysis } from "@/hooks/useLiveAnalysis";
 import { classifyMove } from "@/lib/analysis";
 import { useAuth } from "@/hooks/useAuth";
+import {
+  formatDueLabel,
+  getPuzzleReason,
+  getPuzzleStageMeta,
+  MiniStatCard,
+  StagePill,
+  TrainingModeSelector,
+} from "@/components/training/puzzle/puzzleUi";
 
 // Helper: format centipawns as +1.23 / -0.45 / M3
 function formatEvalPt(score: number): string {
@@ -24,6 +32,8 @@ function formatEvalPt(score: number): string {
 
 type SrsChoice = "hard" | "good" | "easy";
 type PuzzleState = "solving" | "wrong" | "correct" | "rating";
+const PUZZLE_BATCH_LIMIT = 20;
+const TRAINING_MODE_STORAGE_KEY = "chessRecall:puzzleTrainingMode";
 
 // ── SRS button config ────────────────────────────────────────────────────────
 const SRS_BUTTONS: Array<{
@@ -113,7 +123,17 @@ function phaseLabel(phase: string): string {
 }
 
 // ── Empty state ───────────────────────────────────────────────────────────────
-function NoPuzzlesState() {
+function NoPuzzlesState({
+  mode,
+  onModeChange,
+  onReload,
+  isCompactLayout,
+}: {
+  mode: PuzzleTrainingMode;
+  onModeChange: (mode: PuzzleTrainingMode) => void;
+  onReload: () => void;
+  isCompactLayout: boolean;
+}) {
   return (
     <div
       style={{
@@ -149,134 +169,30 @@ function NoPuzzlesState() {
           No puzzles due!
         </div>
         <div style={{ fontSize: "13px", color: "var(--text-muted)", maxWidth: "280px" }}>
-          Check back later — your next review will be scheduled based on how well you know each position.
+          This mode is empty right now. You can switch to another training route or reload the next batch from your library.
         </div>
       </div>
+      <div style={{ width: "100%", maxWidth: "440px", display: "flex", flexDirection: "column", gap: "10px" }}>
+        <TrainingModeSelector mode={mode} onChange={onModeChange} compact={isCompactLayout} />
+        <button
+          type="button"
+          onClick={onReload}
+          style={{
+            padding: "10px 14px",
+            borderRadius: "8px",
+            border: "1px solid var(--border)",
+            background: "var(--bg-elevated)",
+            color: "var(--text-primary)",
+            cursor: "pointer",
+            fontSize: "13px",
+            fontFamily: "inherit",
+            fontWeight: 600,
+          }}
+        >
+          Reload current mode
+        </button>
+      </div>
     </div>
-  );
-}
-
-type PuzzleStageMeta = {
-  label: string;
-  note: string;
-  color: string;
-  bg: string;
-  border: string;
-};
-
-function formatDueLabel(value: string | null): string | null {
-  if (!value) return null;
-  const diffMs = new Date(value).getTime() - Date.now();
-  const absMs = Math.abs(diffMs);
-
-  if (absMs < 15 * 60_000) return "Due now";
-
-  const mins = Math.round(absMs / 60_000);
-  if (mins < 60) return diffMs < 0 ? `${mins}m overdue` : `In ${mins}m`;
-
-  const hours = Math.round(absMs / 3_600_000);
-  if (hours < 24) return diffMs < 0 ? `${hours}h overdue` : `In ${hours}h`;
-
-  const days = Math.round(absMs / 86_400_000);
-  return diffMs < 0 ? `${days}d overdue` : `In ${days}d`;
-}
-
-function getPuzzleStageMeta(puzzle: Puzzle): PuzzleStageMeta {
-  const seen = puzzle.times_seen ?? 0;
-  const correct = puzzle.times_correct ?? 0;
-  const accuracy = seen > 0 ? correct / seen : 0;
-
-  if (seen === 0) {
-    return {
-      label: "Fresh",
-      note: "Brand-new motif from one of your games.",
-      color: "#c0a060",
-      bg: "rgba(192,160,96,0.12)",
-      border: "rgba(192,160,96,0.3)",
-    };
-  }
-
-  if (correct === 0 || accuracy < 0.35) {
-    return {
-      label: "Repair",
-      note: "Still not stable. Clean execution matters here.",
-      color: "#f6b43d",
-      bg: "rgba(246,180,61,0.14)",
-      border: "rgba(246,180,61,0.32)",
-    };
-  }
-
-  if (seen < 3 || accuracy < 0.75) {
-    return {
-      label: "Learning",
-      note: "The idea is there, but it still needs repetition.",
-      color: "#81b64c",
-      bg: "rgba(129,182,76,0.13)",
-      border: "rgba(129,182,76,0.3)",
-    };
-  }
-
-  if (puzzle.srs_ease >= 2.7 && accuracy >= 0.85 && correct >= 3) {
-    return {
-      label: "Mastery",
-      note: "Long-term retention check. Keep it clean.",
-      color: "#4a9e8e",
-      bg: "rgba(74,158,142,0.15)",
-      border: "rgba(74,158,142,0.32)",
-    };
-  }
-
-  return {
-    label: "Reinforce",
-    note: "Known pattern, back now to make it stick.",
-    color: "#5c8bb0",
-    bg: "rgba(92,139,176,0.15)",
-    border: "rgba(92,139,176,0.32)",
-  };
-}
-
-function getPuzzleReason(puzzle: Puzzle, stage: PuzzleStageMeta): string {
-  if (puzzle.times_seen === 0) return "Fresh extraction from one of your games.";
-  if (puzzle.times_correct === 0) return "You still have not solved this motif cleanly.";
-
-  const gap = puzzle.eval_second_best === null ? null : Math.abs(puzzle.eval_best - puzzle.eval_second_best);
-  if (gap !== null && gap >= 120) return "This is close to an only-move decision, so precision matters.";
-
-  if (puzzle.srs_due_at && new Date(puzzle.srs_due_at).getTime() <= Date.now()) {
-    return "Its review window expired, so it is back now before the idea fades.";
-  }
-
-  return stage.note;
-}
-
-function MiniStatCard({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div style={{ padding: "10px 8px", background: "#1a1917", border: "1px solid #3c3a38", borderRadius: "8px", textAlign: "center" }}>
-      <div style={{ fontSize: "10px", color: "#8b8987", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
-      <div style={{ marginTop: "4px", fontSize: "15px", fontWeight: 800, color: "#fff", fontVariantNumeric: "tabular-nums" }}>{value}</div>
-    </div>
-  );
-}
-
-function StagePill({ stage, compact = false }: { stage: PuzzleStageMeta; compact?: boolean }) {
-  return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: compact ? "1px 6px" : "3px 8px",
-        borderRadius: "999px",
-        background: stage.bg,
-        border: `1px solid ${stage.border}`,
-        color: stage.color,
-        fontSize: compact ? "10px" : "11px",
-        fontWeight: 700,
-        whiteSpace: "nowrap",
-      }}
-    >
-      {stage.label}
-    </span>
   );
 }
 
@@ -287,6 +203,8 @@ interface PuzzleTrainerProps {
 
 export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) {
   const { userId } = useAuth();
+  const [trainingMode, setTrainingMode] = useState<PuzzleTrainingMode>("mixed");
+  const [modeReady, setModeReady] = useState(false);
   const [puzzles, setPuzzles] = useState<Puzzle[]>([]);
   const [progressStats, setProgressStats] = useState<PuzzleProgressStats | null>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -313,42 +231,71 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
 
   const wrongResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── Fetch due puzzles ─────────────────────────────────────────────────────
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = window.localStorage.getItem(TRAINING_MODE_STORAGE_KEY);
+    if (stored === "mixed" || stored === "review" || stored === "new" || stored === "weak") {
+      setTrainingMode(stored);
+    }
+    setModeReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!modeReady || typeof window === "undefined") return;
+    window.localStorage.setItem(TRAINING_MODE_STORAGE_KEY, trainingMode);
+  }, [trainingMode, modeReady]);
+
+  const resetSession = useCallback(() => {
+    setCurrentIndex(0);
+    setRatedIds(new Set());
+    setPlayedMoves([]);
+    setViewPly(0);
+    setState("solving");
+    setWrongFen(undefined);
+    setWrongLastMove(undefined);
+    setMistakeCount(0);
+    setWasRevealed(false);
+  }, []);
+
+  const fetchPuzzles = useCallback(async (mode: PuzzleTrainingMode) => {
     if (!userId) {
       setError("Sign in to load puzzles.");
       setLoading(false);
       return;
     }
-    async function fetchPuzzles() {
-      setLoading(true);
-      setError(null);
-      try {
-        const res = await fetch("/api/puzzles?limit=20", {
-          headers: {
-            ...(await getClientAuthHeaders()),
-          },
-        });
-        if (!res.ok) {
-          const payload = (await res.json().catch(() => ({}))) as { error?: string };
-          if (res.status === 401) {
-            throw new Error("Sign in to load puzzles.");
-          }
-          throw new Error(payload.error ?? "Failed to load puzzles");
-        }
-        const payload = (await res.json()) as { puzzles?: Puzzle[]; stats?: PuzzleProgressStats };
-        setPuzzles(payload.puzzles ?? []);
-        setProgressStats(payload.stats ?? null);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        setError(msg);
-      } finally {
-        setLoading(false);
-      }
-    }
 
-    void fetchPuzzles();
-  }, [userId]);
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/puzzles?limit=${PUZZLE_BATCH_LIMIT}&mode=${mode}`, {
+        headers: {
+          ...(await getClientAuthHeaders()),
+        },
+      });
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => ({}))) as { error?: string };
+        if (res.status === 401) {
+          throw new Error("Sign in to load puzzles.");
+        }
+        throw new Error(payload.error ?? "Failed to load puzzles");
+      }
+      const payload = (await res.json()) as { puzzles?: Puzzle[]; stats?: PuzzleProgressStats };
+      setPuzzles(payload.puzzles ?? []);
+      setProgressStats(payload.stats ?? null);
+      resetSession();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg);
+    } finally {
+      setLoading(false);
+    }
+  }, [resetSession, userId]);
+
+  // ── Fetch due puzzles ─────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!modeReady) return;
+    void fetchPuzzles(trainingMode);
+  }, [fetchPuzzles, modeReady, trainingMode]);
 
   // ── Reset board when puzzle changes ──────────────────────────────────────
   const currentPuzzle = puzzles[currentIndex] ?? null;
@@ -441,12 +388,15 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
       // Silently fail — puzzle still advances
     }
 
-    // Mark as rated and move to next puzzle
-    if (currentPuzzle) {
-      setRatedIds((prev) => new Set(prev).add(currentPuzzle.id));
+    setRatedIds((prev) => new Set(prev).add(currentPuzzle.id));
+
+    if (currentIndex >= puzzles.length - 1) {
+      await fetchPuzzles(trainingMode);
+      return;
     }
+
     setCurrentIndex((prev) => prev + 1);
-  }, [currentPuzzle, mistakeCount, wasRevealed]);
+  }, [currentIndex, currentPuzzle, fetchPuzzles, mistakeCount, puzzles.length, trainingMode, wasRevealed]);
 
   // ── Keyboard shortcuts for SRS rating & history review ─────────────────────
   useEffect(() => {
@@ -619,17 +569,6 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   const isCorrect = state === "correct" || state === "rating";
   const isRating = state === "rating";
 
-  // Compute the FEN at the end of the played solution (for live analysis)
-  const solutionFen = useMemo(() => {
-    if (!currentPuzzle || playedMoves.length === 0) return currentPuzzle?.fen ?? "";
-    let f = currentPuzzle.fen;
-    for (const uci of playedMoves) {
-      const nf = applyUciMove(f, uci);
-      if (nf) f = nf;
-    }
-    return f;
-  }, [currentPuzzle, playedMoves]);
-
   // Live analysis: only active after the puzzle is solved
   const { lines: engineLines, depth: engineDepth, isSearching: engineSearching } = useLiveAnalysis(
     displayFen,
@@ -734,7 +673,9 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
           Failed to load puzzles: {error}
         </div>
         <button
-          onClick={() => window.location.reload()}
+          onClick={() => {
+            void fetchPuzzles(trainingMode);
+          }}
           style={{
             padding: "7px 16px",
             borderRadius: "6px",
@@ -750,10 +691,6 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
         </button>
       </div>
     );
-  }
-
-  if (puzzles.length === 0 || !currentPuzzle) {
-    return <NoPuzzlesState />;
   }
 
   // All puzzles done
@@ -809,14 +746,49 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
           <div style={{ fontSize: "16px", fontWeight: 700, color: "var(--text-primary)", marginBottom: "6px" }}>
             Session complete!
           </div>
-          <div style={{ fontSize: "13px", color: "var(--text-muted)", maxWidth: "280px" }}>
+          <div style={{ fontSize: "13px", color: "var(--text-muted)", maxWidth: "320px" }}>
             You reviewed {puzzles.length} puzzle{puzzles.length === 1 ? "" : "s"}.
             {nextDueLabel && (
               <> Your next review is due <span style={{ color: "var(--text-secondary)", fontWeight: 600 }}>{nextDueLabel}</span>.</>
             )}
           </div>
         </div>
+        <div style={{ width: "100%", maxWidth: "460px", display: "flex", flexDirection: "column", gap: "10px" }}>
+          <TrainingModeSelector mode={trainingMode} onChange={setTrainingMode} compact={isCompactLayout} />
+          <button
+            type="button"
+            onClick={() => {
+              void fetchPuzzles(trainingMode);
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: "8px",
+              border: "1px solid var(--border)",
+              background: "var(--bg-elevated)",
+              color: "var(--text-primary)",
+              cursor: "pointer",
+              fontSize: "13px",
+              fontFamily: "inherit",
+              fontWeight: 600,
+            }}
+          >
+            Load next batch
+          </button>
+        </div>
       </div>
+    );
+  }
+
+  if (puzzles.length === 0 || !currentPuzzle) {
+    return (
+      <NoPuzzlesState
+        mode={trainingMode}
+        onModeChange={setTrainingMode}
+        onReload={() => {
+          void fetchPuzzles(trainingMode);
+        }}
+        isCompactLayout={isCompactLayout}
+      />
     );
   }
 
@@ -834,18 +806,16 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   const onlyMoveGap =
     currentPuzzle.eval_second_best === null ? null : Math.round(Math.abs(currentPuzzle.eval_best - currentPuzzle.eval_second_best));
   const evalSwingLabel = `${(currentPuzzle.eval_drop / 100).toFixed(2)} pawns`;
-  const sessionSummary =
-    ratedIds.size === 0
-      ? "Fresh session. Start clean and push the easy ones out."
-      : ratedIds.size === puzzles.length - 1
-        ? "Final rep of the session. Lock this one in."
-        : `${puzzles.length - ratedIds.size} puzzle${puzzles.length - ratedIds.size === 1 ? "" : "s"} still in today's route.`;
   const focusCards = [
     { label: "Swing", value: evalSwingLabel },
     { label: "Only Move Gap", value: onlyMoveGap !== null ? `${(onlyMoveGap / 100).toFixed(2)}` : "Multi-choice" },
     { label: "Clean Rate", value: currentAccuracy !== null ? `${currentAccuracy}%` : "New" },
     { label: "Next Check", value: currentDueLabel ?? "After rating" },
   ];
+  const routeSummary =
+    progressStats && progressStats.due_now > puzzles.length
+      ? `${progressStats.due_now} review-ready positions in your library. This batch loaded ${puzzles.length}.`
+      : `${puzzles.length} puzzle${puzzles.length === 1 ? "" : "s"} loaded in this batch.`;
 
   return (
     <div
@@ -1062,50 +1032,6 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
                 Played in game: {playedInGameLabel}
               </div>
             )}
-          </div>
-        </div>
-
-        <div
-          style={{
-            width: "100%",
-            maxWidth: "min(900px, calc(100vh - 220px))",
-            display: "grid",
-            gridTemplateColumns: isCompactLayout ? "1fr" : "minmax(0, 1.4fr) minmax(0, 1fr)",
-            gap: "12px",
-          }}
-        >
-          <div
-            style={{
-              padding: "14px 16px",
-              borderRadius: "10px",
-              border: `1px solid ${currentStage.border}`,
-              background: "linear-gradient(135deg, rgba(255,255,255,0.02) 0%, rgba(0,0,0,0.18) 100%)",
-              display: "flex",
-              flexDirection: "column",
-              gap: "8px",
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
-              <div>
-                <div style={{ fontSize: "10px", color: "#8b8987", textTransform: "uppercase", letterSpacing: "0.08em" }}>Training Focus</div>
-                <div style={{ marginTop: "4px", fontSize: "18px", fontWeight: 800, color: "#fff" }}>
-                  {phaseLabel(currentPuzzle.phase)} {currentPuzzle.player_color === "white" ? "attack" : "defense"}
-                </div>
-              </div>
-              <StagePill stage={currentStage} />
-            </div>
-            <div style={{ fontSize: "13px", color: "#c9c6c1", lineHeight: 1.5 }}>
-              {currentReason}
-            </div>
-            <div style={{ fontSize: "12px", color: "#8b8987" }}>
-              {sessionSummary}
-            </div>
-          </div>
-
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
-            {focusCards.map((item) => (
-              <MiniStatCard key={item.label} label={item.label} value={item.value} />
-            ))}
           </div>
         </div>
 
@@ -1350,6 +1276,10 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
       >
         {progressStats && (
           <div style={{ display: "flex", flexDirection: "column", gap: "12px", padding: "14px", borderBottom: "1px solid #3c3a38" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              <div style={{ fontSize: "10px", color: "#8b8987", textTransform: "uppercase", letterSpacing: "0.08em" }}>Training Mode</div>
+              <TrainingModeSelector mode={trainingMode} onChange={setTrainingMode} compact />
+            </div>
             <div
               style={{
                 padding: "14px",
@@ -1374,20 +1304,50 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
                 <div style={{ width: `${sessionProgressPercent}%`, height: "100%", background: "linear-gradient(90deg, #81b64c 0%, #c0a060 100%)", transition: "width 180ms ease" }} />
               </div>
               <div style={{ fontSize: "12px", color: "#c9c6c1", lineHeight: 1.5 }}>
+                {routeSummary}
+              </div>
+            </div>
+
+            <div
+              style={{
+                padding: "14px",
+                borderRadius: "10px",
+                border: `1px solid ${currentStage.border}`,
+                background: "linear-gradient(135deg, rgba(255,255,255,0.02) 0%, rgba(0,0,0,0.18) 100%)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "10px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontSize: "10px", color: "#8b8987", textTransform: "uppercase", letterSpacing: "0.08em" }}>Current Focus</div>
+                  <div style={{ marginTop: "4px", fontSize: "17px", fontWeight: 800, color: "#fff" }}>
+                    {phaseLabel(currentPuzzle.phase)} {currentPuzzle.player_color === "white" ? "attack" : "defense"}
+                  </div>
+                </div>
+                <StagePill stage={currentStage} compact />
+              </div>
+              <div style={{ fontSize: "12px", color: "#c9c6c1", lineHeight: 1.5 }}>
                 {currentReason}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
+                {focusCards.map((item) => (
+                  <MiniStatCard key={item.label} label={item.label} value={item.value} />
+                ))}
               </div>
             </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "8px" }}>
               {[
-                { label: "Due", value: progressStats.due_now },
+                { label: "Review Due", value: progressStats.due_now, title: "Positions ready to review right now, including unseen ones." },
                 { label: "Mastered", value: progressStats.mastered },
-                { label: "Accuracy", value: `${Math.round(progressStats.accuracy * 100)}%` },
-                { label: "Unseen", value: progressStats.unseen },
-                { label: "Learning", value: progressStats.learning },
-                { label: "Total", value: progressStats.total },
+                { label: "Clean Rate", value: `${Math.round(progressStats.accuracy * 100)}%`, title: "How often you solved without reveal or mistakes." },
+                { label: "New", value: progressStats.unseen, title: "Never reviewed yet." },
+                { label: "In Rotation", value: progressStats.learning, title: "Seen before and still actively cycling in SRS." },
+                { label: "Library", value: progressStats.total, title: "Total puzzles stored for this account." },
               ].map((item) => (
-                <MiniStatCard key={item.label} label={item.label} value={item.value} />
+                <MiniStatCard key={item.label} label={item.label} value={item.value} title={item.title} />
               ))}
             </div>
           </div>

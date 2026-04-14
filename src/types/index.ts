@@ -11,6 +11,7 @@ export type GameResult = "win" | "loss" | "draw";
 export type GameStatus = "pending" | "processing" | "analyzed" | "failed";
 export type PuzzlePhase = "opening" | "middlegame" | "endgame";
 export type PuzzleStatus = "pending" | "validated" | "rejected";
+export type PuzzleTrainingMode = "mixed" | "review" | "new" | "weak";
 export type SrsRating = 1 | 2 | 3 | 4 | 5; // Ease factor buckets
 
 // ------------------------------------------------------------------
