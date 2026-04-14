@@ -34,6 +34,13 @@ type SrsChoice = "hard" | "good" | "easy";
 type PuzzleState = "solving" | "wrong" | "correct" | "rating";
 const PUZZLE_BATCH_LIMIT = 20;
 const TRAINING_MODE_STORAGE_KEY = "chessRecall:puzzleTrainingMode";
+const PUZZLE_SESSION_SOLVED_STORAGE_KEY = "chessRecall:puzzleSessionSolvedCount";
+
+type PuzzleReviewTarget = {
+  gameId: string;
+  reviewIndex?: number;
+  sidebarTab?: "engine" | "report";
+};
 
 // ── SRS button config ────────────────────────────────────────────────────────
 const SRS_BUTTONS: Array<{
@@ -122,6 +129,12 @@ function phaseLabel(phase: string): string {
   }
 }
 
+function getPuzzleReviewIndex(puzzle: Puzzle): number {
+  return puzzle.player_color === "white"
+    ? Math.max(0, puzzle.move_number * 2 - 1)
+    : Math.max(0, puzzle.move_number * 2);
+}
+
 // ── Empty state ───────────────────────────────────────────────────────────────
 function NoPuzzlesState({
   mode,
@@ -198,7 +211,7 @@ function NoPuzzlesState({
 
 // ── Main Component ────────────────────────────────────────────────────────────
 interface PuzzleTrainerProps {
-  onOpenGameReview?: (gameId: string) => void;
+  onOpenGameReview?: (target: PuzzleReviewTarget) => void;
 }
 
 export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) {
@@ -224,10 +237,12 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
   // Track which puzzle IDs have been rated this session (for sidebar "done" indicator).
   const [ratedIds, setRatedIds] = useState<Set<string>>(new Set());
+  const [sessionSolvedCount, setSessionSolvedCount] = useState(0);
   // Experimental reset state
   const [resetting, setResetting] = useState(false);
   const [mistakeCount, setMistakeCount] = useState(0);
   const [wasRevealed, setWasRevealed] = useState(false);
+  const [showPlayedMove, setShowPlayedMove] = useState(false);
   const [isCompactLayout, setIsCompactLayout] = useState(false);
 
   const wrongResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -239,6 +254,13 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
     if (stored === "mixed" || stored === "review" || stored === "new" || stored === "weak") {
       setTrainingMode(stored);
     }
+    const storedSolved = window.sessionStorage.getItem(PUZZLE_SESSION_SOLVED_STORAGE_KEY);
+    if (storedSolved) {
+      const parsed = Number(storedSolved);
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        setSessionSolvedCount(Math.floor(parsed));
+      }
+    }
     setModeReady(true);
   }, []);
 
@@ -246,6 +268,11 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
     if (!modeReady || typeof window === "undefined") return;
     window.localStorage.setItem(TRAINING_MODE_STORAGE_KEY, trainingMode);
   }, [trainingMode, modeReady]);
+
+  useEffect(() => {
+    if (!modeReady || typeof window === "undefined") return;
+    window.sessionStorage.setItem(PUZZLE_SESSION_SOLVED_STORAGE_KEY, String(sessionSolvedCount));
+  }, [modeReady, sessionSolvedCount]);
 
   const resetSession = useCallback(() => {
     setCurrentIndex(0);
@@ -257,6 +284,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
     setWrongLastMove(undefined);
     setMistakeCount(0);
     setWasRevealed(false);
+    setShowPlayedMove(false);
   }, []);
 
   const fetchPuzzles = useCallback(async (mode: PuzzleTrainingMode) => {
@@ -320,6 +348,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
     setWrongLastMove(undefined);
     setMistakeCount(0);
     setWasRevealed(false);
+    setShowPlayedMove(false);
   }, [currentPuzzle]);
 
   useEffect(() => {
@@ -400,6 +429,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
     }
 
     setRatedIds((prev) => new Set(prev).add(currentPuzzle.id));
+    setSessionSolvedCount((prev) => prev + 1);
 
     if (currentIndex >= puzzles.length - 1) {
       await fetchPuzzles(trainingMode);
@@ -620,15 +650,27 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
       cls = classifyMove(prevScore, currScore, turnBefore, isSacrifice);
     } catch { return undefined; }
 
-    if (!cls || cls === "book" || cls === "best" || cls === "good" || cls === "excellent") return undefined;
+    if (!cls || cls === "book") return undefined;
 
     const destSquare = lastUci.slice(2, 4) as Key;
-    const SYMBOLS: Record<string, string> = { brilliant: "!!", great: "!", inaccuracy: "?!", mistake: "?", blunder: "??", miss: "?" };
+    const SYMBOLS: Record<string, string> = {
+      brilliant: "!!",
+      great: "!",
+      inaccuracy: "?!",
+      mistake: "?",
+      blunder: "??",
+      miss: "?",
+    };
     const symbol = SYMBOLS[cls];
     if (!symbol) return undefined;
     
     const CLASSIFICATION_COLOR: Record<string, string> = {
-      brilliant: "#1baca6", great: "#5c8bb0", inaccuracy: "#f6b43d", mistake: "#ee6b23", blunder: "#fa412d", miss: "#ff7769",
+      brilliant: "#1baca6",
+      great: "#5c8bb0",
+      inaccuracy: "#f6b43d",
+      mistake: "#ee6b23",
+      blunder: "#fa412d",
+      miss: "#ff7769",
     };
 
     return { square: destSquare, symbol, color: CLASSIFICATION_COLOR[cls] ?? "#999" };
@@ -808,6 +850,11 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   const currentStage = getPuzzleStageMeta(currentPuzzle);
   const currentReason = getPuzzleReason(currentPuzzle, currentStage);
   const currentDueLabel = formatDueLabel(currentPuzzle.srs_due_at);
+  const currentReviewTarget: PuzzleReviewTarget = {
+    gameId: currentPuzzle.game_id,
+    reviewIndex: getPuzzleReviewIndex(currentPuzzle),
+    sidebarTab: "report",
+  };
   const sessionProgress = puzzles.length > 0 ? ratedIds.size / puzzles.length : 0;
   const sessionProgressPercent = Math.round(sessionProgress * 100);
   const currentAccuracy =
@@ -953,7 +1000,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
                   type="button"
                   onClick={() => {
                     if (currentPuzzle.game_id && onOpenGameReview) {
-                      onOpenGameReview(currentPuzzle.game_id);
+                      onOpenGameReview(currentReviewTarget);
                     }
                   }}
                   disabled={!onOpenGameReview}
@@ -1045,7 +1092,9 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
               </div>
             )}
             {currentPuzzle?.blunder_move && (
-              <div
+              <button
+                type="button"
+                onClick={() => setShowPlayedMove((prev) => !prev)}
                 style={{
                   padding: "4px 10px",
                   borderRadius: "6px",
@@ -1054,11 +1103,13 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
                   fontSize: "12px",
                   fontWeight: 600,
                   color: "var(--text-muted)",
+                  cursor: "pointer",
+                  fontFamily: "inherit",
                 }}
-                title={`Played in game (UCI): ${currentPuzzle.blunder_move}`}
+                title={showPlayedMove ? `Played in game (UCI): ${currentPuzzle.blunder_move}` : "Reveal the move that was played in the game"}
               >
-                Played in game: {playedInGameLabel}
-              </div>
+                {showPlayedMove ? `Played in game: ${playedInGameLabel}` : "Reveal played move"}
+              </button>
             )}
           </div>
         </div>
@@ -1184,7 +1235,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
           {currentPuzzle.game_id && onOpenGameReview && (
             <button
               type="button"
-              onClick={() => onOpenGameReview(currentPuzzle.game_id)}
+              onClick={() => onOpenGameReview(currentReviewTarget)}
               style={{
                 alignSelf: "flex-start",
                 padding: "8px 12px",
@@ -1323,7 +1374,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
                 <div>
                   <div style={{ fontSize: "10px", color: "#a7a29a", textTransform: "uppercase", letterSpacing: "0.08em" }}>Today&apos;s Route</div>
                   <div style={{ marginTop: "4px", fontSize: "17px", fontWeight: 800, color: "#fff" }}>
-                    {ratedIds.size}/{puzzles.length} solved this session
+                    {sessionSolvedCount} solved this session
                   </div>
                 </div>
                 <StagePill stage={currentStage} compact />

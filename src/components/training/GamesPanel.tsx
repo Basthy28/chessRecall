@@ -101,7 +101,7 @@ interface LiveReviewResponse {
 }
 
 interface GamesPanelProps {
-  requestedReviewGameId?: string | null;
+  requestedReviewTarget?: { gameId: string; reviewIndex?: number; sidebarTab?: "engine" | "report" } | null;
   onRequestedReviewHandled?: () => void;
 }
 
@@ -573,11 +573,13 @@ function ReviewView({
   review,
   reviewIndex,
   setReviewIndex,
+  initialSidebarTab,
   onClose,
 }: {
   review: LiveReviewResponse;
   reviewIndex: number;
   setReviewIndex: React.Dispatch<React.SetStateAction<number>>;
+  initialSidebarTab?: "engine" | "report";
   onClose: () => void;
 }) {
   const [windowWidth, setWindowWidth] = useState(1280);
@@ -637,7 +639,7 @@ function ReviewView({
   const { lines, depth, isSearching, error } = useLiveAnalysis(activeFen);
 
   // ── Sidebar tab ───────────────────────────────────────────────────────────
-  const [sidebarTab, setSidebarTab] = useState<"engine" | "report">("engine");
+  const [sidebarTab, setSidebarTab] = useState<"engine" | "report">(initialSidebarTab ?? "engine");
 
   // ── Background full-game analysis ────────────────────────────────────────
   const gameAnalysis = useGameAnalysis(review.positions, review.moves);
@@ -1635,7 +1637,7 @@ function ReviewView({
 
 // ── Main component ─────────────────────────────────────────────────
 export default function GamesPanel({
-  requestedReviewGameId = null,
+  requestedReviewTarget = null,
   onRequestedReviewHandled,
 }: GamesPanelProps) {
   const [platform, setPlatform] = useState<Platform>("all");
@@ -1666,6 +1668,7 @@ export default function GamesPanel({
   const [gameSearch, setGameSearch] = useState("");
   const [isCompactLayout, setIsCompactLayout] = useState(false);
   const lastRequestedReviewIdRef = useRef<string | null>(null);
+  const [reviewStartTab, setReviewStartTab] = useState<"engine" | "report">("engine");
 
   useEffect(() => {
     const refreshLinkedAccounts = () => {
@@ -2027,7 +2030,10 @@ export default function GamesPanel({
     }
   }
 
-  async function openLiveReview(gameId = selectedGameId) {
+  async function openLiveReview(
+    gameId = selectedGameId,
+    options?: { reviewIndex?: number; sidebarTab?: "engine" | "report" }
+  ) {
     if (!gameId) { setMessage("Select a game first."); return; }
     setReviewLoading(true);
     setMessage("");
@@ -2043,7 +2049,8 @@ export default function GamesPanel({
       } else {
         // Go directly into the review board — no intermediate report screen
         setReview(json);
-        setReviewIndex(0);
+        setReviewIndex(options?.reviewIndex ?? 0);
+        setReviewStartTab(options?.sidebarTab ?? "engine");
       }
     } catch {
       setMessage("Network error while opening live review.");
@@ -2053,25 +2060,31 @@ export default function GamesPanel({
   }
 
   useEffect(() => {
-    if (!requestedReviewGameId) {
+    if (!requestedReviewTarget) {
       lastRequestedReviewIdRef.current = null;
       return;
     }
-    if (lastRequestedReviewIdRef.current === requestedReviewGameId) return;
-    lastRequestedReviewIdRef.current = requestedReviewGameId;
-    setSelectedGameId(requestedReviewGameId);
-    void openLiveReview(requestedReviewGameId).finally(() => {
+    const targetSignature = `${requestedReviewTarget.gameId}:${requestedReviewTarget.reviewIndex ?? 0}:${requestedReviewTarget.sidebarTab ?? "engine"}`;
+    if (lastRequestedReviewIdRef.current === targetSignature) return;
+    lastRequestedReviewIdRef.current = targetSignature;
+    setSelectedGameId(requestedReviewTarget.gameId);
+    void openLiveReview(requestedReviewTarget.gameId, {
+      reviewIndex: requestedReviewTarget.reviewIndex,
+      sidebarTab: requestedReviewTarget.sidebarTab,
+    }).finally(() => {
       onRequestedReviewHandled?.();
     });
-  }, [requestedReviewGameId, onRequestedReviewHandled]);
+  }, [requestedReviewTarget, onRequestedReviewHandled]);
 
   // ── Review mode: full chess.com-style layout ───────────────────
   if (review) {
     return (
       <ReviewView
+        key={`${review.game.id}:${reviewStartTab}:${reviewIndex}`}
         review={review}
         reviewIndex={reviewIndex}
         setReviewIndex={setReviewIndex}
+        initialSidebarTab={reviewStartTab}
         onClose={() => { setReview(null); setReviewIndex(0); }}
       />
     );

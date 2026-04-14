@@ -16,6 +16,12 @@ import {
 } from "@/lib/linkedAccounts";
 import type { Puzzle } from "@/types";
 
+type RequestedReviewTarget = {
+  gameId: string;
+  reviewIndex?: number;
+  sidebarTab?: "engine" | "report";
+};
+
 // Placeholder puzzles — will be replaced by real Supabase data in Phase 2
 const MOCK_PUZZLES: Puzzle[] = [
   {
@@ -188,7 +194,7 @@ export default function TrainingDashboard() {
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [chessComAvatar, setChessComAvatar] = useState<string | null>(null);
-  const [requestedReviewGameId, setRequestedReviewGameId] = useState<string | null>(null);
+  const [requestedReviewTarget, setRequestedReviewTarget] = useState<RequestedReviewTarget | null>(null);
 
   // Fetch chess.com avatar from linked account
   useEffect(() => {
@@ -484,13 +490,13 @@ export default function TrainingDashboard() {
       >
         {activeNav === "games" ? (
           <GamesPanel
-            requestedReviewGameId={requestedReviewGameId}
-            onRequestedReviewHandled={() => setRequestedReviewGameId(null)}
+            requestedReviewTarget={requestedReviewTarget}
+            onRequestedReviewHandled={() => setRequestedReviewTarget(null)}
           />
         ) : (
           <PuzzleTrainer
-            onOpenGameReview={(gameId) => {
-              setRequestedReviewGameId(gameId);
+            onOpenGameReview={(target) => {
+              setRequestedReviewTarget(target);
               setActiveNav("games");
             }}
           />
