@@ -3,37 +3,33 @@
 /**
  * useGameAnalysis — background full-game WASM analysis.
  *
- * Runs a separate Stockfish worker (single-threaded, depth 14) that evaluates
- * every position in the game sequentially. Produces per-move classifications,
- * per-player accuracy scores, and a breakdown table — all computed client-side
- * without any DB writes.
- *
- * Design notes:
- *   - Uses its own Worker instance, separate from useLiveAnalysis.
- *   - Positions are evaluated sequentially (one at a time) to avoid racing.
- *   - The hook cancels in-progress analysis on unmount or when inputs change.
+ * Runs a separate Stockfish worker that evaluates every position in the game
+ * sequentially at a WintrChess-like depth. Produces:
+ *   - stable per-position snapshots (score + top 2 engine choices)
+ *   - per-move classifications aligned with the shared review reporter
+ *   - per-player accuracies using the WintrChess/Lichess formula
  */
 
 import { useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
-import { classifyMove, getExpectedPointsLoss, isSacrificeMove } from "@/lib/analysis";
+
 import type { MoveClassification } from "@/lib/analysis";
-import { isBookPosition } from "@/lib/ecoBook";
+import {
+  classifyReviewedMove,
+  getMoveAccuracyFromScores,
+  type PositionEvaluationSnapshot,
+} from "@/lib/reviewReporter";
 
-// ── Config ─────────────────────────────────────────────────────────────────────
 const BG_ENGINE_URL = "/stockfish/stockfish-18-single.js";
-/** Depth for background analysis — enough for accurate classification. */
-const BG_DEPTH = 14;
-/** Per-position timeout — failsafe for stalled engine. */
-const BG_TIMEOUT_MS = 12_000;
+const BG_DEPTH = Math.max(10, Number(process.env.NEXT_PUBLIC_ANALYSIS_DEPTH ?? 16));
+const BG_MULTI_PV = 2;
+const BG_TIMEOUT_MS = 16_000;
 
-// ── Types ──────────────────────────────────────────────────────────────────────
 export interface MoveAnalysis {
   ply: number;
   san: string;
   turn: "w" | "b";
   classification: MoveClassification;
-  /** Lichess accuracy formula: 0–100 */
   accuracy: number;
 }
 
@@ -51,73 +47,78 @@ export interface GameStats {
 
 export interface GameAnalysisResult {
   isAnalyzing: boolean;
-  /** 0–100 during analysis, 100 when complete */
   progress: number;
   moves: MoveAnalysis[];
   stats: GameStats | null;
-  /** White-POV centipawn eval for each position (index 0 = start, index N = after move N-1) */
   positionEvals: (number | null)[];
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────────
-
-/** WintrChess / Lichess accuracy formula. pointLoss is in [0, 1]. */
-function moveAccuracy(pointLoss: number): number {
-  return Math.max(0, Math.min(100, 103.16 * Math.exp(-4 * pointLoss) - 3.17));
-}
-
-/** Simple accuracy → Elo lookup based on empirical data. */
-function accuracyToElo(accuracy: number): number {
-  if (accuracy >= 98) return 2800;
-  if (accuracy >= 95) return 2500;
-  if (accuracy >= 90) return 2200;
-  if (accuracy >= 85) return 1900;
-  if (accuracy >= 80) return 1700;
-  if (accuracy >= 75) return 1500;
-  if (accuracy >= 70) return 1300;
-  if (accuracy >= 65) return 1100;
-  if (accuracy >= 60) return 1000;
-  return 900;
+  snapshots: PositionEvaluationSnapshot[];
 }
 
 function parseScore(line: string): number | null {
   const mateMatch = line.match(/\bscore mate (-?\d+)\b/);
   if (mateMatch) {
-    const m = parseInt(mateMatch[1], 10);
-    return m > 0 ? 100_000 - m : -100_000 - m;
+    const mate = parseInt(mateMatch[1], 10);
+    return mate > 0 ? 100_000 - mate : -100_000 - mate;
   }
   const cpMatch = line.match(/\bscore cp (-?\d+)\b/);
   return cpMatch ? parseInt(cpMatch[1], 10) : null;
 }
 
-// ── Hook ───────────────────────────────────────────────────────────────────────
-/**
- * @param positions  Array of FEN strings: positions[0] = start, positions[N] = after move N-1.
- *                   Length must be moves.length + 1.
- * @param moves      Array of { san, ply } for each move.
- * @param enabled    Set to false to skip analysis (e.g. when the view is not visible).
- */
+function normaliseScore(raw: number, turn: "w" | "b"): number {
+  return turn === "w" ? raw : -raw;
+}
+
+function terminalSnapshot(fen: string): PositionEvaluationSnapshot {
+  try {
+    const board = new Chess(fen);
+    if (board.moves().length > 0) {
+      return { fen, score: null, depth: 0 };
+    }
+    if (board.isCheckmate()) {
+      return { fen, score: board.turn() === "w" ? -99_999 : 99_999, depth: 0 };
+    }
+    return { fen, score: 0, depth: 0 };
+  } catch {
+    return { fen, score: null, depth: 0 };
+  }
+}
+
+function resolvePlayedUci(
+  fen: string,
+  move: { san: string; from?: string; to?: string },
+): string | null {
+  if (move.from && move.to) return `${move.from}${move.to}`;
+
+  try {
+    const board = new Chess(fen);
+    const played = board.move(move.san);
+    if (!played) return null;
+    const promotion = played.promotion ?? "";
+    return `${played.from}${played.to}${promotion}`;
+  } catch {
+    return null;
+  }
+}
+
 export function useGameAnalysis(
   positions: string[],
   moves: Array<{ san: string; ply: number; from?: string; to?: string }>,
   enabled = true,
 ): GameAnalysisResult {
-  const workerRef  = useRef<Worker | null>(null);
-  const cancelRef  = useRef(false);
+  const workerRef = useRef<Worker | null>(null);
+  const cancelRef = useRef(false);
 
-  const [workerReady,  setWorkerReady]  = useState(false);
-  const [isAnalyzing,  setIsAnalyzing]  = useState(false);
-  const [progress,     setProgress]     = useState(0);
+  const [workerReady, setWorkerReady] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [progress, setProgress] = useState(0);
   const [moveAnalyses, setMoveAnalyses] = useState<MoveAnalysis[]>([]);
-  const [stats,        setStats]        = useState<GameStats | null>(null);
-  const [positionEvals, setPositionEvals] = useState<(number | null)[]>([]);
+  const [stats, setStats] = useState<GameStats | null>(null);
+  const [snapshots, setSnapshots] = useState<PositionEvaluationSnapshot[]>([]);
 
-  // ── Boot the background engine ────────────────────────────────────────────
   useEffect(() => {
     if (!enabled || typeof Worker === "undefined") return;
 
     cancelRef.current = false;
-    setWorkerReady(false);
 
     const worker = new Worker(BG_ENGINE_URL);
     workerRef.current = worker;
@@ -125,13 +126,13 @@ export function useGameAnalysis(
     worker.onmessage = (e: MessageEvent<string>) => {
       const line = typeof e.data === "string" ? e.data : "";
       if (line === "uciok") {
-        // Single thread + small hash to minimise competition with live analysis
         worker.postMessage("setoption name Threads value 1");
         worker.postMessage("setoption name Hash value 64");
+        worker.postMessage(`setoption name MultiPV value ${BG_MULTI_PV}`);
         worker.postMessage("setoption name UCI_AnalyseMode value true");
         worker.postMessage("isready");
       } else if (line === "readyok") {
-        worker.onmessage = null; // hand off control to evalPosition
+        worker.onmessage = null;
         setWorkerReady(true);
       }
     };
@@ -152,40 +153,82 @@ export function useGameAnalysis(
     };
   }, [enabled]);
 
-  // ── Run analysis once the engine is ready ─────────────────────────────────
   useEffect(() => {
     if (!workerReady || !enabled || positions.length < 2 || moves.length === 0) return;
 
     let cancelled = false;
 
-    /** Evaluates a single FEN, returns side-to-move score or null on error/timeout. */
-    function evalPosition(fen: string): Promise<number | null> {
+    function evalPosition(fen: string): Promise<PositionEvaluationSnapshot> {
       return new Promise((resolve) => {
         const worker = workerRef.current;
-        if (!worker) { resolve(null); return; }
+        if (!worker) {
+          resolve(terminalSnapshot(fen));
+          return;
+        }
 
-        const timeout = setTimeout(() => {
+        const fallback = terminalSnapshot(fen);
+        if (fallback.score !== null && fallback.depth === 0) {
+          resolve(fallback);
+          return;
+        }
+
+        let bestDepth = 0;
+        const scores = new Map<number, number>();
+        const topMoves = new Map<number, string>();
+
+        const timeout = window.setTimeout(() => {
           worker.onmessage = null;
-          resolve(null);
+          resolve({
+            fen,
+            score: scores.has(1) ? scores.get(1)! : fallback.score,
+            depth: bestDepth,
+            topMove: topMoves.get(1),
+            secondScore: scores.get(2),
+          });
         }, BG_TIMEOUT_MS);
-
-        let bestScore: number | null = null;
-        let highestDepth = 0;
 
         worker.onmessage = (e: MessageEvent<string>) => {
           const line = typeof e.data === "string" ? e.data : "";
-          if (line.startsWith("info") && line.includes("depth")) {
-            const dm = line.match(/\bdepth (\d+)\b/);
-            const d  = dm ? parseInt(dm[1], 10) : 0;
-            if (d >= highestDepth) {
-              const s = parseScore(line);
-              if (s !== null) { highestDepth = d; bestScore = s; }
+
+          if (line.startsWith("info") && line.includes("multipv")) {
+            const depthMatch = line.match(/\bdepth (\d+)\b/);
+            const mpvMatch = line.match(/\bmultipv (\d+)\b/);
+            const pvMatch = line.match(/\bpv (.+)$/);
+            const score = parseScore(line);
+            const rawDepth = depthMatch ? parseInt(depthMatch[1], 10) : 0;
+            const pvIndex = mpvMatch ? parseInt(mpvMatch[1], 10) : 0;
+
+            if (!pvMatch || score === null || pvIndex < 1 || pvIndex > BG_MULTI_PV) return;
+            if (rawDepth < bestDepth) return;
+
+            if (rawDepth > bestDepth) {
+              bestDepth = rawDepth;
+              scores.clear();
+              topMoves.clear();
             }
-          } else if (line.startsWith("bestmove")) {
-            clearTimeout(timeout);
-            worker.onmessage = null;
-            resolve(bestScore);
+
+            try {
+              const turn = new Chess(fen).turn();
+              scores.set(pvIndex, normaliseScore(score, turn));
+              topMoves.set(pvIndex, pvMatch[1].trim().split(/\s+/)[0]);
+            } catch {
+              scores.set(pvIndex, score);
+              topMoves.set(pvIndex, pvMatch[1].trim().split(/\s+/)[0]);
+            }
+            return;
           }
+
+          if (!line.startsWith("bestmove")) return;
+
+          window.clearTimeout(timeout);
+          worker.onmessage = null;
+          resolve({
+            fen,
+            score: scores.has(1) ? scores.get(1)! : fallback.score,
+            depth: bestDepth,
+            topMove: topMoves.get(1),
+            secondScore: scores.get(2),
+          });
         };
 
         worker.postMessage("ucinewgame");
@@ -199,29 +242,21 @@ export function useGameAnalysis(
       setProgress(0);
       setMoveAnalyses([]);
       setStats(null);
-      setPositionEvals([]);
+      setSnapshots([]);
 
-      // Evaluate all N+1 positions (before each move + final position)
       const total = positions.length;
-      const evals: (number | null)[] = new Array(total).fill(null);
+      const nextSnapshots: PositionEvaluationSnapshot[] = new Array(total)
+        .fill(null)
+        .map((_, index) => ({ fen: positions[index], score: null, depth: 0 }));
 
       for (let i = 0; i < total; i++) {
         if (cancelled || cancelRef.current) break;
 
-        const rawScore = await evalPosition(positions[i]);
-        if (rawScore !== null) {
-          // Convert side-to-move score → white's POV
-          try {
-            const turn = new Chess(positions[i]).turn();
-            evals[i] = turn === "w" ? rawScore : -rawScore;
-          } catch {
-            evals[i] = rawScore;
-          }
-        }
+        nextSnapshots[i] = await evalPosition(positions[i]);
 
         if (!cancelled) {
           setProgress(Math.round(((i + 1) / total) * 100));
-          setPositionEvals([...evals]);
+          setSnapshots([...nextSnapshots]);
         }
       }
 
@@ -230,71 +265,80 @@ export function useGameAnalysis(
         return;
       }
 
-      // Classify each move
       const analyses: MoveAnalysis[] = [];
       for (let i = 0; i < moves.length; i++) {
-        const evalBefore = evals[i];
-        const evalAfter  = evals[i + 1];
-        if (evalBefore === null || evalAfter === null) continue;
+        const previous = nextSnapshots[i];
+        const current = nextSnapshots[i + 1];
+        if (previous.score === null || current.score === null) continue;
+
+        const playedUci = resolvePlayedUci(positions[i], moves[i]);
+        if (!playedUci) continue;
 
         let turn: "w" | "b" = "w";
-        try { turn = new Chess(positions[i]).turn(); } catch { /* skip */ }
-
-        // Book move: if the destination position is in the ECO database
-        if (isBookPosition(positions[i + 1])) {
-          analyses.push({ ply: moves[i].ply, san: moves[i].san, turn, classification: "book", accuracy: 100 });
-          continue;
-        }
-
-        // Forced move + sacrifice detection
-        let legalMoveCount: number | undefined;
-        let sacrifice = false;
         try {
-          const board = new Chess(positions[i]);
-          legalMoveCount = board.moves().length;
-        } catch { /* ignore */ }
-        const uci = moves[i].from != null && moves[i].to != null ? moves[i].from! + moves[i].to! : null;
-        if (uci && legalMoveCount !== 1) {
-          sacrifice = isSacrificeMove(positions[i], uci);
+          turn = new Chess(positions[i]).turn();
+        } catch {
+          // Use white as a stable fallback if the FEN is malformed.
         }
 
-        const classification = classifyMove(evalBefore, evalAfter, turn, sacrifice, legalMoveCount);
-        const pointLoss      = getExpectedPointsLoss(evalBefore, evalAfter, turn);
-        const accuracy       = moveAccuracy(pointLoss);
+        const classification = classifyReviewedMove({
+          parentFen: positions[i],
+          currentFen: positions[i + 1],
+          playedUci,
+          previous,
+          current,
+        });
+        if (!classification) continue;
 
-        analyses.push({ ply: moves[i].ply, san: moves[i].san, turn, classification, accuracy });
+        const accuracy = getMoveAccuracyFromScores(previous.score, current.score, turn);
+        analyses.push({
+          ply: moves[i].ply,
+          san: moves[i].san,
+          turn,
+          classification,
+          accuracy,
+        });
       }
 
       if (!cancelled) {
         setMoveAnalyses(analyses);
-        setPositionEvals(evals);
+        setSnapshots([...nextSnapshots]);
       }
 
-      // Aggregate stats
-      const wMoves = analyses.filter(m => m.turn === "w");
-      const bMoves = analyses.filter(m => m.turn === "b");
-      const wAcc = wMoves.length > 0
-        ? wMoves.reduce((s, m) => s + m.accuracy, 0) / wMoves.length : 0;
-      const bAcc = bMoves.length > 0
-        ? bMoves.reduce((s, m) => s + m.accuracy, 0) / bMoves.length : 0;
+      const whiteMoves = analyses.filter((move) => move.turn === "w");
+      const blackMoves = analyses.filter((move) => move.turn === "b");
+      const whiteAccuracy = whiteMoves.length > 0
+        ? whiteMoves.reduce((sum, move) => sum + move.accuracy, 0) / whiteMoves.length
+        : 0;
+      const blackAccuracy = blackMoves.length > 0
+        ? blackMoves.reduce((sum, move) => sum + move.accuracy, 0) / blackMoves.length
+        : 0;
 
-      // WintrChess display order (Critical/great requires multi-PV; background analysis shows 0)
-      const CLS_ORDER: MoveClassification[] = [
-        "brilliant", "great", "best", "excellent", "good", "inaccuracy", "mistake", "blunder", "book",
+      const order: MoveClassification[] = [
+        "brilliant",
+        "great",
+        "best",
+        "excellent",
+        "good",
+        "inaccuracy",
+        "mistake",
+        "blunder",
+        "book",
       ];
-      const breakdown = CLS_ORDER.map(cls => ({
-        classification: cls,
-        white: wMoves.filter(m => m.classification === cls).length,
-        black: bMoves.filter(m => m.classification === cls).length,
+
+      const breakdown = order.map((classification) => ({
+        classification,
+        white: whiteMoves.filter((move) => move.classification === classification).length,
+        black: blackMoves.filter((move) => move.classification === classification).length,
       }));
 
       if (!cancelled) {
         setStats({
-          whiteAccuracy:      Math.round(wAcc * 10) / 10,
-          blackAccuracy:      Math.round(bAcc * 10) / 10,
+          whiteAccuracy: Math.round(whiteAccuracy * 10) / 10,
+          blackAccuracy: Math.round(blackAccuracy * 10) / 10,
           breakdown,
-          estimatedWhiteElo:  accuracyToElo(wAcc),
-          estimatedBlackElo:  accuracyToElo(bAcc),
+          estimatedWhiteElo: null,
+          estimatedBlackElo: null,
         });
         setIsAnalyzing(false);
         setProgress(100);
@@ -302,10 +346,17 @@ export function useGameAnalysis(
     }
 
     void analyze();
-    return () => { cancelled = true; };
-  // positions and moves are stable per-game (ReviewView remounts for each game)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workerReady, enabled]);
+    return () => {
+      cancelled = true;
+    };
+  }, [workerReady, enabled, positions, moves]);
 
-  return { isAnalyzing, progress, moves: moveAnalyses, stats, positionEvals };
+  return {
+    isAnalyzing,
+    progress,
+    moves: moveAnalyses,
+    stats,
+    positionEvals: snapshots.map((snapshot) => snapshot.score),
+    snapshots,
+  };
 }

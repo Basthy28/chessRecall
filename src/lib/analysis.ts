@@ -124,11 +124,13 @@ export function classifyMove(
   // Forced move (only one legal option) — classify as best regardless of eval
   if (legalMoveCount !== undefined && legalMoveCount <= 1) return "best";
 
-  const sign          = turnBefore === "w" ? 1 : -1;
-  const prevWinning   = prevScore    * sign > 0;
-  const currWinning   = currentScore * sign > 0;
-  const prevMate      = isMate(prevScore);
-  const currMate      = isMate(currentScore);
+  const sign = turnBefore === "w" ? 1 : -1;
+  const prevSubjective = prevScore * sign;
+  const currSubjective = currentScore * sign;
+  const prevWinning = prevSubjective > 0;
+  const currWinning = currSubjective > 0;
+  const prevMate = isMate(prevScore);
+  const currMate = isMate(currentScore);
 
   // ── Mate → Mate ────────────────────────────────────────────────────────────
   if (prevMate && currMate) {
@@ -137,9 +139,12 @@ export function classifyMove(
       const mateIn = 100_000 - Math.abs(currentScore);
       return mateIn > 3 ? "mistake" : "blunder";
     }
-    // Measure mate distance change (negative = improved, positive = worsened)
-    const mateLoss = (prevScore - currentScore) * sign;
-    if (mateLoss < 0) return "best";
+
+    // For the losing side, preserving the mate distance is still best.
+    const previousMateValue = 100_000 - Math.abs(prevScore);
+    const currentMateValue = 100_000 - Math.abs(currentScore);
+    const mateLoss = (currentMateValue - previousMateValue) * sign;
+    if (mateLoss < 0 || (mateLoss === 0 && currSubjective < 0)) return "best";
     if (mateLoss < 2) return "excellent";
     if (mateLoss < 7) return "good";
     return "inaccuracy";
@@ -147,17 +152,11 @@ export function classifyMove(
 
   // ── Mate → Centipawn (had a forced mate, played a non-mate move) ───────────
   if (prevMate && !currMate) {
-    const currSubjective = currentScore * sign;
-    if (prevWinning) {
-      // Missed the win
-      if (currSubjective >= 800) return "excellent";
-      if (currSubjective >= 400) return "good";
-      if (currSubjective >= 200) return "inaccuracy";
-      if (currSubjective >= 0)   return "mistake";
-      return "blunder";
-    }
-    // Was losing to mate, escaped to centipawn eval — excellent escape
-    return currSubjective >= 0 ? "best" : "excellent";
+    if (currSubjective >= 800) return "excellent";
+    if (currSubjective >= 400) return "good";
+    if (currSubjective >= 200) return "inaccuracy";
+    if (currSubjective >= 0) return "mistake";
+    return "blunder";
   }
 
   // ── Centipawn → Mate (found or walked into a mate) ────────────────────────

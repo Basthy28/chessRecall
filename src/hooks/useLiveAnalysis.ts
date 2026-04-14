@@ -3,13 +3,10 @@
 /**
  * useLiveAnalysis — shared browser-side Stockfish 18 WASM analysis hook.
  *
- * Adapted from the Wintrchess RealtimeEngine pattern:
- *   - Engine class wraps a Web Worker with promise-based log consumption
- *   - Positions are queued with a debounce; a running search is stopped before
- *     starting a new one
- *   - Lines update progressively as depth increases (streaming result)
- *
- * Scores are always from White's perspective (engine output is negated for Black).
+ * Adapted from the WintrChess realtime engine pattern:
+ *   - analysis is depth-driven by default (instead of movetime-driven)
+ *   - we keep only the deepest consistent MultiPV set
+ *   - positions are queued/debounced and an active search is stopped before a new one
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -17,13 +14,19 @@ import { Chess } from "chess.js";
 
 // ── Engine config ──────────────────────────────────────────────────────────────
 const ANALYSIS_ENGINE_URL = "/stockfish/stockfish-18-single.js";
-const ANALYSIS_MULTI_PV   = 3;
-const ANALYSIS_DEBOUNCE_MS = 150;
-const ANALYSIS_MOVETIME_MS = Math.max(
-  2_500,
-  Number(process.env.NEXT_PUBLIC_ANALYSIS_MOVETIME_MS ?? 8_000)
+const ANALYSIS_MULTI_PV = Math.max(
+  1,
+  Math.min(5, Number(process.env.NEXT_PUBLIC_ANALYSIS_MULTI_PV ?? 2)),
 );
-const ANALYSIS_TIMEOUT_MS  = ANALYSIS_MOVETIME_MS + 6_000;
+const ANALYSIS_DEBOUNCE_MS = 150;
+export const LIVE_ANALYSIS_DEPTH = Math.max(
+  10,
+  Number(process.env.NEXT_PUBLIC_ANALYSIS_DEPTH ?? 16),
+);
+const ANALYSIS_TIMEOUT_MS = Math.max(
+  12_000,
+  Number(process.env.NEXT_PUBLIC_ANALYSIS_TIMEOUT_MS ?? 18_000),
+);
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 export interface AnalysisLine {
@@ -180,7 +183,7 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
     worker.postMessage("ucinewgame");
     worker.postMessage(`setoption name MultiPV value ${ANALYSIS_MULTI_PV}`);
     worker.postMessage(`position fen ${queued.fen}`);
-    worker.postMessage(`go movetime ${ANALYSIS_MOVETIME_MS}`);
+      worker.postMessage(`go depth ${LIVE_ANALYSIS_DEPTH}`);
   }, [clearTimeout_]);
 
   // ── Boot the Web Worker ──────────────────────────────────────────────────
@@ -290,8 +293,11 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
 
   // ── Boot once on mount ───────────────────────────────────────────────────
   useEffect(() => {
-    bootWorker();
+    const bootTimer = window.setTimeout(() => {
+      bootWorker();
+    }, 0);
     return () => {
+      window.clearTimeout(bootTimer);
       clearTimeout_();
       if (debounceRef.current !== null) window.clearTimeout(debounceRef.current);
       if (workerRef.current) {
@@ -311,11 +317,11 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
 
     if (debounceRef.current !== null) window.clearTimeout(debounceRef.current);
 
-    // Optimistically clear stale data & mark searching
-    setIsSearching(true);
-    setError("");
-
     debounceRef.current = window.setTimeout(() => {
+      // Optimistically clear stale data once the queued request is real.
+      setIsSearching(true);
+      setError("");
+
       let turn: "w" | "b";
       try { turn = new Chess(fen).turn(); } catch { turn = "w"; }
 

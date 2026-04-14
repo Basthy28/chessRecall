@@ -18,7 +18,7 @@ import {
   usernameMatchesPlayer,
   type LinkedAccounts,
 } from "@/lib/linkedAccounts";
-import { useLiveAnalysis } from "@/hooks/useLiveAnalysis";
+import { LIVE_ANALYSIS_DEPTH, useLiveAnalysis } from "@/hooks/useLiveAnalysis";
 
 const AUTO_SYNC_INTERVAL_MS = 30 * 60 * 1000; // 30 min between auto-syncs
 const MANUAL_SYNC_COOLDOWN_MS = 5 * 60 * 1000;
@@ -34,9 +34,13 @@ function setLastSyncMs(p: "lichess" | "chess.com", username: string) {
 }
 import { useGameAnalysis } from "@/hooks/useGameAnalysis";
 import type { DrawShape } from "chessground/draw";
-import { classifyMove, evalWinningChances, getExpectedPointsLoss, isSacrificeMove } from "@/lib/analysis";
-import { lookupOpening, isBookPosition } from "@/lib/ecoBook";
+import { evalWinningChances } from "@/lib/analysis";
+import { lookupOpening } from "@/lib/ecoBook";
 import type { OpeningInfo } from "@/lib/ecoBook";
+import {
+  classifyReviewedMove,
+  type PositionEvaluationSnapshot,
+} from "@/lib/reviewReporter";
 
 type Platform = "lichess" | "chess.com" | "all";
 type GameStatus = "pending" | "processing" | "analyzed" | "failed";
@@ -137,7 +141,7 @@ function formatClock(totalSeconds: number | null): string {
 }
 
 /** Minimum depth before showing live move classification. Prevents premature annotations. */
-const MIN_CLASSIFY_DEPTH = 16;
+const MIN_CLASSIFY_DEPTH = LIVE_ANALYSIS_DEPTH;
 
 const CLASSIFICATION_COLOR: Record<string, string> = {
   brilliant: "#1baca6",  // teal  — !!
@@ -236,18 +240,24 @@ function PlayerAvatar({
   name: string; size?: number; platform?: "lichess" | "chess.com";
 }) {
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
+  const cacheKey = platform ? `${platform}:${name.toLowerCase()}` : null;
+  const cachedPhotoUrl = cacheKey && avatarCache.has(cacheKey)
+    ? (avatarCache.get(cacheKey) ?? null)
+    : undefined;
 
   useEffect(() => {
-    if (!name || !platform) return;
-    const key = `${platform}:${name.toLowerCase()}`;
-    if (avatarCache.has(key)) {
-      setPhotoUrl(avatarCache.get(key) ?? null);
-      return;
-    }
-    void fetchAvatarUrl(name, platform).then(setPhotoUrl);
-  }, [name, platform]);
+    if (!name || !platform || cachedPhotoUrl !== undefined) return;
+    let cancelled = false;
+    void fetchAvatarUrl(name, platform).then((url) => {
+      if (!cancelled) setPhotoUrl(url);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [cachedPhotoUrl, name, platform]);
 
   const bg = playerAvatarColor(name);
+  const resolvedPhotoUrl = cachedPhotoUrl !== undefined ? cachedPhotoUrl : photoUrl;
   return (
     <div style={{
       width: size, height: size, borderRadius: "50%",
@@ -255,9 +265,9 @@ function PlayerAvatar({
       border: "2px solid rgba(255,255,255,0.12)",
       display: "flex", alignItems: "center", justifyContent: "center",
     }}>
-      {photoUrl ? (
+      {resolvedPhotoUrl ? (
         <img
-          src={photoUrl}
+          src={resolvedPhotoUrl}
           alt={name}
           style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "50%" }}
           onError={() => setPhotoUrl(null)}
@@ -570,7 +580,6 @@ function ReviewView({
   setReviewIndex: React.Dispatch<React.SetStateAction<number>>;
   onClose: () => void;
 }) {
-  const total = review.positions.length - 1;
   const [windowWidth, setWindowWidth] = useState(1280);
   const [orientation, setOrientation] = useState<"white" | "black">(
     review.game.playerColor === "black" ? "black" : "white"
@@ -627,129 +636,86 @@ function ReviewView({
 
   const { lines, depth, isSearching, error } = useLiveAnalysis(activeFen);
 
-  // ── Eval cache: fen → { score, topMove, secondScore } ────────────────────
-  // Continuously updated as engine depth increases. Used for:
-  //   1. prevScore:    eval of parent position, needed to compute point loss
-  //   2. topMove:      engine's best UCI, for played-best detection
-  //   3. secondScore:  second-best line eval, for Critical detection (WintrChess)
-  const evalCacheRef = useRef<Map<string, { score: number; topMove: string; secondScore?: number }>>(new Map());
-  useEffect(() => {
-    if (lines.length > 0 && depth >= 8) {
-      evalCacheRef.current.set(activeFen, {
-        score: lines[0].score,
-        topMove: lines[0].move,
-        secondScore: lines[1]?.score,
-      });
-    }
-  }, [activeFen, lines, depth]);
-
   // ── Sidebar tab ───────────────────────────────────────────────────────────
   const [sidebarTab, setSidebarTab] = useState<"engine" | "report">("engine");
 
   // ── Background full-game analysis ────────────────────────────────────────
   const gameAnalysis = useGameAnalysis(review.positions, review.moves);
+  const snapshotByFen = useMemo(() => {
+    const map = new Map<string, PositionEvaluationSnapshot>();
+    for (const snapshot of gameAnalysis.snapshots) {
+      map.set(snapshot.fen, snapshot);
+    }
+    return map;
+  }, [gameAnalysis.snapshots]);
 
-  // ── Opening: track last known book position as user navigates ────────────
-  const [currentOpening, setCurrentOpening] = useState<OpeningInfo | null>(
-    () => lookupOpening(review.positions[0]) ?? null
-  );
-  useEffect(() => {
-    const opening = lookupOpening(activeFen);
-    if (opening) setCurrentOpening(opening);
-  }, [activeFen]);
+  // ── Opening: keep the last book hit along the currently selected path ────
+  const currentOpening = useMemo((): OpeningInfo | null => {
+    let opening = lookupOpening(review.positions[0]) ?? null;
+    let node = rootNode;
+    for (const uci of activePath) {
+      const next = node.children.find((child) => child.uci === uci);
+      if (!next) break;
+      node = next;
+      const nextOpening = lookupOpening(node.fen);
+      if (nextOpening) opening = nextOpening;
+    }
+    return opening;
+  }, [activePath, review.positions, rootNode]);
 
-  // ── Live classification (WASM-driven, no worker needed) ─────────────────────
-  //
-  // Classification order (matches WintrChess classify.ts):
-  //   1. Forced  — only 1 legal move available → "best" (no annotation)
-  //   2. Theory  — current FEN is in the ECO opening book → "book"
-  //   3. Played best move — engine cached topMove === played UCI → "best"
-  //   4. Point loss delta — full centipawn threshold table
-  //
-  // We wait for MIN_CLASSIFY_DEPTH to avoid shallow-search instability.
-  const liveClassification = useMemo((): import("@/lib/analysis").MoveClassification | null => {
+  const isMainlinePath = useMemo(() => (
+    activePath.every((uci, index) => {
+      const move = review.moves[index];
+      return !!move && uci === `${move.from}${move.to}`;
+    })
+  ), [activePath, review.moves]);
+
+  const mainlineClassification = useMemo(() => {
+    if (!isMainlinePath || activePath.length === 0) return null;
+    const move = review.moves[activePath.length - 1];
+    if (!move) return null;
+    return gameAnalysis.moves.find((analysis) => (
+      analysis.ply === move.ply && analysis.san === move.san
+    ))?.classification ?? null;
+  }, [activePath.length, gameAnalysis.moves, isMainlinePath, review.moves]);
+
+  const liveCurrentSnapshot = useMemo((): PositionEvaluationSnapshot | null => {
+    if (lines.length === 0 || depth < MIN_CLASSIFY_DEPTH) return null;
+    return {
+      fen: activeFen,
+      score: lines[0].score,
+      depth,
+      topMove: lines[0].move,
+      secondScore: lines[1]?.score,
+    };
+  }, [activeFen, lines, depth]);
+
+  const liveClassification = useMemo(() => {
+    if (mainlineClassification) return mainlineClassification;
     if (activePath.length === 0) return null;
-    if (depth < MIN_CLASSIFY_DEPTH) return null;
 
-    // Walk to the parent node
     let parentNode = rootNode;
     for (const uci of activePath.slice(0, -1)) {
-      const next = parentNode.children.find(c => c.uci === uci);
+      const next = parentNode.children.find((child) => child.uci === uci);
       if (!next) return null;
       parentNode = next;
     }
+
     const parentFen = parentNode.fen;
+    const previous = snapshotByFen.get(parentFen);
+    const current = snapshotByFen.get(activeFen) ?? liveCurrentSnapshot;
     const playedUci = activePath[activePath.length - 1];
 
-    // 1. Forced move (only 1 legal move) — no meaningful annotation
-    try {
-      const parentBoard = new Chess(parentFen);
-      if (parentBoard.moves().length <= 1) return "best";
-    } catch { /* ignore */ }
+    if (!previous || !current) return null;
 
-    // 2. Theory — position reached is in the opening book
-    if (isBookPosition(activeFen)) return "book";
-
-    // 3. Played-best short-circuit (WintrChess pattern):
-    //    If the played UCI matches the engine's cached best move from the parent
-    //    position, skip the eval-delta computation and classify as best or critical.
-    const parentCache = evalCacheRef.current.get(parentFen);
-    if (parentCache && parentCache.topMove === playedUci) {
-      // Critical detection (WintrChess): best move played AND second-best
-      // alternative loses ≥ 10% win-probability, position is not trivially won.
-      if (
-        parentCache.secondScore !== undefined &&
-        playedUci.length <= 4  // no promotions
-      ) {
-        try {
-          const parentBoard = new Chess(parentFen);
-          if (!parentBoard.isCheck()) {  // not a forced escape
-            const turnBefore = parentBoard.turn();
-            const secondLoss = getExpectedPointsLoss(parentCache.score, parentCache.secondScore, turnBefore);
-            if (secondLoss >= 0.1) return "great"; // Critical
-          }
-        } catch { /* ignore */ }
-      }
-      return "best";
-    }
-
-    // 4. Point-loss classification — requires both evals
-    const prevScore = parentCache?.score;
-    const currScore = lines.length > 0 ? lines[0].score : evalCacheRef.current.get(activeFen)?.score;
-    if (prevScore === undefined || currScore === undefined) return null;
-
-    try {
-      const chess = new Chess(parentFen);
-      const turnBefore = chess.turn();
-      return classifyMove(prevScore, currScore, turnBefore);
-    } catch { return null; }
-  }, [activePath, rootNode, lines, activeFen, depth]);
-
-  // ── Live brilliant detection ─────────────────────────────────────────────────
-  // A move is Brilliant when: it classifies as "best" AND it's a sacrifice AND
-  // the engine has only ONE clearly-good option (≥50cp gap to 2nd-best line).
-  const isLiveBrilliant = useMemo((): boolean => {
-    if (liveClassification !== "best") return false;
-    if (activePath.length === 0) return false;
-    const lastUci = activePath[activePath.length - 1];
-    if (lastUci.length > 4) return false; // no promotions
-
-    // Sacrifice check (client-side, same logic as the worker)
-    let parentFen = rootNode.fen;
-    let parentNode = rootNode;
-    for (const uci of activePath.slice(0, -1)) {
-      const next = parentNode.children.find(c => c.uci === uci);
-      if (!next) return false;
-      parentNode = next;
-    }
-    parentFen = parentNode.fen;
-    if (!isSacrificeMove(parentFen, lastUci)) return false;
-
-    // Gap check: the engine must have had only one good option (lines[1] much worse)
-    if (lines.length < 2) return false;
-    const gap = lines[0].score - lines[1].score;
-    return gap >= 50;
-  }, [liveClassification, activePath, rootNode, lines]);
+    return classifyReviewedMove({
+      parentFen,
+      currentFen: activeFen,
+      playedUci,
+      previous,
+      current,
+    });
+  }, [activePath, activeFen, liveCurrentSnapshot, mainlineClassification, rootNode, snapshotByFen]);
 
 
   const boardBoxRef = useRef<HTMLDivElement | null>(null);
@@ -1004,8 +970,7 @@ function ReviewView({
     // Don't show annotation while searching at shallow depth
     if (isSearching && depth < MIN_CLASSIFY_DEPTH) return undefined;
 
-    const cls: string = (isLiveBrilliant ? "brilliant" : liveClassification)
-      ?? "";
+    const cls: string = liveClassification ?? "";
 
     if (!cls || cls === "book" || cls === "excellent" || cls === "good") return undefined;
 
@@ -1017,7 +982,7 @@ function ReviewView({
     const symbol = SYMBOLS[cls];
     if (!symbol) return undefined;
     return { square: destSquare, symbol, color: CLASSIFICATION_COLOR[cls] ?? "#999" };
-  }, [activePath, liveClassification, isLiveBrilliant, depth, isSearching]);
+  }, [activePath, liveClassification, depth, isSearching]);
 
 
   const resultLabel = review.game.result === "win" ? "1-0" : review.game.result === "loss" ? "0-1" : "½-½";
@@ -1412,8 +1377,8 @@ function ReviewView({
           {sidebarTab === "engine" && (() => {
             if (activePath.length === 0 || gameOverResult) return null;
 
-            const rawCls = liveClassification ?? null;
-            const cls: string = isLiveBrilliant ? "brilliant" : (rawCls ?? "");
+                const rawCls = liveClassification ?? null;
+                const cls: string = rawCls ?? "";
             const color = cls ? (CLASSIFICATION_COLOR[cls] ?? "#999") : null;
             const label = cls ? (CLASSIFICATION_LABEL[cls] ?? cls) : null;
             const bestSan = lines[0]?.san ?? null;
@@ -1570,9 +1535,9 @@ function ReviewView({
                   {/* Accuracy cards */}
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", marginBottom: "12px" }}>
                     {([
-                      { color: "white", name: review.game.white, acc: gameAnalysis.stats.whiteAccuracy, elo: gameAnalysis.stats.estimatedWhiteElo },
-                      { color: "black", name: review.game.black, acc: gameAnalysis.stats.blackAccuracy, elo: gameAnalysis.stats.estimatedBlackElo },
-                    ] as const).map(({ color, name, acc, elo }) => (
+                      { color: "white", name: review.game.white, acc: gameAnalysis.stats.whiteAccuracy },
+                      { color: "black", name: review.game.black, acc: gameAnalysis.stats.blackAccuracy },
+                    ] as const).map(({ color, name, acc }) => (
                       <div key={color} style={{
                         padding: "10px 8px", background: "#2a2826",
                         borderRadius: "6px", border: "1px solid #3c3a38", textAlign: "center",
@@ -1586,9 +1551,9 @@ function ReviewView({
                         <div style={{ fontSize: "21px", fontWeight: 900, color: "#fff", fontVariantNumeric: "tabular-nums" }}>
                           {acc.toFixed(1)}%
                         </div>
-                        {elo && (
-                          <div style={{ fontSize: "10px", color: "#666", marginTop: "2px" }}>~{elo} Elo</div>
-                        )}
+                        <div style={{ fontSize: "10px", color: "#666", marginTop: "2px" }}>
+                          WintrChess-style accuracy
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -1698,7 +1663,6 @@ export default function GamesPanel({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [reviewLoading, setReviewLoading] = useState(false);
-  const [report, setReport] = useState<LiveReviewResponse | null>(null);  // game report / stats
   const [review, setReview] = useState<LiveReviewResponse | null>(null);  // board review
   const [reviewIndex, setReviewIndex] = useState(0);
   const [gameSearchInput, setGameSearchInput] = useState("");
