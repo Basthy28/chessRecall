@@ -170,6 +170,7 @@ export function useGameAnalysis(
   const workerRef = useRef<Worker | null>(null);
   const workerBlobUrlRef = useRef<string | null>(null);
   const cancelRef = useRef(false);
+  const bootIdRef = useRef(0);
 
   const [workerReady, setWorkerReady] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -186,14 +187,23 @@ export function useGameAnalysis(
   };
 
   useEffect(() => {
-    if (!enabled || typeof Worker === "undefined") return;
+    if (!enabled || typeof Worker === "undefined") {
+      cancelRef.current = true;
+      bootIdRef.current += 1;
+      setWorkerReady(false);
+      setIsAnalyzing(false);
+      return;
+    }
 
+    const bootId = bootIdRef.current + 1;
+    bootIdRef.current = bootId;
     cancelRef.current = false;
+    setWorkerReady(false);
 
     void (async () => {
       try {
         const created = await createBackgroundWorker();
-        if (cancelRef.current) {
+        if (cancelRef.current || bootIdRef.current !== bootId) {
           created.worker.terminate();
           URL.revokeObjectURL(created.blobUrl);
           return;
@@ -204,6 +214,7 @@ export function useGameAnalysis(
         workerBlobUrlRef.current = created.blobUrl;
 
         worker.onmessage = (e: MessageEvent<string>) => {
+          if (cancelRef.current || bootIdRef.current !== bootId) return;
           const line = typeof e.data === "string" ? e.data : "";
           if (line === "uciok") {
             worker.postMessage("setoption name Threads value 1");
@@ -219,18 +230,26 @@ export function useGameAnalysis(
 
         worker.onerror = () => {
           console.warn("[useGameAnalysis] background engine failed to start");
+          if (bootIdRef.current !== bootId) return;
           setWorkerReady(false);
+          setIsAnalyzing(false);
         };
 
         worker.postMessage("uci");
       } catch {
         console.warn("[useGameAnalysis] background engine bootstrap failed");
+        if (bootIdRef.current !== bootId) return;
         setWorkerReady(false);
+        setIsAnalyzing(false);
       }
     })();
 
     return () => {
       cancelRef.current = true;
+      if (bootIdRef.current === bootId) {
+        setWorkerReady(false);
+        setIsAnalyzing(false);
+      }
       if (workerRef.current) {
         workerRef.current.postMessage("stop");
         workerRef.current.postMessage("quit");
@@ -242,18 +261,13 @@ export function useGameAnalysis(
   }, [enabled]);
 
   useEffect(() => {
-    if (!workerReady || !enabled || positions.length < 2 || moves.length === 0) return;
+    if (!workerReady || !enabled || positions.length < 2 || moves.length === 0 || !workerRef.current) return;
 
     let cancelled = false;
+    const worker = workerRef.current;
 
-    function evalPosition(fen: string): Promise<PositionEvaluationSnapshot> {
+    function evalPosition(engine: Worker, fen: string): Promise<PositionEvaluationSnapshot> {
       return new Promise((resolve) => {
-        const worker = workerRef.current;
-        if (!worker) {
-          resolve(terminalSnapshot(fen));
-          return;
-        }
-
         const fallback = terminalSnapshot(fen);
         if (fallback.score !== null && fallback.depth === 0) {
           resolve(fallback);
@@ -276,6 +290,13 @@ export function useGameAnalysis(
         }, BG_TIMEOUT_MS);
 
         worker.onmessage = (e: MessageEvent<string>) => {
+          if (cancelled || cancelRef.current) {
+            window.clearTimeout(timeout);
+            worker.onmessage = null;
+            resolve(fallback);
+            return;
+          }
+
           const line = typeof e.data === "string" ? e.data : "";
 
           if (line.startsWith("info") && line.includes("multipv")) {
@@ -341,7 +362,7 @@ export function useGameAnalysis(
         for (let i = 0; i < total; i++) {
           if (cancelled || cancelRef.current) break;
 
-          nextSnapshots[i] = await evalPosition(positions[i]);
+          nextSnapshots[i] = await evalPosition(worker, positions[i]);
 
           if (!cancelled) {
             setProgress(Math.round(((i + 1) / total) * 100));
@@ -418,6 +439,9 @@ export function useGameAnalysis(
     void analyze();
     return () => {
       cancelled = true;
+      if (workerRef.current === worker) {
+        worker.postMessage("stop");
+      }
     };
   }, [workerReady, enabled, positions, moves]);
 
