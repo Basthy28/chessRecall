@@ -244,13 +244,14 @@ function ReviewView({
     setReviewIndex(activePath.length);
   }, [activePath.length, setReviewIndex]);
 
-  const { lines, depth, isSearching, error } = useLiveAnalysis(activeFen);
-
   // ── Sidebar tab ───────────────────────────────────────────────────────────
   const [sidebarTab, setSidebarTab] = useState<"engine" | "report">(initialSidebarTab ?? "engine");
+  const liveAnalysisEnabled = sidebarTab === "engine";
+  const backgroundAnalysisEnabled = sidebarTab === "report";
+  const { lines, depth, isSearching, error } = useLiveAnalysis(activeFen, liveAnalysisEnabled);
 
   // ── Background full-game analysis ────────────────────────────────────────
-  const gameAnalysis = useGameAnalysis(review.positions, review.moves);
+  const gameAnalysis = useGameAnalysis(review.positions, review.moves, backgroundAnalysisEnabled);
   const snapshotByFen = useMemo(() => {
     const map = new Map<string, PositionEvaluationSnapshot>();
     for (const snapshot of gameAnalysis.snapshots) {
