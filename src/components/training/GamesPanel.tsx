@@ -660,7 +660,19 @@ function ReviewView({
   const bottomBoardProfile = boardProfiles.find((p) => p.slot === "bottom") ?? null;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, height: "calc(100dvh - 56px)", minHeight: 0, maxHeight: "calc(100dvh - 56px)", overflow: "hidden", background: "var(--bg-base)" }}>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        flex: 1,
+        height: isCompact ? "auto" : "calc(100dvh - 56px)",
+        minHeight: 0,
+        maxHeight: isCompact ? "none" : "calc(100dvh - 56px)",
+        overflowY: isCompact ? "auto" : "hidden",
+        overflowX: "hidden",
+        background: "var(--bg-base)",
+      }}
+    >
       <div style={{
         display: "flex",
         alignItems: "center",
@@ -735,13 +747,22 @@ function ReviewView({
         )}
       </div>
 
-      <div style={{ display: "flex", flexDirection: isCompact ? "column" : "row", flex: 1, height: "100%", minHeight: 0, overflow: "visible" }}>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: isCompact ? "column" : "row",
+          flex: isCompact ? "0 0 auto" : 1,
+          height: isCompact ? "auto" : "100%",
+          minHeight: 0,
+          overflow: "visible",
+        }}
+      >
         <div style={{
-          flex: 1,
+          flex: isCompact ? "0 0 auto" : 1,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          padding: isCompact ? "12px" : "18px 24px",
+          padding: isCompact ? "10px 12px 12px" : "18px 24px",
           minWidth: 0,
           minHeight: 0,
           overflow: "visible",
@@ -752,8 +773,8 @@ function ReviewView({
               display: "flex",
               alignItems: "stretch",
               gap: "0px",
-              height: "100%",
-              maxHeight: "100%",
+              height: isCompact ? "auto" : "100%",
+              maxHeight: isCompact ? "none" : "100%",
               width: "100%",
               flex: 1,
               minWidth: 0,
@@ -1102,7 +1123,14 @@ function ReviewView({
 
           {/* Report tab — accuracy + move breakdown */}
           {sidebarTab === "report" && (
-            <div style={{ flexShrink: 0, borderBottom: "1px solid #3c3a38", overflowY: "auto", maxHeight: "320px" }}>
+            <div
+              style={{
+                flexShrink: 0,
+                borderBottom: "1px solid #3c3a38",
+                overflowY: "auto",
+                maxHeight: isCompact ? "none" : "320px",
+              }}
+            >
               {gameAnalysis.isAnalyzing ? (
                 <div style={{ padding: "14px 12px" }}>
                   {/* Live-building eval graph during analysis */}
@@ -1197,7 +1225,17 @@ function ReviewView({
           )}
 
           {/* Move tree */}
-          <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "10px 0", display: "flex", flexDirection: "column" }}>
+          <div
+            style={{
+              flex: isCompact ? "0 0 auto" : 1,
+              minHeight: 0,
+              maxHeight: isCompact ? "260px" : "none",
+              overflowY: "auto",
+              padding: "10px 0",
+              display: "flex",
+              flexDirection: "column",
+            }}
+          >
             <div style={{ fontWeight: 700, fontSize: "10px", marginBottom: "4px", color: "#444", paddingLeft: "12px", textTransform: "uppercase", letterSpacing: "0.08em" }}>
               Moves
             </div>
@@ -1499,13 +1537,13 @@ export default function GamesPanel({
     return () => clearInterval(timer);
   }, [hasRunningAnalysis, review, platform, gameSearch]);
 
-  async function queueSelectedGame() {
-    if (!selectedGameId || !selectedGame) { setMessage("Select a game first."); return; }
-    if (selectedGame.status === "analyzed") {
+  async function queueSelectedGame(targetGameId = selectedGameId, targetGame = selectedGame) {
+    if (!targetGameId || !targetGame) { setMessage("Select a game first."); return; }
+    if (targetGame.status === "analyzed") {
       setMessage("This game is already analyzed.");
       return;
     }
-    const selectedPlatform = inferPlatformFromGameId(selectedGame.lichess_game_id);
+    const selectedPlatform = inferPlatformFromGameId(targetGame.lichess_game_id);
     const selectedUsername = getLinkedUsername(linkedAccounts, selectedPlatform);
 
     setActionLoading(true);
@@ -1515,11 +1553,11 @@ export default function GamesPanel({
         method: "POST",
         headers: { "Content-Type": "application/json", ...(await getClientAuthHeaders()) },
         body: JSON.stringify({
-          gameIds: [selectedGameId],
+          gameIds: [targetGameId],
           platform: selectedPlatform,
           username: selectedUsername,
           viewerUsernames,
-          forceRequeue: selectedGame.status === "processing" || selectedGame.status === "failed",
+          forceRequeue: targetGame.status === "processing" || targetGame.status === "failed",
         }),
       });
       const json = (await res.json()) as { selected?: number; queued?: number; skipped?: number; queueUnavailable?: boolean; error?: string };
@@ -1917,6 +1955,119 @@ export default function GamesPanel({
             const linkedUsername = getLinkedUsername(linkedAccounts, gamePlatform);
             const youAreWhite = usernameMatchesPlayer(linkedUsername, g.white_username);
             const youAreBlack = usernameMatchesPlayer(linkedUsername, g.black_username);
+            const canOpenReview = g.status === "analyzed";
+            const primaryActionLabel = canOpenReview
+              ? "Open review"
+              : g.status === "processing"
+                ? "Re-queue"
+                : "Queue analysis";
+            if (isCompactLayout) {
+              return (
+                <div
+                  key={g.id}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "10px",
+                    padding: "12px",
+                    borderRadius: "10px",
+                    border: isSelected ? "1px solid var(--accent)" : "1px solid var(--border-subtle)",
+                    background: isSelected ? "var(--accent-dim)" : "var(--bg-elevated)",
+                  }}
+                >
+                  <button
+                    onClick={() => { setSelectedGameId(g.id); setMessage(""); }}
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "8px",
+                      alignItems: "stretch",
+                      background: "transparent",
+                      border: "none",
+                      padding: 0,
+                      margin: 0,
+                      cursor: "pointer",
+                      textAlign: "left",
+                      fontFamily: "inherit",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: "10px", alignItems: "flex-start" }}>
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{ color: "var(--text-primary)", fontWeight: 700, fontSize: "13px", lineHeight: 1.35 }}>
+                          {g.white_username}{youAreWhite ? " (You)" : ""} vs {g.black_username}{youAreBlack ? " (You)" : ""}
+                        </div>
+                        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px", lineHeight: 1.35 }}>
+                          {g.white_rating ?? "?"} / {g.black_rating ?? "?"} · {g.time_control}
+                        </div>
+                      </div>
+                      <div style={{ padding: "3px 8px", borderRadius: "999px", background: "rgba(255,255,255,0.05)", color: statusColor(g.status), fontSize: "10px", fontWeight: 700, textTransform: "capitalize", whiteSpace: "nowrap" }}>
+                        {g.status}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                      <span style={{ padding: "2px 7px", borderRadius: "999px", background: "rgba(255,255,255,0.04)", color: "var(--text-muted)", fontSize: "10px", fontWeight: 700 }}>
+                        {gamePlatform === "chess.com" ? "Chess.com" : "Lichess"}
+                      </span>
+                      <span style={{ padding: "2px 7px", borderRadius: "999px", background: "rgba(255,255,255,0.04)", color: "var(--text-muted)", fontSize: "10px", fontWeight: 700, textTransform: "capitalize" }}>
+                        {g.result}
+                      </span>
+                      <span style={{ padding: "2px 7px", borderRadius: "999px", background: "rgba(255,255,255,0.04)", color: "var(--text-muted)", fontSize: "10px", fontWeight: 700 }}>
+                        {new Date(g.played_at).toLocaleDateString()}
+                      </span>
+                    </div>
+                  </button>
+                  <div style={{ display: "grid", gridTemplateColumns: canOpenReview ? "1fr auto" : "1fr", gap: "8px" }}>
+                    <button
+                      onClick={() => {
+                        setSelectedGameId(g.id);
+                        setMessage("");
+                        if (canOpenReview) {
+                          void openLiveReview(g.id);
+                        } else {
+                          void queueSelectedGame(g.id, g);
+                        }
+                      }}
+                      disabled={actionLoading || reviewLoading}
+                      style={{
+                        padding: "10px 12px",
+                        borderRadius: "8px",
+                        border: "1px solid rgba(129,182,76,0.3)",
+                        background: "rgba(129,182,76,0.12)",
+                        color: "#81b64c",
+                        fontSize: "12px",
+                        fontWeight: 700,
+                        cursor: actionLoading || reviewLoading ? "default" : "pointer",
+                        fontFamily: "inherit",
+                        opacity: actionLoading || reviewLoading ? 0.6 : 1,
+                      }}
+                    >
+                      {primaryActionLabel}
+                    </button>
+                    {canOpenReview && (
+                      <button
+                        onClick={() => {
+                          setSelectedGameId(g.id);
+                          setMessage("");
+                        }}
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: "8px",
+                          border: "1px solid var(--border)",
+                          background: "transparent",
+                          color: "var(--text-muted)",
+                          fontSize: "12px",
+                          fontWeight: 600,
+                          cursor: "pointer",
+                          fontFamily: "inherit",
+                        }}
+                      >
+                        Select
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            }
             return (
               <button
                 key={g.id}
@@ -1994,7 +2145,9 @@ export default function GamesPanel({
       </div>
 
       <div style={{ fontSize: "11px", color: "var(--text-muted)", flexShrink: 0 }}>
-        Double-click a game to open Live Review · Select + Queue Analysis to analyse
+        {isCompactLayout
+          ? "Tap a card to select it, then use Open review / Queue analysis on the card."
+          : "Double-click a game to open Live Review · Select + Queue Analysis to analyse"}
       </div>
     </div>
   );

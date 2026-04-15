@@ -13,7 +13,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 
 // ── Engine config ──────────────────────────────────────────────────────────────
-const ANALYSIS_ENGINE_URL = "/stockfish/stockfish-18-single.js";
+const ANALYSIS_ENGINE_BASE_URL = "https://r2.chessrecall.qzz.io/stockfish";
+const ANALYSIS_ENGINE_URL = `${ANALYSIS_ENGINE_BASE_URL}/stockfish-18-single.js`;
+const ANALYSIS_WASM_URL = `${ANALYSIS_ENGINE_BASE_URL}/stockfish-18-single.wasm`;
 const ANALYSIS_MULTI_PV = Math.max(
   1,
   Math.min(5, Number(process.env.NEXT_PUBLIC_ANALYSIS_MULTI_PV ?? 2)),
@@ -117,6 +119,19 @@ function pvToSanPreview(fen: string, pvLine: string, maxPlies = 10): string {
   return parts.join(" ");
 }
 
+function createAnalysisWorker(): { worker: Worker; bootstrapUrl: string } {
+  const bootstrapSource = `importScripts(${JSON.stringify(ANALYSIS_ENGINE_URL)});`;
+  const bootstrapBlob = new Blob([bootstrapSource], {
+    type: "application/javascript; charset=utf-8",
+  });
+  const bootstrapUrl = URL.createObjectURL(bootstrapBlob);
+  const worker = new Worker(
+    `${bootstrapUrl}#${encodeURIComponent(ANALYSIS_WASM_URL)},worker`,
+  );
+
+  return { worker, bootstrapUrl };
+}
+
 // ── Hook ───────────────────────────────────────────────────────────────────────
 /**
  * @param fen - the current board position to analyse (changes trigger a new search)
@@ -124,6 +139,7 @@ function pvToSanPreview(fen: string, pvLine: string, maxPlies = 10): string {
  */
 export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult {
   const workerRef     = useRef<Worker | null>(null);
+  const workerBootstrapUrlRef = useRef<string | null>(null);
   const readyRef      = useRef(false);
   const debounceRef   = useRef<number | null>(null);
   const timeoutRef    = useRef<number | null>(null);
@@ -140,6 +156,13 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
   const [depth,       setDepth]       = useState(0);
   const [isSearching, setIsSearching] = useState(false);
   const [error,       setError]       = useState("");
+
+  const revokeWorkerBootstrapUrl = useCallback(() => {
+    if (workerBootstrapUrlRef.current) {
+      URL.revokeObjectURL(workerBootstrapUrlRef.current);
+      workerBootstrapUrlRef.current = null;
+    }
+  }, []);
 
   // ── Clear timeout helper ─────────────────────────────────────────────────
   const clearTimeout_ = useCallback(() => {
@@ -196,12 +219,14 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
 
     workerRef.current?.terminate();
     workerRef.current = null;
+    revokeWorkerBootstrapUrl();
     readyRef.current  = false;
     activeRef.current = null;
     clearTimeout_();
 
-    const worker = new Worker(ANALYSIS_ENGINE_URL);
+    const { worker, bootstrapUrl } = createAnalysisWorker();
     workerRef.current = worker;
+    workerBootstrapUrlRef.current = bootstrapUrl;
 
     worker.onmessage = (e: MessageEvent<string>) => {
       const line = typeof e.data === "string" ? e.data : "";
@@ -284,12 +309,13 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
       activeRef.current = null;
       workerRef.current?.terminate();
       workerRef.current = null;
+      revokeWorkerBootstrapUrl();
       setIsSearching(false);
       setError("Engine crashed — navigate to a position to retry.");
     };
 
     worker.postMessage("uci");
-  }, [clearTimeout_, publish, startQueued]);
+  }, [clearTimeout_, publish, revokeWorkerBootstrapUrl, startQueued]);
 
   // ── Boot once on mount ───────────────────────────────────────────────────
   useEffect(() => {
@@ -305,11 +331,12 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
         workerRef.current.terminate();
         workerRef.current = null;
       }
+      revokeWorkerBootstrapUrl();
       readyRef.current  = false;
       activeRef.current = null;
       queuedRef.current = null;
     };
-  }, [bootWorker, clearTimeout_]);
+  }, [bootWorker, clearTimeout_, revokeWorkerBootstrapUrl]);
 
   // ── Queue new analysis when FEN changes ─────────────────────────────────
   useEffect(() => {

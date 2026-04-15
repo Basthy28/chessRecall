@@ -238,6 +238,100 @@ function NoPuzzlesState({
   );
 }
 
+function PuzzleRatingPanel({
+  hoveredSrs,
+  onHover,
+  onRate,
+  onRetry,
+  compact,
+}: {
+  hoveredSrs: number | null;
+  onHover: (index: number | null) => void;
+  onRate: (choice: SrsChoice) => void;
+  onRetry: () => void;
+  compact: boolean;
+}) {
+  return (
+    <div
+      style={{
+        width: "100%",
+        maxWidth: "min(900px, calc(100vh - 220px))",
+        display: "flex",
+        flexDirection: "column",
+        gap: "10px",
+        padding: compact ? "12px" : "14px 16px",
+        borderRadius: "10px",
+        border: "1px solid rgba(129,182,76,0.22)",
+        background: "linear-gradient(180deg, rgba(129,182,76,0.08) 0%, rgba(38,36,33,0.9) 100%)",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: "12px", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: "#cbb88b" }}>
+            How was this puzzle?
+          </div>
+          <div style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "3px" }}>
+            Rate it to load the next puzzle in your route.
+          </div>
+        </div>
+        <button
+          onClick={onRetry}
+          style={{
+            padding: "6px 12px",
+            borderRadius: "6px",
+            border: "1px solid var(--border)",
+            background: "transparent",
+            color: "var(--text-muted)",
+            fontSize: "12px",
+            cursor: "pointer",
+            fontFamily: "inherit",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Retry this puzzle
+        </button>
+      </div>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: compact ? "1fr" : "1fr 1fr 1fr",
+          gap: "8px",
+        }}
+      >
+        {SRS_BUTTONS.map((btn, i) => (
+          <button
+            key={btn.key}
+            onMouseEnter={() => onHover(i)}
+            onMouseLeave={() => onHover(null)}
+            onClick={() => onRate(btn.key)}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: compact ? "12px 10px" : "11px 8px",
+              borderRadius: "8px",
+              background: hoveredSrs === i ? btn.hoverBg : btn.bg,
+              border: `1px solid ${btn.border}`,
+              color: btn.color,
+              cursor: "pointer",
+              fontFamily: "inherit",
+              transition: "background var(--transition-fast), transform 0.1s",
+              gap: "3px",
+              minHeight: compact ? "64px" : undefined,
+            }}
+            onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.98)"; }}
+            onMouseUp={(e) => { e.currentTarget.style.transform = "scale(1)"; }}
+          >
+            <span style={{ fontSize: "14px", fontWeight: 700 }}>{btn.label}</span>
+            <span style={{ fontSize: "10px", opacity: 0.7 }}>{btn.interval} [{btn.shortcut}]</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Main Component ────────────────────────────────────────────────────────────
 interface PuzzleTrainerProps {
   onOpenGameReview?: (target: PuzzleReviewTarget) => void;
@@ -1068,6 +1162,18 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
           </div>
         )}
 
+        {isRating && (
+          <PuzzleRatingPanel
+            hoveredSrs={hoveredSrs}
+            onHover={setHoveredSrs}
+            onRate={(choice) => {
+              void handleSrsRating(choice);
+            }}
+            onRetry={retryPuzzle}
+            compact={isCompactLayout}
+          />
+        )}
+
         {/* ── Controls ── */}
         <div
           style={{
@@ -1212,7 +1318,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
           focusCards={focusCards}
           compactModeSelector
         />
-        {isRating && (
+        {!isCompactLayout && isRating && (
           <div style={{ display: "flex", flexDirection: "column", padding: "16px", gap: "16px", borderBottom: "1px solid #3c3a38" }}>
             <div style={{ display: "flex", alignItems: "center", gap: "6px", paddingBottom: "8px", borderBottom: "1px solid #3c3a38" }}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#bbb" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1267,54 +1373,6 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
               </div>
             </div>
 
-            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-              <div style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: "#8b8987", textAlign: "center" }}>
-                How was this puzzle?
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "6px" }}>
-                {SRS_BUTTONS.map((btn, i) => (
-                  <button
-                    key={btn.key}
-                    onMouseEnter={() => setHoveredSrs(i)}
-                    onMouseLeave={() => setHoveredSrs(null)}
-                    onClick={() => handleSrsRating(btn.key)}
-                    style={{
-                      display: "flex", flexDirection: "column", alignItems: "center",
-                      padding: "10px 8px", borderRadius: "8px",
-                      background: hoveredSrs === i ? btn.hoverBg : btn.bg,
-                      border: `1px solid ${btn.border}`,
-                      color: btn.color, cursor: "pointer", fontFamily: "inherit",
-                      transition: "background var(--transition-fast), transform 0.1s", gap: "3px",
-                    }}
-                    onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.96)"; }}
-                    onMouseUp={(e) => { e.currentTarget.style.transform = "scale(1)"; }}
-                  >
-                    <span style={{ fontSize: "14px", fontWeight: 700 }}>{btn.label}</span>
-                    <span style={{ fontSize: "10px", opacity: 0.65 }}>{btn.interval} [{btn.shortcut}]</span>
-                  </button>
-                ))}
-              </div>
-              <div style={{ display: "flex", justifyContent: "center" }}>
-                <button
-                  onClick={retryPuzzle}
-                  style={{
-                    padding: "5px 12px",
-                    borderRadius: "5px",
-                    border: "1px solid #3c3a38",
-                    background: "transparent",
-                    color: "#8b8987",
-                    fontSize: "11px",
-                    cursor: "pointer",
-                    fontFamily: "inherit",
-                    transition: "color 150ms",
-                  }}
-                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = "#e8e6e2"; }}
-                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = "#8b8987"; }}
-                >
-                  ↺ Retry this puzzle
-                </button>
-              </div>
-            </div>
           </div>
         )}
 
