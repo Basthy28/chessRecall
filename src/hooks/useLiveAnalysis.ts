@@ -131,13 +131,15 @@ async function createAnalysisWorker(): Promise<{ worker: Worker; blobUrl: string
   }
 
   const source = await response.text();
-  const blob = new Blob([source], {
+  const rewrittenSource = source.replace(
+    'a=decodeURIComponent(e[0]||location.origin+location.pathname.replace(/\\.js$/i,".wasm"))',
+    `a=${JSON.stringify(ANALYSIS_WASM_URL)}`,
+  );
+  const blob = new Blob([rewrittenSource], {
     type: "application/javascript; charset=utf-8",
   });
   const blobUrl = URL.createObjectURL(blob);
-  const worker = new Worker(
-    `${blobUrl}#${encodeURIComponent(ANALYSIS_WASM_URL)},worker`,
-  );
+  const worker = new Worker(blobUrl);
 
   return { worker, blobUrl };
 }
