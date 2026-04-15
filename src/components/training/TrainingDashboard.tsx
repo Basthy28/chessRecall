@@ -35,6 +35,7 @@ const MOCK_PUZZLES: Puzzle[] = [
     solution_line_uci: ["d1e2"],
     solution_line_san: ["Qe2"],
     is_brilliant: false,
+    training_kind: "strict",
     eval_before: 30,
     eval_after: -180,
     eval_best: 25,
@@ -62,6 +63,7 @@ const MOCK_PUZZLES: Puzzle[] = [
     solution_line_uci: ["e5e6", "f7e6", "d3h7"],
     solution_line_san: ["e6!", "fxe6", "Bxh7+"],
     is_brilliant: false,
+    training_kind: "strict",
     eval_before: 120,
     eval_after: -250,
     eval_best: 180,
@@ -89,6 +91,7 @@ const MOCK_PUZZLES: Puzzle[] = [
     solution_line_uci: ["g4g5", "h7g6", "f3f4"],
     solution_line_san: ["g5", "hxg6", "Kf4"],
     is_brilliant: false,
+    training_kind: "strict",
     eval_before: 80,
     eval_after: -60,
     eval_best: 150,
@@ -192,7 +195,7 @@ export default function TrainingDashboard() {
   const [showSolution, setShowSolution] = useState(false);
   const [activeNav, setActiveNav] = useState<"puzzles" | "games">("puzzles");
   const [hoveredSrs, setHoveredSrs] = useState<number | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const sidebarOpen = true;
   const [chessComAvatar, setChessComAvatar] = useState<string | null>(null);
   const [requestedReviewTarget, setRequestedReviewTarget] = useState<RequestedReviewTarget | null>(null);
 

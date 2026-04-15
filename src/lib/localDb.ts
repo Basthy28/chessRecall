@@ -60,6 +60,7 @@ async function ensureSchema(): Promise<void> {
         move_number integer NOT NULL,
         player_color text NOT NULL CHECK (player_color IN ('white','black')),
         phase text NOT NULL CHECK (phase IN ('opening','middlegame','endgame')),
+        training_kind text NOT NULL DEFAULT 'strict',
         status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','validated','rejected')),
         times_seen integer NOT NULL DEFAULT 0,
         times_correct integer NOT NULL DEFAULT 0,
@@ -88,6 +89,10 @@ async function ensureSchema(): Promise<void> {
 
       CREATE INDEX IF NOT EXISTS import_sync_cooldowns_last_synced_at_idx
       ON import_sync_cooldowns (last_synced_at DESC);
+    `);
+    await pool.query(`
+      ALTER TABLE puzzles
+      ADD COLUMN IF NOT EXISTS training_kind text NOT NULL DEFAULT 'strict'
     `);
   })();
 
@@ -130,6 +135,7 @@ function mapPuzzle(row: Record<string, unknown>): Puzzle {
     solution_line_uci: (row.solution_line_uci as string[]) ?? [],
     solution_line_san: (row.solution_line_san as string[]) ?? [],
     is_brilliant: Boolean(row.is_brilliant),
+    training_kind: row.training_kind === "practice" ? "practice" : "strict",
     eval_before: Number(row.eval_before),
     eval_after: Number(row.eval_after),
     eval_best: Number(row.eval_best),
@@ -426,10 +432,10 @@ export async function insertPuzzle(row: Omit<Puzzle, "id" | "created_at">): Prom
   const { rows } = await pool.query(
     `INSERT INTO puzzles
       (game_id, user_id, fen, blunder_move, solution_move, solution_san, eval_before, eval_after, eval_best, eval_second_best,
-       eval_drop, move_number, player_color, phase, status, times_seen, times_correct, srs_due_at, srs_ease, last_reviewed_at,
+       eval_drop, move_number, player_color, phase, training_kind, status, times_seen, times_correct, srs_due_at, srs_ease, last_reviewed_at,
        solution_line_uci, solution_line_san, is_brilliant)
      VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
      RETURNING *`,
     [
       row.game_id,
@@ -446,6 +452,7 @@ export async function insertPuzzle(row: Omit<Puzzle, "id" | "created_at">): Prom
       row.move_number,
       row.player_color,
       row.phase,
+      row.training_kind,
       row.status,
       row.times_seen,
       row.times_correct,

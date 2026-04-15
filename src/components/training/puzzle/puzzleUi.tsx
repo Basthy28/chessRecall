@@ -10,6 +10,13 @@ export type PuzzleStageMeta = {
   border: string;
 };
 
+export type PuzzleTrainingKindMeta = {
+  label: string;
+  color: string;
+  bg: string;
+  border: string;
+};
+
 export function formatDueLabel(value: string | null): string | null {
   if (!value) return null;
   const diffMs = new Date(value).getTime() - Date.now();
@@ -81,7 +88,28 @@ export function getPuzzleStageMeta(puzzle: Puzzle): PuzzleStageMeta {
   };
 }
 
+export function getPuzzleTrainingKindMeta(puzzle: Puzzle): PuzzleTrainingKindMeta {
+  if (puzzle.training_kind === "practice") {
+    return {
+      label: "Practice",
+      color: "#7fb7d6",
+      bg: "rgba(127,183,214,0.14)",
+      border: "rgba(127,183,214,0.32)",
+    };
+  }
+
+  return {
+    label: "Strict",
+    color: "#c0a060",
+    bg: "rgba(192,160,96,0.12)",
+    border: "rgba(192,160,96,0.3)",
+  };
+}
+
 export function getPuzzleReason(puzzle: Puzzle, stage: PuzzleStageMeta): string {
+  if (puzzle.training_kind === "practice" && puzzle.times_seen === 0) {
+    return "Practical correction from one of your games.";
+  }
   if (puzzle.times_seen === 0) return "Fresh extraction from one of your games.";
   if (puzzle.times_correct === 0) return "You still have not solved this motif cleanly.";
 
@@ -139,6 +167,30 @@ export function StagePill({ stage, compact = false }: { stage: PuzzleStageMeta; 
       }}
     >
       {stage.label}
+    </span>
+  );
+}
+
+export function TrainingKindPill({ puzzle, compact = false }: { puzzle: Puzzle; compact?: boolean }) {
+  const meta = getPuzzleTrainingKindMeta(puzzle);
+  return (
+    <span
+      title={puzzle.training_kind === "practice" ? "Lila-style practical correction from your game" : "Strict tactical puzzle extracted from your game"}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: compact ? "1px 6px" : "3px 8px",
+        borderRadius: "999px",
+        background: meta.bg,
+        border: `1px solid ${meta.border}`,
+        color: meta.color,
+        fontSize: compact ? "10px" : "11px",
+        fontWeight: 700,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {meta.label}
     </span>
   );
 }

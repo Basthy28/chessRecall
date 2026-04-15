@@ -11,6 +11,7 @@ export type GameResult = "win" | "loss" | "draw";
 export type GameStatus = "pending" | "processing" | "analyzed" | "failed";
 export type PuzzlePhase = "opening" | "middlegame" | "endgame";
 export type PuzzleStatus = "pending" | "validated" | "rejected";
+export type PuzzleTrainingKind = "strict" | "practice";
 export type PuzzleTrainingMode = "mixed" | "review" | "new" | "weak";
 export type SrsRating = 1 | 2 | 3 | 4 | 5; // Ease factor buckets
 
@@ -63,6 +64,7 @@ export interface Puzzle {
   solution_line_uci: string[]; // Full refutation PV in UCI (up to 8 moves)
   solution_line_san: string[]; // Full refutation PV in SAN (human-readable)
   is_brilliant: boolean; // true when the correct move is a brilliant/sacrifice find
+  training_kind: PuzzleTrainingKind; // strict = forced/clear puzzle, practice = best practical correction
 
   // Validation data (populated by Worker)
   eval_before: number; // Centipawn eval before blunder
