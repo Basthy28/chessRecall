@@ -20,11 +20,35 @@ import {
   type PositionEvaluationSnapshot,
 } from "@/lib/reviewReporter";
 
+const BG_ENGINE_BASE_URL = "https://r2.chessrecall.qzz.io/stockfish";
+const BG_ENGINE_URL = `${BG_ENGINE_BASE_URL}/stockfish-18-single.js`;
 const BG_REMOTE_WASM_URL = "https://r2.chessrecall.qzz.io/stockfish/stockfish-18-single.wasm";
-const BG_ENGINE_URL = `/stockfish/stockfish-18-single.js#${encodeURIComponent(BG_REMOTE_WASM_URL)},worker`;
 const BG_DEPTH = Math.max(10, Number(process.env.NEXT_PUBLIC_ANALYSIS_DEPTH ?? 16));
 const BG_MULTI_PV = 2;
 const BG_TIMEOUT_MS = 16_000;
+
+async function createBackgroundWorker(): Promise<{ worker: Worker; blobUrl: string }> {
+  const response = await fetch(BG_ENGINE_URL, {
+    method: "GET",
+    mode: "cors",
+    credentials: "omit",
+    cache: "default",
+  });
+  if (!response.ok) {
+    throw new Error(`Background engine bootstrap fetch failed (${response.status})`);
+  }
+
+  const source = await response.text();
+  const blob = new Blob([source], {
+    type: "application/javascript; charset=utf-8",
+  });
+  const blobUrl = URL.createObjectURL(blob);
+  const worker = new Worker(
+    `${blobUrl}#${encodeURIComponent(BG_REMOTE_WASM_URL)},worker`,
+  );
+
+  return { worker, blobUrl };
+}
 
 export interface MoveAnalysis {
   ply: number;
@@ -142,6 +166,7 @@ export function useGameAnalysis(
   enabled = true,
 ): GameAnalysisResult {
   const workerRef = useRef<Worker | null>(null);
+  const workerBlobUrlRef = useRef<string | null>(null);
   const cancelRef = useRef(false);
 
   const [workerReady, setWorkerReady] = useState(false);
@@ -151,41 +176,66 @@ export function useGameAnalysis(
   const [stats, setStats] = useState<GameStats | null>(null);
   const [snapshots, setSnapshots] = useState<PositionEvaluationSnapshot[]>([]);
 
+  const revokeWorkerBlobUrl = () => {
+    if (workerBlobUrlRef.current) {
+      URL.revokeObjectURL(workerBlobUrlRef.current);
+      workerBlobUrlRef.current = null;
+    }
+  };
+
   useEffect(() => {
     if (!enabled || typeof Worker === "undefined") return;
 
     cancelRef.current = false;
 
-    const worker = new Worker(BG_ENGINE_URL);
-    workerRef.current = worker;
+    void (async () => {
+      try {
+        const created = await createBackgroundWorker();
+        if (cancelRef.current) {
+          created.worker.terminate();
+          URL.revokeObjectURL(created.blobUrl);
+          return;
+        }
 
-    worker.onmessage = (e: MessageEvent<string>) => {
-      const line = typeof e.data === "string" ? e.data : "";
-      if (line === "uciok") {
-        worker.postMessage("setoption name Threads value 1");
-        worker.postMessage("setoption name Hash value 64");
-        worker.postMessage(`setoption name MultiPV value ${BG_MULTI_PV}`);
-        worker.postMessage("setoption name UCI_AnalyseMode value true");
-        worker.postMessage("isready");
-      } else if (line === "readyok") {
-        worker.onmessage = null;
-        setWorkerReady(true);
+        const worker = created.worker;
+        workerRef.current = worker;
+        workerBlobUrlRef.current = created.blobUrl;
+
+        worker.onmessage = (e: MessageEvent<string>) => {
+          const line = typeof e.data === "string" ? e.data : "";
+          if (line === "uciok") {
+            worker.postMessage("setoption name Threads value 1");
+            worker.postMessage("setoption name Hash value 64");
+            worker.postMessage(`setoption name MultiPV value ${BG_MULTI_PV}`);
+            worker.postMessage("setoption name UCI_AnalyseMode value true");
+            worker.postMessage("isready");
+          } else if (line === "readyok") {
+            worker.onmessage = null;
+            setWorkerReady(true);
+          }
+        };
+
+        worker.onerror = () => {
+          console.warn("[useGameAnalysis] background engine failed to start");
+          setWorkerReady(false);
+        };
+
+        worker.postMessage("uci");
+      } catch {
+        console.warn("[useGameAnalysis] background engine bootstrap failed");
+        setWorkerReady(false);
       }
-    };
-
-    worker.onerror = () => {
-      console.warn("[useGameAnalysis] background engine failed to start");
-      setWorkerReady(false);
-    };
-
-    worker.postMessage("uci");
+    })();
 
     return () => {
       cancelRef.current = true;
-      worker.postMessage("stop");
-      worker.postMessage("quit");
-      worker.terminate();
-      workerRef.current = null;
+      if (workerRef.current) {
+        workerRef.current.postMessage("stop");
+        workerRef.current.postMessage("quit");
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+      revokeWorkerBlobUrl();
     };
   }, [enabled]);
 

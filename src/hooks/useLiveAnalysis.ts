@@ -14,8 +14,8 @@ import { Chess } from "chess.js";
 
 // ── Engine config ──────────────────────────────────────────────────────────────
 const ANALYSIS_ENGINE_BASE_URL = "https://r2.chessrecall.qzz.io/stockfish";
+const ANALYSIS_ENGINE_URL = `${ANALYSIS_ENGINE_BASE_URL}/stockfish-18-single.js`;
 const ANALYSIS_WASM_URL = `${ANALYSIS_ENGINE_BASE_URL}/stockfish-18-single.wasm`;
-const ANALYSIS_ENGINE_URL = `/stockfish/stockfish-18-single.js#${encodeURIComponent(ANALYSIS_WASM_URL)},worker`;
 const ANALYSIS_MULTI_PV = Math.max(
   1,
   Math.min(5, Number(process.env.NEXT_PUBLIC_ANALYSIS_MULTI_PV ?? 2)),
@@ -119,8 +119,27 @@ function pvToSanPreview(fen: string, pvLine: string, maxPlies = 10): string {
   return parts.join(" ");
 }
 
-function createAnalysisWorker(): Worker {
-  return new Worker(ANALYSIS_ENGINE_URL);
+async function createAnalysisWorker(): Promise<{ worker: Worker; blobUrl: string }> {
+  const response = await fetch(ANALYSIS_ENGINE_URL, {
+    method: "GET",
+    mode: "cors",
+    credentials: "omit",
+    cache: "default",
+  });
+  if (!response.ok) {
+    throw new Error(`Engine bootstrap fetch failed (${response.status})`);
+  }
+
+  const source = await response.text();
+  const blob = new Blob([source], {
+    type: "application/javascript; charset=utf-8",
+  });
+  const blobUrl = URL.createObjectURL(blob);
+  const worker = new Worker(
+    `${blobUrl}#${encodeURIComponent(ANALYSIS_WASM_URL)},worker`,
+  );
+
+  return { worker, blobUrl };
 }
 
 // ── Hook ───────────────────────────────────────────────────────────────────────
@@ -130,6 +149,7 @@ function createAnalysisWorker(): Worker {
  */
 export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult {
   const workerRef     = useRef<Worker | null>(null);
+  const workerBlobUrlRef = useRef<string | null>(null);
   const readyRef      = useRef(false);
   const debounceRef   = useRef<number | null>(null);
   const timeoutRef    = useRef<number | null>(null);
@@ -146,6 +166,13 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
   const [depth,       setDepth]       = useState(0);
   const [isSearching, setIsSearching] = useState(false);
   const [error,       setError]       = useState("");
+
+  const revokeWorkerBlobUrl = useCallback(() => {
+    if (workerBlobUrlRef.current) {
+      URL.revokeObjectURL(workerBlobUrlRef.current);
+      workerBlobUrlRef.current = null;
+    }
+  }, []);
 
   // ── Clear timeout helper ─────────────────────────────────────────────────
   const clearTimeout_ = useCallback(() => {
@@ -193,7 +220,7 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
   }, [clearTimeout_]);
 
   // ── Boot the Web Worker ──────────────────────────────────────────────────
-  const bootWorker = useCallback(() => {
+  const bootWorker = useCallback(async () => {
     if (typeof Worker === "undefined") {
       setError("Web Workers unavailable in this environment.");
       setIsSearching(false);
@@ -202,12 +229,22 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
 
     workerRef.current?.terminate();
     workerRef.current = null;
+    revokeWorkerBlobUrl();
     readyRef.current  = false;
     activeRef.current = null;
     clearTimeout_();
 
-    const worker = createAnalysisWorker();
-    workerRef.current = worker;
+    let worker: Worker;
+    try {
+      const created = await createAnalysisWorker();
+      worker = created.worker;
+      workerBlobUrlRef.current = created.blobUrl;
+      workerRef.current = worker;
+    } catch {
+      setIsSearching(false);
+      setError("Engine bootstrap failed — remote Stockfish unavailable.");
+      return;
+    }
 
     worker.onmessage = (e: MessageEvent<string>) => {
       const line = typeof e.data === "string" ? e.data : "";
@@ -290,17 +327,18 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
       activeRef.current = null;
       workerRef.current?.terminate();
       workerRef.current = null;
+      revokeWorkerBlobUrl();
       setIsSearching(false);
       setError("Engine crashed — remote Stockfish unavailable.");
     };
 
     worker.postMessage("uci");
-  }, [clearTimeout_, publish, startQueued]);
+  }, [clearTimeout_, publish, revokeWorkerBlobUrl, startQueued]);
 
   // ── Boot once on mount ───────────────────────────────────────────────────
   useEffect(() => {
     const bootTimer = window.setTimeout(() => {
-      bootWorker();
+      void bootWorker();
     }, 0);
     return () => {
       window.clearTimeout(bootTimer);
@@ -311,11 +349,12 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
         workerRef.current.terminate();
         workerRef.current = null;
       }
+      revokeWorkerBlobUrl();
       readyRef.current  = false;
       activeRef.current = null;
       queuedRef.current = null;
     };
-  }, [bootWorker, clearTimeout_]);
+  }, [bootWorker, clearTimeout_, revokeWorkerBlobUrl]);
 
   // ── Queue new analysis when FEN changes ─────────────────────────────────
   useEffect(() => {
@@ -335,7 +374,7 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
       requestIdRef.current = id;
       queuedRef.current = { id, fen, turn, bestDepth: 0, pvByIndex: new Map() };
 
-      if (!workerRef.current) { bootWorker(); return; }
+      if (!workerRef.current) { void bootWorker(); return; }
 
       if (activeRef.current) {
         workerRef.current.postMessage("stop");
