@@ -246,8 +246,15 @@ function ReviewView({
 
   // ── Sidebar tab ───────────────────────────────────────────────────────────
   const [sidebarTab, setSidebarTab] = useState<"engine" | "report">(initialSidebarTab ?? "engine");
+  const [reportSession, setReportSession] = useState(() => ({
+    gameId: review.game.id,
+    requested: initialSidebarTab === "report",
+  }));
+  const reportRequested = reportSession.gameId === review.game.id
+    ? reportSession.requested
+    : initialSidebarTab === "report";
   const liveAnalysisEnabled = sidebarTab === "engine";
-  const backgroundAnalysisEnabled = sidebarTab === "report";
+  const backgroundAnalysisEnabled = reportRequested;
   const { lines, depth, isSearching, error } = useLiveAnalysis(activeFen, liveAnalysisEnabled);
 
   // ── Background full-game analysis ────────────────────────────────────────
@@ -960,7 +967,15 @@ function ReviewView({
               {(["engine", "report"] as const).map(tab => (
                 <button
                   key={tab}
-                  onClick={() => setSidebarTab(tab)}
+                  onClick={() => {
+                    if (tab === "report") {
+                      setReportSession({
+                        gameId: review.game.id,
+                        requested: true,
+                      });
+                    }
+                    setSidebarTab(tab);
+                  }}
                   style={{
                     flex: 1, padding: "7px 0",
                     background: sidebarTab === tab ? "#262421" : "transparent",

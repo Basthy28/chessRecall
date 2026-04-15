@@ -27,6 +27,17 @@ const BG_DEPTH = Math.max(10, Number(process.env.NEXT_PUBLIC_ANALYSIS_DEPTH ?? 1
 const BG_MULTI_PV = 2;
 const BG_TIMEOUT_MS = 16_000;
 
+type CachedGameAnalysis = {
+  moves: MoveAnalysis[];
+  stats: GameStats | null;
+  snapshots: PositionEvaluationSnapshot[];
+};
+
+const gameAnalysisCache = new Map<string, CachedGameAnalysis>();
+type SharedBackgroundWorker = { worker: Worker; blobUrl: string };
+let sharedBackgroundWorker: SharedBackgroundWorker | null = null;
+let sharedBackgroundWorkerPromise: Promise<SharedBackgroundWorker> | null = null;
+
 async function createBackgroundWorker(): Promise<{ worker: Worker; blobUrl: string }> {
   const response = await fetch(BG_ENGINE_URL, {
     method: "GET",
@@ -50,6 +61,63 @@ async function createBackgroundWorker(): Promise<{ worker: Worker; blobUrl: stri
   const worker = new Worker(blobUrl);
 
   return { worker, blobUrl };
+}
+
+function resetSharedBackgroundWorker() {
+  if (sharedBackgroundWorker) {
+    try {
+      sharedBackgroundWorker.worker.terminate();
+    } catch {}
+    try {
+      URL.revokeObjectURL(sharedBackgroundWorker.blobUrl);
+    } catch {}
+  }
+  sharedBackgroundWorker = null;
+  sharedBackgroundWorkerPromise = null;
+}
+
+async function ensureSharedBackgroundWorker(): Promise<SharedBackgroundWorker> {
+  if (sharedBackgroundWorker) return sharedBackgroundWorker;
+  if (sharedBackgroundWorkerPromise) return sharedBackgroundWorkerPromise;
+
+  sharedBackgroundWorkerPromise = (async () => {
+    const created = await createBackgroundWorker();
+    const { worker } = created;
+
+    await new Promise<void>((resolve, reject) => {
+      worker.onmessage = (e: MessageEvent<string>) => {
+        const line = typeof e.data === "string" ? e.data : "";
+        if (line === "uciok") {
+          worker.postMessage("setoption name Threads value 1");
+          worker.postMessage("setoption name Hash value 64");
+          worker.postMessage(`setoption name MultiPV value ${BG_MULTI_PV}`);
+          worker.postMessage("setoption name UCI_AnalyseMode value true");
+          worker.postMessage("isready");
+          return;
+        }
+
+        if (line === "readyok") {
+          worker.onmessage = null;
+          resolve();
+        }
+      };
+
+      worker.onerror = () => {
+        resetSharedBackgroundWorker();
+        reject(new Error("Shared background worker failed to initialize"));
+      };
+
+      worker.postMessage("uci");
+    });
+
+    sharedBackgroundWorker = created;
+    return created;
+  })().catch((error) => {
+    resetSharedBackgroundWorker();
+    throw error;
+  });
+
+  return sharedBackgroundWorkerPromise;
 }
 
 export interface MoveAnalysis {
@@ -162,15 +230,30 @@ function resolvePlayedUci(
   }
 }
 
+function buildAnalysisCacheKey(
+  positions: string[],
+  moves: Array<{ san: string; ply: number; from?: string; to?: string }>,
+): string {
+  return JSON.stringify({
+    positions,
+    moves: moves.map((move) => ({
+      ply: move.ply,
+      san: move.san,
+      from: move.from ?? null,
+      to: move.to ?? null,
+    })),
+  });
+}
+
 export function useGameAnalysis(
   positions: string[],
   moves: Array<{ san: string; ply: number; from?: string; to?: string }>,
   enabled = true,
 ): GameAnalysisResult {
   const workerRef = useRef<Worker | null>(null);
-  const workerBlobUrlRef = useRef<string | null>(null);
   const cancelRef = useRef(false);
   const bootIdRef = useRef(0);
+  const analysisKey = buildAnalysisCacheKey(positions, moves);
 
   const [workerReady, setWorkerReady] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -179,14 +262,29 @@ export function useGameAnalysis(
   const [stats, setStats] = useState<GameStats | null>(null);
   const [snapshots, setSnapshots] = useState<PositionEvaluationSnapshot[]>([]);
 
-  const revokeWorkerBlobUrl = () => {
-    if (workerBlobUrlRef.current) {
-      URL.revokeObjectURL(workerBlobUrlRef.current);
-      workerBlobUrlRef.current = null;
-    }
-  };
+  useEffect(() => {
+    if (!enabled) return;
+
+    const cached = gameAnalysisCache.get(analysisKey);
+    if (!cached) return;
+
+    setWorkerReady(false);
+    setIsAnalyzing(false);
+    setProgress(100);
+    setMoveAnalyses(cached.moves);
+    setStats(cached.stats);
+    setSnapshots(cached.snapshots);
+  }, [analysisKey, enabled]);
 
   useEffect(() => {
+    if (enabled && gameAnalysisCache.has(analysisKey)) {
+      cancelRef.current = true;
+      bootIdRef.current += 1;
+      setWorkerReady(false);
+      setIsAnalyzing(false);
+      return;
+    }
+
     if (!enabled || typeof Worker === "undefined") {
       cancelRef.current = true;
       bootIdRef.current += 1;
@@ -202,40 +300,14 @@ export function useGameAnalysis(
 
     void (async () => {
       try {
-        const created = await createBackgroundWorker();
+        const created = await ensureSharedBackgroundWorker();
         if (cancelRef.current || bootIdRef.current !== bootId) {
-          created.worker.terminate();
-          URL.revokeObjectURL(created.blobUrl);
           return;
         }
 
         const worker = created.worker;
         workerRef.current = worker;
-        workerBlobUrlRef.current = created.blobUrl;
-
-        worker.onmessage = (e: MessageEvent<string>) => {
-          if (cancelRef.current || bootIdRef.current !== bootId) return;
-          const line = typeof e.data === "string" ? e.data : "";
-          if (line === "uciok") {
-            worker.postMessage("setoption name Threads value 1");
-            worker.postMessage("setoption name Hash value 64");
-            worker.postMessage(`setoption name MultiPV value ${BG_MULTI_PV}`);
-            worker.postMessage("setoption name UCI_AnalyseMode value true");
-            worker.postMessage("isready");
-          } else if (line === "readyok") {
-            worker.onmessage = null;
-            setWorkerReady(true);
-          }
-        };
-
-        worker.onerror = () => {
-          console.warn("[useGameAnalysis] background engine failed to start");
-          if (bootIdRef.current !== bootId) return;
-          setWorkerReady(false);
-          setIsAnalyzing(false);
-        };
-
-        worker.postMessage("uci");
+        setWorkerReady(true);
       } catch {
         console.warn("[useGameAnalysis] background engine bootstrap failed");
         if (bootIdRef.current !== bootId) return;
@@ -252,13 +324,12 @@ export function useGameAnalysis(
       }
       if (workerRef.current) {
         workerRef.current.postMessage("stop");
-        workerRef.current.postMessage("quit");
-        workerRef.current.terminate();
+        workerRef.current.onmessage = null;
+        workerRef.current.onerror = null;
         workerRef.current = null;
       }
-      revokeWorkerBlobUrl();
     };
-  }, [enabled]);
+  }, [analysisKey, enabled]);
 
   useEffect(() => {
     if (!workerReady || !enabled || positions.length < 2 || moves.length === 0 || !workerRef.current) return;
@@ -420,8 +491,14 @@ export function useGameAnalysis(
         if (!cancelled) {
           setMoveAnalyses(analyses);
           setSnapshots([...nextSnapshots]);
-          setStats(buildGameStats(analyses));
+          const nextStats = buildGameStats(analyses);
+          setStats(nextStats);
           setProgress(100);
+          gameAnalysisCache.set(analysisKey, {
+            moves: analyses,
+            stats: nextStats,
+            snapshots: [...nextSnapshots],
+          });
         }
       } catch (error) {
         console.warn("[useGameAnalysis] report generation failed", error);
@@ -441,9 +518,11 @@ export function useGameAnalysis(
       cancelled = true;
       if (workerRef.current === worker) {
         worker.postMessage("stop");
+        worker.onmessage = null;
+        worker.onerror = null;
       }
     };
-  }, [workerReady, enabled, positions, moves]);
+  }, [analysisKey, workerReady, enabled, positions, moves]);
 
   return {
     isAnalyzing,
