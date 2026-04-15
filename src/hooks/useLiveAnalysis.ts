@@ -144,6 +144,68 @@ async function createAnalysisWorker(): Promise<{ worker: Worker; blobUrl: string
   return { worker, blobUrl };
 }
 
+type SharedAnalysisWorker = { worker: Worker; blobUrl: string };
+
+let sharedAnalysisWorker: SharedAnalysisWorker | null = null;
+let sharedAnalysisWorkerPromise: Promise<SharedAnalysisWorker> | null = null;
+
+function resetSharedAnalysisWorker() {
+  if (sharedAnalysisWorker) {
+    try {
+      sharedAnalysisWorker.worker.terminate();
+    } catch {}
+    try {
+      URL.revokeObjectURL(sharedAnalysisWorker.blobUrl);
+    } catch {}
+  }
+  sharedAnalysisWorker = null;
+  sharedAnalysisWorkerPromise = null;
+}
+
+async function ensureSharedAnalysisWorker(): Promise<SharedAnalysisWorker> {
+  if (sharedAnalysisWorker) return sharedAnalysisWorker;
+  if (sharedAnalysisWorkerPromise) return sharedAnalysisWorkerPromise;
+
+  sharedAnalysisWorkerPromise = (async () => {
+    const created = await createAnalysisWorker();
+    const { worker } = created;
+
+    await new Promise<void>((resolve, reject) => {
+      worker.onmessage = (e: MessageEvent<string>) => {
+        const line = typeof e.data === "string" ? e.data : "";
+        if (line === "uciok") {
+          const threads = getThreadCount();
+          const hash = getHashMb(threads);
+          worker.postMessage("setoption name UCI_AnalyseMode value true");
+          worker.postMessage(`setoption name Threads value ${threads}`);
+          worker.postMessage(`setoption name Hash value ${hash}`);
+          worker.postMessage("isready");
+          return;
+        }
+        if (line === "readyok") {
+          worker.onmessage = null;
+          resolve();
+        }
+      };
+
+      worker.onerror = () => {
+        resetSharedAnalysisWorker();
+        reject(new Error("Shared analysis worker failed to initialize"));
+      };
+
+      worker.postMessage("uci");
+    });
+
+    sharedAnalysisWorker = created;
+    return created;
+  })().catch((error) => {
+    resetSharedAnalysisWorker();
+    throw error;
+  });
+
+  return sharedAnalysisWorkerPromise;
+}
+
 // ── Hook ───────────────────────────────────────────────────────────────────────
 /**
  * @param fen - the current board position to analyse (changes trigger a new search)
@@ -151,7 +213,6 @@ async function createAnalysisWorker(): Promise<{ worker: Worker; blobUrl: string
  */
 export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult {
   const workerRef     = useRef<Worker | null>(null);
-  const workerBlobUrlRef = useRef<string | null>(null);
   const readyRef      = useRef(false);
   const debounceRef   = useRef<number | null>(null);
   const timeoutRef    = useRef<number | null>(null);
@@ -168,13 +229,6 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
   const [depth,       setDepth]       = useState(0);
   const [isSearching, setIsSearching] = useState(false);
   const [error,       setError]       = useState("");
-
-  const revokeWorkerBlobUrl = useCallback(() => {
-    if (workerBlobUrlRef.current) {
-      URL.revokeObjectURL(workerBlobUrlRef.current);
-      workerBlobUrlRef.current = null;
-    }
-  }, []);
 
   // ── Clear timeout helper ─────────────────────────────────────────────────
   const clearTimeout_ = useCallback(() => {
@@ -229,19 +283,17 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
       return;
     }
 
-    workerRef.current?.terminate();
     workerRef.current = null;
-    revokeWorkerBlobUrl();
     readyRef.current  = false;
     activeRef.current = null;
     clearTimeout_();
 
     let worker: Worker;
     try {
-      const created = await createAnalysisWorker();
+      const created = await ensureSharedAnalysisWorker();
       worker = created.worker;
-      workerBlobUrlRef.current = created.blobUrl;
       workerRef.current = worker;
+      readyRef.current = true;
     } catch {
       setIsSearching(false);
       setError("Engine bootstrap failed — remote Stockfish unavailable.");
@@ -251,24 +303,6 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
     worker.onmessage = (e: MessageEvent<string>) => {
       const line = typeof e.data === "string" ? e.data : "";
       if (!line) return;
-
-      // ── Init handshake ──────────────────────────────────────────────
-      if (!readyRef.current) {
-        if (line === "uciok") {
-          const threads = getThreadCount();
-          const hash    = getHashMb(threads);
-          worker.postMessage("setoption name UCI_AnalyseMode value true");
-          worker.postMessage(`setoption name Threads value ${threads}`);
-          worker.postMessage(`setoption name Hash value ${hash}`);
-          worker.postMessage("isready");
-          return;
-        }
-        if (line === "readyok") {
-          readyRef.current = true;
-          startQueued();
-        }
-        return;
-      }
 
       const pending = activeRef.current;
       if (!pending) return;
@@ -327,15 +361,13 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
       clearTimeout_();
       readyRef.current  = false;
       activeRef.current = null;
-      workerRef.current?.terminate();
       workerRef.current = null;
-      revokeWorkerBlobUrl();
+      resetSharedAnalysisWorker();
       setIsSearching(false);
       setError("Engine crashed — remote Stockfish unavailable.");
     };
-
-    worker.postMessage("uci");
-  }, [clearTimeout_, publish, revokeWorkerBlobUrl, startQueued]);
+    startQueued();
+  }, [clearTimeout_, publish, startQueued]);
 
   // ── Boot once on mount ───────────────────────────────────────────────────
   useEffect(() => {
@@ -347,16 +379,16 @@ export function useLiveAnalysis(fen: string, enabled = true): LiveAnalysisResult
       clearTimeout_();
       if (debounceRef.current !== null) window.clearTimeout(debounceRef.current);
       if (workerRef.current) {
-        workerRef.current.postMessage("quit");
-        workerRef.current.terminate();
+        workerRef.current.postMessage("stop");
+        workerRef.current.onmessage = null;
+        workerRef.current.onerror = null;
         workerRef.current = null;
       }
-      revokeWorkerBlobUrl();
       readyRef.current  = false;
       activeRef.current = null;
       queuedRef.current = null;
     };
-  }, [bootWorker, clearTimeout_, revokeWorkerBlobUrl]);
+  }, [bootWorker, clearTimeout_]);
 
   // ── Queue new analysis when FEN changes ─────────────────────────────────
   useEffect(() => {
