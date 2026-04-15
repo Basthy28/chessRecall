@@ -347,6 +347,10 @@ function ReviewView({
   const isCompact = windowWidth < 1100;
   const boardSize = useMemo(() => {
     if (!boardSlotSize) return null;
+    if (isCompact) {
+      const size = Math.floor(Math.min(boardSlotSize.width, 560) - 2);
+      return size > 0 ? size : null;
+    }
     const chromeWidth = isCompact ? 0 : 24 + 42;
     const max = isCompact ? 560 : 920;
     const reservedVertical = 86;
