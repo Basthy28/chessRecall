@@ -20,7 +20,8 @@ import {
   type PositionEvaluationSnapshot,
 } from "@/lib/reviewReporter";
 
-const BG_ENGINE_URL = "/stockfish/stockfish-18-single.js";
+const BG_REMOTE_WASM_URL = "https://r2.chessrecall.qzz.io/stockfish/stockfish-18-single.wasm";
+const BG_ENGINE_URL = `/stockfish/stockfish-18-single.js#${encodeURIComponent(BG_REMOTE_WASM_URL)},worker`;
 const BG_DEPTH = Math.max(10, Number(process.env.NEXT_PUBLIC_ANALYSIS_DEPTH ?? 16));
 const BG_MULTI_PV = 2;
 const BG_TIMEOUT_MS = 16_000;
