@@ -295,13 +295,10 @@ async function validatePuzzleLine(
     validUci.pop();
   }
 
-  // Allow mate-in-1 style puzzles when the player's move ends the game immediately.
-  if (validUci.length === 1) {
-    return chess.isCheckmate() ? validUci : [];
-  }
-
-  // Otherwise require at least player move + best defense.
-  if (validUci.length < 2) {
+  // Single-move puzzles are allowed as long as the root move passed the
+  // strict uniqueness/drop checks above. This better fits "learn from your
+  // mistake" moments that hinge on one tactical shot or one winning resource.
+  if (validUci.length < 1) {
     return [];
   }
 
