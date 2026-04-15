@@ -43,6 +43,7 @@ type PuzzleReviewTarget = {
   gameId: string;
   reviewIndex?: number;
   sidebarTab?: "engine" | "report";
+  viewerColor?: "white" | "black";
 };
 
 // ── SRS button config ────────────────────────────────────────────────────────
@@ -130,6 +131,31 @@ function phaseLabel(phase: string): string {
     case "endgame": return "Endgame";
     default: return phase;
   }
+}
+
+function getPuzzleSolutionLineUci(puzzle: Puzzle): string[] {
+  const rawSolutionLine = (puzzle as Puzzle & { solution_line_uci?: unknown }).solution_line_uci;
+
+  if (Array.isArray(rawSolutionLine) && rawSolutionLine.length > 0) {
+    return rawSolutionLine.map((value) => String(value)).filter(Boolean);
+  }
+  if (typeof rawSolutionLine === "string") {
+    const rawSolutionLineString: string = rawSolutionLine as string;
+    try {
+      const parsed = JSON.parse(rawSolutionLineString);
+      if (Array.isArray(parsed)) {
+        return parsed.map((value) => String(value)).filter(Boolean);
+      }
+    } catch {
+      const s = rawSolutionLineString.replace(/^{|}$/g, "");
+      const fallback = s
+        .split(",")
+        .map((value: string) => value.replace(/^"|"$/g, "").trim())
+        .filter(Boolean);
+      if (fallback.length > 0) return fallback;
+    }
+  }
+  return puzzle.solution_move ? [puzzle.solution_move] : [];
 }
 
 function getPuzzleReviewIndex(puzzle: Puzzle): number {
@@ -471,29 +497,10 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   const handleMove = useCallback((orig: Key, dest: Key) => {
     if (!currentPuzzle) return;
 
-    // Must be at the latest ply to play
-    if (viewPly !== playedMoves.length) {
-      setViewPly(playedMoves.length);
-      return;
-    }
-
     const moveUci = `${orig}${dest}`;
     
     // Support either the new solution_line_uci array, legacy solution_move, or Postgres stringified arrays
-    let targetLine: string[] = [];
-    if (Array.isArray(currentPuzzle.solution_line_uci) && currentPuzzle.solution_line_uci.length > 0) {
-      targetLine = currentPuzzle.solution_line_uci;
-    } else if (typeof currentPuzzle.solution_line_uci === 'string') {
-      try {
-        targetLine = JSON.parse(currentPuzzle.solution_line_uci);
-      } catch {
-        const s = (currentPuzzle.solution_line_uci as string).replace(/^{|}$/g, '');
-        targetLine = s.split(',').map(x => x.replace(/^"|"$/g, '').trim()).filter(Boolean);
-      }
-    }
-    if (!targetLine || targetLine.length === 0) {
-      targetLine = [currentPuzzle.solution_move];
-    }
+    const targetLine = getPuzzleSolutionLineUci(currentPuzzle);
 
     // ── If we are already done solving, allow free play
     if (state !== "solving") {
@@ -502,11 +509,18 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
         const m = chess.move({ from: orig, to: dest, promotion: "q" });
         if (m) {
           const actualUci = `${m.from}${m.to}${m.promotion ? m.promotion : ""}`;
-          const newPlayed = [...playedMoves, actualUci];
+          const branchBase = playedMoves.slice(0, viewPly);
+          const newPlayed = [...branchBase, actualUci];
           setPlayedMoves(newPlayed);
           setViewPly(newPlayed.length);
         }
       } catch { /* ignore illegal free moves */ }
+      return;
+    }
+
+    // Must be at the latest ply while solving the puzzle line.
+    if (viewPly !== playedMoves.length) {
+      setViewPly(playedMoves.length);
       return;
     }
 
@@ -561,20 +575,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   const handleRevealSolution = useCallback(() => {
     if (!currentPuzzle) return;
 
-    let targetLine: string[] = [];
-    if (Array.isArray(currentPuzzle.solution_line_uci) && currentPuzzle.solution_line_uci.length > 0) {
-      targetLine = currentPuzzle.solution_line_uci;
-    } else if (typeof currentPuzzle.solution_line_uci === 'string') {
-      try {
-        targetLine = JSON.parse(currentPuzzle.solution_line_uci);
-      } catch {
-        const s = (currentPuzzle.solution_line_uci as string).replace(/^{|}$/g, '');
-        targetLine = s.split(',').map(x => x.replace(/^"|"$/g, '').trim()).filter(Boolean);
-      }
-    }
-    if (!targetLine || targetLine.length === 0) {
-      targetLine = [currentPuzzle.solution_move];
-    }
+    const targetLine = getPuzzleSolutionLineUci(currentPuzzle);
 
     setWasRevealed(true);
     setPlayedMoves(targetLine);
@@ -612,6 +613,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   const isWrong = state === "wrong";
   const isCorrect = state === "correct" || state === "rating";
   const isRating = state === "rating";
+  const isAutoRevealing = wasRevealed && state === "correct" && viewPly < playedMoves.length;
 
   // Live analysis: only active after the puzzle is solved
   const { lines: engineLines, depth: engineDepth, isSearching: engineSearching } = useLiveAnalysis(
@@ -681,13 +683,13 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
 
   // Engine arrows on the board post-solution
   const engineShapes = useMemo((): DrawShape[] => {
-    if (!isRating || engineLines.length === 0 || engineDepth < 4) return [];
-    return engineLines.slice(1, 3).map((line, i) => ({
+    if (!isCorrect || engineLines.length === 0 || engineDepth < 4) return [];
+    return engineLines.slice(0, 2).map((line, i) => ({
       orig: line.move.slice(0, 2) as Key,
       dest: line.move.slice(2, 4) as Key,
       brush: i === 0 ? "paleBlue" : "paleGrey",
     }));
-  }, [isRating, engineLines, engineDepth]);
+  }, [isCorrect, engineLines, engineDepth]);
 
   if (loading) {
     return (
@@ -849,7 +851,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
   }
 
   // Board is interactive while solving, or after puzzle is solved (for free play)
-  const boardInteractive = state === "solving" || state === "rating";
+  const boardInteractive = state === "solving" || state === "rating" || (state === "correct" && !isAutoRevealing);
   const currentStage = getPuzzleStageMeta(currentPuzzle);
   const currentReason = getPuzzleReason(currentPuzzle, currentStage);
   const currentDueLabel = formatDueLabel(currentPuzzle.srs_due_at);
@@ -857,7 +859,9 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
     gameId: currentPuzzle.game_id,
     reviewIndex: getPuzzleReviewIndex(currentPuzzle),
     sidebarTab: "report",
+    viewerColor: currentPuzzle.player_color,
   };
+  const solutionLineUci = getPuzzleSolutionLineUci(currentPuzzle);
   const sessionProgress = puzzles.length > 0 ? ratedIds.size / puzzles.length : 0;
   const sessionProgressPercent = Math.round(sessionProgress * 100);
   const currentAccuracy =
@@ -877,6 +881,13 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
     progressStats && progressStats.due_now > puzzles.length
       ? `${progressStats.due_now} review-ready positions in your library. This batch loaded ${puzzles.length}.`
       : `${puzzles.length} puzzle${puzzles.length === 1 ? "" : "s"} loaded in this batch.`;
+  const viewedMoves = playedMoves.slice(0, viewPly);
+  const isInPuzzleVariation =
+    isCorrect &&
+    (
+      viewedMoves.length > solutionLineUci.length ||
+      viewedMoves.some((move, idx) => solutionLineUci[idx] !== move)
+    );
 
   return (
     <div
@@ -948,6 +959,18 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
             position: "relative",
           }}
         >
+          {isInPuzzleVariation && (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                background: "rgba(255,255,255,0.22)",
+                pointerEvents: "none",
+                zIndex: 4,
+                borderRadius: "6px",
+              }}
+            />
+          )}
           <ChessBoard
             fen={displayFen}
             orientation={currentPuzzle.player_color}
@@ -955,7 +978,7 @@ export default function PuzzleTrainer({ onOpenGameReview }: PuzzleTrainerProps) 
             onMove={handleMove}
             lastMove={displayLastMove}
             showCoordinates
-            shapes={isRating ? engineShapes : []}
+            shapes={isCorrect ? engineShapes : []}
             annotation={boardAnnotation}
           />
         </div>

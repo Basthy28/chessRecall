@@ -20,6 +20,7 @@ type RequestedReviewTarget = {
   gameId: string;
   reviewIndex?: number;
   sidebarTab?: "engine" | "report";
+  viewerColor?: "white" | "black";
 };
 
 // Placeholder puzzles — will be replaced by real Supabase data in Phase 2

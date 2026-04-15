@@ -111,7 +111,12 @@ interface LiveReviewResponse {
 }
 
 interface GamesPanelProps {
-  requestedReviewTarget?: { gameId: string; reviewIndex?: number; sidebarTab?: "engine" | "report" } | null;
+  requestedReviewTarget?: {
+    gameId: string;
+    reviewIndex?: number;
+    sidebarTab?: "engine" | "report";
+    viewerColor?: "white" | "black";
+  } | null;
   onRequestedReviewHandled?: () => void;
 }
 
@@ -174,17 +179,20 @@ function ReviewView({
   reviewIndex,
   setReviewIndex,
   initialSidebarTab,
+  preferredViewerColor,
   onClose,
 }: {
   review: LiveReviewResponse;
   reviewIndex: number;
   setReviewIndex: React.Dispatch<React.SetStateAction<number>>;
   initialSidebarTab?: "engine" | "report";
+  preferredViewerColor?: "white" | "black" | null;
   onClose: () => void;
 }) {
   const [windowWidth, setWindowWidth] = useState(1280);
+  const effectiveViewerColor = review.game.playerColor ?? preferredViewerColor ?? null;
   const [orientation, setOrientation] = useState<"white" | "black">(
-    review.game.playerColor === "black" ? "black" : "white"
+    effectiveViewerColor === "black" ? "black" : "white"
   );
 
   const initialTree = useMemo(() => {
@@ -589,7 +597,7 @@ function ReviewView({
 
   const resultLabel = review.game.result === "win" ? "1-0" : review.game.result === "loss" ? "0-1" : "½-½";
   const whiteEval = lines[0]?.score ?? 0;
-  const viewerColor = review.game.playerColor ?? null;
+  const viewerColor = effectiveViewerColor;
   // Clock reflects time remaining at the CURRENT position (up to activePath.length mainline moves).
   // For branch moves (ply > review.moves.length) we just freeze at the last known clock.
   const initialClockSeconds = useMemo(
@@ -1269,6 +1277,8 @@ export default function GamesPanel({
   const [isCompactLayout, setIsCompactLayout] = useState(false);
   const lastRequestedReviewIdRef = useRef<string | null>(null);
   const [reviewStartTab, setReviewStartTab] = useState<"engine" | "report">("engine");
+  const [reviewPreferredViewerColor, setReviewPreferredViewerColor] = useState<"white" | "black" | null>(null);
+  const [reviewSessionKey, setReviewSessionKey] = useState(0);
 
   useEffect(() => {
     const refreshLinkedAccounts = () => {
@@ -1630,10 +1640,14 @@ export default function GamesPanel({
     }
   }
 
-  async function openLiveReview(
+  const openLiveReview = useCallback(async (
     gameId = selectedGameId,
-    options?: { reviewIndex?: number; sidebarTab?: "engine" | "report" }
-  ) {
+    options?: {
+      reviewIndex?: number;
+      sidebarTab?: "engine" | "report";
+      viewerColor?: "white" | "black";
+    }
+  ) => {
     if (!gameId) { setMessage("Select a game first."); return; }
     setReviewLoading(true);
     setMessage("");
@@ -1647,45 +1661,52 @@ export default function GamesPanel({
       if (!res.ok) {
         setMessage(json.error ?? "Could not open live review for this game.");
       } else {
-        // Go directly into the review board — no intermediate report screen
         setReview(json);
         setReviewIndex(options?.reviewIndex ?? 0);
         setReviewStartTab(options?.sidebarTab ?? "engine");
+        setReviewPreferredViewerColor(options?.viewerColor ?? null);
+        setReviewSessionKey((prev) => prev + 1);
       }
     } catch {
       setMessage("Network error while opening live review.");
     } finally {
       setReviewLoading(false);
     }
-  }
+  }, [selectedGameId, viewerUsernames]);
 
   useEffect(() => {
     if (!requestedReviewTarget) {
       lastRequestedReviewIdRef.current = null;
       return;
     }
-    const targetSignature = `${requestedReviewTarget.gameId}:${requestedReviewTarget.reviewIndex ?? 0}:${requestedReviewTarget.sidebarTab ?? "engine"}`;
+    const targetSignature = `${requestedReviewTarget.gameId}:${requestedReviewTarget.reviewIndex ?? 0}:${requestedReviewTarget.sidebarTab ?? "engine"}:${requestedReviewTarget.viewerColor ?? "auto"}`;
     if (lastRequestedReviewIdRef.current === targetSignature) return;
     lastRequestedReviewIdRef.current = targetSignature;
     setSelectedGameId(requestedReviewTarget.gameId);
     void openLiveReview(requestedReviewTarget.gameId, {
       reviewIndex: requestedReviewTarget.reviewIndex,
       sidebarTab: requestedReviewTarget.sidebarTab,
+      viewerColor: requestedReviewTarget.viewerColor,
     }).finally(() => {
       onRequestedReviewHandled?.();
     });
-  }, [requestedReviewTarget, onRequestedReviewHandled]);
+  }, [requestedReviewTarget, onRequestedReviewHandled, openLiveReview]);
 
   // ── Review mode: full chess.com-style layout ───────────────────
   if (review) {
     return (
       <ReviewView
-        key={`${review.game.id}:${reviewStartTab}:${reviewIndex}`}
+        key={`${review.game.id}:${reviewSessionKey}`}
         review={review}
         reviewIndex={reviewIndex}
         setReviewIndex={setReviewIndex}
         initialSidebarTab={reviewStartTab}
-        onClose={() => { setReview(null); setReviewIndex(0); }}
+        preferredViewerColor={reviewPreferredViewerColor}
+        onClose={() => {
+          setReview(null);
+          setReviewIndex(0);
+          setReviewPreferredViewerColor(null);
+        }}
       />
     );
   }
